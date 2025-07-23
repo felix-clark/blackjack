@@ -68,21 +68,6 @@ enum Move {
     Surrender,
 }
 
-// /// The stipulation of miscellaneous rules other than the number of decks (?).
-// struct Ruleset {
-//     /// Whether the dealer hits soft 17
-//     hs17: bool,
-//     /// Allowed to double after split
-//     das: bool,
-//     /// Whether the dealer checks their hole card for blackjack
-//     dealer_check: bool,
-//     // /// Double on anything (as opposed to just 10 and 11) -- maybe just assume true
-//     // doa: bool,
-//     // /// Whether surrender is allowed. There are 2 variants, early and late - how to encode this?
-//     // surrender: bool,
-//     // TODO: only allowed 1 card after splitting aces?
-// }
-
 fn dealer_hit(hand: &CardCol, hs17: bool) -> bool {
     // let hard_count: u8 = hand.iter().map(Card::hard).sum();
     let hard_count: u8 = hand.hard_count();
