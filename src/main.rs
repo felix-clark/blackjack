@@ -177,20 +177,6 @@ fn main() {
     assert!(Card::Pip(9) > Card::Ace);
     assert!(Card::Ten > Card::Ace);
 
-    // use Card::*;
-    //
-    // let mut cc = CardCol {
-    //     inner: Counter::<Card>::from_iter([Ace, Ten, Pip(3)].into_iter()),
-    // };
-    // println!("{}", cc);
-    // cc.inner.remove(&Ace);
-    // assert!(!cc.inner.contains_key(&Ace));
-    // println!("{}", cc);
-    // // This will indeed insert a zero
-    // // cc.inner.insert(Ace, 0);
-    // println!("{}", cc);
-    // assert!(!cc.inner.contains_key(&Ace));
-
     let dd = CardCol::from_decks(4);
     println!("{} - {} total", dd, dd.inner.total::<usize>());
 
