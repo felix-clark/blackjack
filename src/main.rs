@@ -161,6 +161,47 @@ fn _dealer_outcome_probs(hand: CardCol, shoe: impl Shoe) -> HashMap<DealerOutcom
     prob_map
 }
 
+fn remove_nat21(dealer_outcomes: HashMap<DealerOutcome, f64>) -> HashMap<DealerOutcome, f64> {
+    let nat_prob: f64 = *dealer_outcomes.get(&DealerOutcome::Natural).unwrap_or(&0.);
+    let scale = 1.0 / (1.0 - nat_prob);
+    let new_map = HashMap::from_iter(dealer_outcomes.into_iter().filter_map(|(o, p)| {
+        if let DealerOutcome::Natural = o {
+            None
+        } else {
+            Some((o, p * scale))
+        }
+    }));
+    assert!((new_map.values().sum::<f64>() - 1.0).abs() < 1e-12);
+    new_map
+}
+
+fn resolve_ev(player_hand: &CardCol, dealer_hand: &CardCol) -> f64 {
+    // TODO: We need a conversion from hand to DealerOutcome, although it should somehow enforce
+    // that it's a final outcome (e.g. 17+ or bust)
+    let player_state = HandState::from(player_hand);
+    let dealer_count = dealer_hand.best_count();
+    let dealer_state = if dealer_count > 21 {
+        DealerOutcome::Bust
+    } else if dealer_hand.is_nat21() {
+        DealerOutcome::Natural
+    } else {
+        assert!((17..=21).contains(&dealer_count));
+        DealerOutcome::Total(dealer_count)
+    };
+    match (player_state, dealer_state) {
+        (HandState::Natural, DealerOutcome::Natural) => 0.0,
+        (_, DealerOutcome::Natural) => -1.,
+        (HandState::Natural, _) => 1.5, // This can change based on the rules, but should be 3/2
+        (HandState::Bust, _) => -1.,
+        (_, DealerOutcome::Bust) => 1.0,
+        (HandState::Hard(p) | HandState::Soft(p), DealerOutcome::Total(d)) => match p.cmp(&d) {
+            std::cmp::Ordering::Less => -1.0,
+            std::cmp::Ordering::Equal => 0.0,
+            std::cmp::Ordering::Greater => 1.0,
+        },
+    }
+}
+
 // NOTE: We really only care about hit/stand choices here, so the value could be a tuple?
 // Should this be a struct so it can recursively build the table by demand?
 fn build_hard_evs(mut shoe: impl Shoe, up_card: Card) -> HashMap<HandState, HashMap<Move, f64>> {
