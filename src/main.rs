@@ -189,15 +189,15 @@ fn resolve_ev(player_hand: &CardCol, dealer_hand: &CardCol) -> f64 {
         DealerOutcome::Total(dealer_count)
     };
     match (player_state, dealer_state) {
-        (HandState::Natural, DealerOutcome::Natural) => 0.0,
+        (HandState::Natural, DealerOutcome::Natural) => 0.,
         (_, DealerOutcome::Natural) => -1.,
         (HandState::Natural, _) => 1.5, // This can change based on the rules, but should be 3/2
         (HandState::Bust, _) => -1.,
-        (_, DealerOutcome::Bust) => 1.0,
+        (_, DealerOutcome::Bust) => 1.,
         (HandState::Hard(p) | HandState::Soft(p), DealerOutcome::Total(d)) => match p.cmp(&d) {
-            std::cmp::Ordering::Less => -1.0,
-            std::cmp::Ordering::Equal => 0.0,
-            std::cmp::Ordering::Greater => 1.0,
+            std::cmp::Ordering::Less => -1.,
+            std::cmp::Ordering::Equal => 0.,
+            std::cmp::Ordering::Greater => 1.,
         },
     }
 }

@@ -25,6 +25,19 @@ impl Debug for Card {
     }
 }
 
+impl TryFrom<u8> for Card {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Ace),
+            n if (2..=9).contains(&value) => Ok(Self::Pip(n)),
+            10 => Ok(Self::Ten),
+            _ => Err(format!("Invald card value {}", value)),
+        }
+    }
+}
+
 impl Card {
     pub fn hard(&self) -> u8 {
         match &self {
@@ -37,9 +50,25 @@ impl Card {
 }
 
 /// Representation of a generic collection of cards
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(Clone, Eq)]
 pub struct CardCol {
     pub inner: Counter<Card>,
+}
+
+impl std::hash::Hash for CardCol {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // As long as we always use the same order for all cards, it should be OK
+        for c in (1..=10).map(Card::try_from) {
+            self.inner[&c.unwrap()].hash(state);
+        }
+    }
+}
+
+impl PartialEq for CardCol {
+    fn eq(&self, other: &Self) -> bool {
+        // NOTE: The inner hash maps can be non-equal due to zero values.
+        self.inner.is_subset(&other.inner) && self.inner.is_superset(&other.inner)
+    }
 }
 
 impl CardCol {
@@ -58,6 +87,12 @@ impl CardCol {
         inner.insert(Card::Ten, 4 * n_per_rank);
         inner.insert(Card::Ace, n_per_rank);
         Self { inner }
+    }
+
+    pub fn from_hand(hand: &[Card]) -> Self {
+        Self {
+            inner: hand.iter().cloned().collect::<Counter<_>>(),
+        }
     }
 
     pub fn best_count(&self) -> u8 {
@@ -85,7 +120,11 @@ impl CardCol {
 
     pub fn is_nat21(&self) -> bool {
         // TODO: Consider if there's a more efficient way of checking this
-        self.inner == Counter::<Card>::from_iter([Card::Ace, Card::Ten])
+        // NOTE: It's important that we not simply equate the inner counters, because those
+        // consider 0s to be distinct from empties.
+        self == &Self {
+            inner: Counter::<Card>::from_iter([Card::Ace, Card::Ten]),
+        }
     }
 }
 
@@ -95,6 +134,16 @@ impl Display for CardCol {
             if num == &0 {
                 continue;
             }
+            write!(f, "{}:{} ", card, num)?;
+        }
+        Ok(())
+    }
+}
+
+impl Debug for CardCol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (card, num) in self.inner.iter() {
+            // Don't skip zeros for debug, it's actually important esp. with testing equality.
             write!(f, "{}:{} ", card, num)?;
         }
         Ok(())
