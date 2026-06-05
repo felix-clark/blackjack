@@ -109,6 +109,16 @@ struct Ruleset {
     // TODO: only allowed 1 card after splitting aces? Only allowed to split aces once?
 }
 
+impl Default for Ruleset {
+    fn default() -> Self {
+        Self {
+            hs17: true,
+            das: true,
+            dealer_check: true,
+        }
+    }
+}
+
 fn dealer_hit(hand: &CardCol, hs17: bool) -> bool {
     // let hard_count: u8 = hand.iter().map(Card::hard).sum();
     let hard_count: u8 = hand.hard_count();
