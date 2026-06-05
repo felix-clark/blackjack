@@ -4,6 +4,7 @@ use card::*;
 use counter::Counter;
 use std::{
     collections::HashMap,
+    default::Default,
     fmt::{Debug, Display},
 };
 
