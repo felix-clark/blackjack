@@ -1,5 +1,8 @@
 use counter::Counter;
-use std::fmt::{Debug, Display};
+use std::{
+    fmt::{Debug, Display},
+    ops::{Add, Sub},
+};
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub enum Card {
@@ -38,6 +41,27 @@ impl TryFrom<u8> for Card {
     }
 }
 
+impl TryFrom<char> for Card {
+    type Error = String;
+
+    fn try_from(value: char) -> Result<Self, Self::Error> {
+        use Card::*;
+        match value {
+            'A' => Ok(Ace),
+            '2' => Ok(Pip(2)),
+            '3' => Ok(Pip(3)),
+            '4' => Ok(Pip(4)),
+            '5' => Ok(Pip(5)),
+            '6' => Ok(Pip(6)),
+            '7' => Ok(Pip(7)),
+            '8' => Ok(Pip(8)),
+            '9' => Ok(Pip(9)),
+            'T' => Ok(Ten),
+            _ => Err(format!("Invalid card character {}", value)),
+        }
+    }
+}
+
 impl Card {
     pub fn hard(&self) -> u8 {
         match &self {
@@ -71,6 +95,39 @@ impl PartialEq for CardCol {
     }
 }
 
+impl Add for CardCol {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self {
+            inner: self.inner + rhs.inner,
+        }
+    }
+}
+
+impl Sub for CardCol {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            inner: self.inner - rhs.inner,
+        }
+    }
+}
+
+impl TryFrom<&str> for CardCol {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let cards: Vec<Card> = value
+            .chars()
+            .map(|c| c.try_into())
+            .collect::<Result<_, _>>()?;
+        let inner: Counter<Card> = Counter::from_iter(cards);
+        Ok(Self { inner })
+    }
+}
+
 impl CardCol {
     pub fn new() -> Self {
         Self {
@@ -78,9 +135,28 @@ impl CardCol {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.inner.total()
+    }
+
+    pub fn get_count(&self, card: &Card) -> usize {
+        *self.inner.get(card).unwrap_or(&0)
+    }
+
     pub fn from_decks(n: u8) -> Self {
         let mut inner = Counter::<Card>::with_capacity(10);
         let n_per_rank = 4 * n as usize;
+        for i in 2..=9 {
+            inner.insert(Card::Pip(i), n_per_rank);
+        }
+        inner.insert(Card::Ten, 4 * n_per_rank);
+        inner.insert(Card::Ace, n_per_rank);
+        Self { inner }
+    }
+
+    pub fn half_deck() -> Self {
+        let mut inner = Counter::<Card>::with_capacity(10);
+        let n_per_rank = 2;
         for i in 2..=9 {
             inner.insert(Card::Pip(i), n_per_rank);
         }
@@ -118,13 +194,16 @@ impl CardCol {
         }
     }
 
+    fn from_nat21() -> Self {
+        let inner = Counter::<Card>::from_iter([Card::Ace, Card::Ten]);
+        Self { inner }
+    }
+
     pub fn is_nat21(&self) -> bool {
         // TODO: Consider if there's a more efficient way of checking this
         // NOTE: It's important that we not simply equate the inner counters, because those
         // consider 0s to be distinct from empties.
-        self == &Self {
-            inner: Counter::<Card>::from_iter([Card::Ace, Card::Ten]),
-        }
+        self == &Self::from_nat21()
     }
 }
 
@@ -143,8 +222,11 @@ impl Display for CardCol {
 impl Debug for CardCol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (card, num) in self.inner.iter() {
-            // Don't skip zeros for debug, it's actually important esp. with testing equality.
-            write!(f, "{}:{} ", card, num)?;
+            // Consider not skipping zeros for debug, it's actually important esp. with testing equality.
+            if num == &0 {
+                continue;
+            }
+            write!(f, "{}x{} ", num, card)?;
         }
         Ok(())
     }
