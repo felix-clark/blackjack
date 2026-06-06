@@ -1,3 +1,4 @@
+use crate::Ruleset;
 use crate::shoe::{CardCol, Shoe};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
@@ -25,13 +26,12 @@ impl Display for DealerOutcome {
     }
 }
 
-fn dealer_hit(hand: &CardCol, hs17: bool) -> bool {
+pub fn dealer_hit(hand: &CardCol, hs17: bool) -> bool {
     // let hard_count: u8 = hand.iter().map(Card::hard).sum();
     let hard_count: u8 = hand.hard_count();
     if hard_count >= 17 {
         return false;
     }
-    // let has_ace: bool = hand.iter().any(|&c| c == Card::Ace);
     let has_ace: bool = hand.has_ace();
     if has_ace && hard_count <= 11 {
         let soft_target = if hs17 { 18 } else { 17 };
@@ -40,40 +40,6 @@ fn dealer_hit(hand: &CardCol, hs17: bool) -> bool {
         }
     }
     true
-}
-
-pub fn _dealer_outcome_probs(
-    hand: CardCol,
-    shoe: impl Shoe,
-    // exclude_nat21: bool,
-) -> HashMap<DealerOutcome, f64> {
-    // TODO: option to exclude natural blackjack?
-    let hs17 = true;
-    if !dealer_hit(&hand, hs17) {
-        let dealer_count = hand.best_count();
-        let res = if dealer_count > 21 {
-            DealerOutcome::Bust
-        } else if hand.is_nat21() {
-            DealerOutcome::Natural
-        } else {
-            DealerOutcome::Total(dealer_count)
-        };
-        return HashMap::from([(res, 1.0)]);
-    }
-    let mut prob_map = HashMap::new();
-    for (card, weight) in shoe.all_draw_probs() {
-        assert!(weight > 0.);
-        let mut new_hand = hand;
-        new_hand.insert(card);
-        let mut new_shoe = shoe.clone();
-        new_shoe.draw(&card);
-        let draw_probs = _dealer_outcome_probs(new_hand, new_shoe);
-        for (res, prob) in draw_probs.into_iter() {
-            *prob_map.entry(res).or_insert(0.) += weight * prob;
-        }
-    }
-
-    prob_map
 }
 
 /// Number of distinct dealer outcomes: Bust, Total(17..=21), Natural.
@@ -237,22 +203,37 @@ impl DealerHand {
 /// representations and memoized on the dealer hand, which keeps every `Counter`/`HashMap` operation
 /// out of the recursion. Finite shoe only (the dense tally needs concrete counts); the infinite
 /// deck still goes through [`_dealer_outcome_probs`].
-pub fn _dealer_outcome_probs_dense(hand: CardCol, shoe: CardCol) -> HashMap<DealerOutcome, f64> {
+pub fn dealer_outcome_probs(
+    hand: CardCol,
+    shoe: CardCol,
+    rules: &Ruleset,
+) -> HashMap<DealerOutcome, f64> {
     let mut memo: HashMap<DealerHand, DealerDist> = HashMap::new();
     let dist = dealer_dist(
         DealerHand::from_cards(&hand),
         DenseShoe::from_cards(&shoe),
+        rules.hs17,
         &mut memo,
     );
-    dealer_dist_to_map(dist)
+    let probs = dealer_dist_to_map(dist);
+    // When the dealer peeks for blackjack the player only ever acts in games where the dealer has
+    // no natural, so they face the outcome distribution conditioned on `not natural`. Renormalizing
+    // the terminal distribution is exact, not an approximation: a natural is a terminal state
+    // disjoint from every other outcome, so `P(o | not-nat) = P(o) / (1 - P(nat))` for each `o`.
+    if rules.dealer_check {
+        remove_nat21(probs)
+    } else {
+        probs
+    }
 }
 
 fn dealer_dist(
     hand: DealerHand,
     shoe: DenseShoe,
+    hs17: bool,
     memo: &mut HashMap<DealerHand, DealerDist>,
 ) -> DealerDist {
-    if !hand.must_hit(true) {
+    if !hand.must_hit(hs17) {
         let mut dist = [0.0; N_DEALER_OUTCOMES];
         dist[dealer_outcome_index(&hand.terminal_outcome())] = 1.0;
         return dist;
@@ -268,7 +249,7 @@ fn dealer_dist(
         if prob == 0.0 {
             continue;
         }
-        let sub = dealer_dist(hand.with_card(rank), shoe.draw(rank), memo);
+        let sub = dealer_dist(hand.with_card(rank), shoe.draw(rank), hs17, memo);
         for (acc, p) in dist.iter_mut().zip(sub) {
             *acc += prob * p;
         }
