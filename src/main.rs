@@ -78,6 +78,19 @@ impl Display for Move {
     }
 }
 
+/// When (if ever) the player may forfeit half the bet instead of playing the hand out.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub(crate) enum SurrenderRule {
+    /// Surrender is not offered.
+    None,
+    /// Surrender *before* the dealer peeks for blackjack, escaping the dealer-natural loss too.
+    /// EV is an unconditional -0.5.
+    Early,
+    /// Surrender *after* the dealer peeks and shows no blackjack. Only coherent when the dealer
+    /// actually peeks (`dealer_check`), since otherwise there is no "after the check".
+    Late,
+}
+
 /// The stipulation of miscellaneous rules other than the number of decks (?).
 pub(crate) struct Ruleset {
     /// Whether the dealer hits soft 17
@@ -90,9 +103,23 @@ pub(crate) struct Ruleset {
     pub(crate) dealer_check: bool,
     // /// Double on anything (as opposed to just 10 and 11) -- maybe just assume true
     // doa: bool,
-    // /// Whether early surrender (before dealer checks) is allowed.
-    early_surrender: bool,
+    /// Whether (and when) the player may surrender.
+    pub(crate) surrender: SurrenderRule,
     // TODO: only allowed 1 card after splitting aces? Only allowed to split aces once?
+}
+
+impl Ruleset {
+    /// Reject rule combinations that don't correspond to a real game. Late surrender is defined as
+    /// surrendering after the dealer peeks, so it only makes sense when the dealer peeks at all.
+    fn validate(&self) {
+        if self.surrender == SurrenderRule::Late {
+            assert!(
+                self.dealer_check,
+                "Late surrender requires the dealer to peek for blackjack (dealer_check); \
+                 use SurrenderRule::Early for a no-peek game."
+            );
+        }
+    }
 }
 
 impl Default for Ruleset {
@@ -101,7 +128,9 @@ impl Default for Ruleset {
             hs17: true,
             das: true,
             dealer_check: true,
-            early_surrender: false,
+            // Preserves prior behavior: surrender was always evaluated, as late surrender, when the
+            // dealer peeks.
+            surrender: SurrenderRule::Late,
         }
     }
 }
@@ -122,17 +151,15 @@ fn resolve_ev(player_hand: &CardCol, dealer_state: DealerOutcome) -> f64 {
     }
 }
 
-fn late_surrender_ev(dealer_probs: &HashMap<DealerOutcome, f64>) -> f64 {
-    -0.5 * dealer_probs
-        .iter()
-        .filter_map(|(&dh, &prob)| {
-            if dh == DealerOutcome::Natural {
-                None
-            } else {
-                Some(prob)
-            }
-        })
-        .sum::<f64>()
+/// Probability the dealer's down card completes a natural, given the up card and the cards left in
+/// `shoe`. Exact because a natural is the only two-card 21: it needs the single rank that pairs with
+/// the up card to make ace+ten, and nothing else can.
+fn dealer_natural_prob(up_card: Card, shoe: &impl Shoe) -> f64 {
+    match up_card {
+        Card::Ace => shoe.draw_prob(&Card::Ten),
+        Card::Ten => shoe.draw_prob(&Card::Ace),
+        _ => 0.0,
+    }
 }
 
 /// Returns a map from a given player hand to a probability weight and an expectation value for each
@@ -151,6 +178,7 @@ fn build_evs(
     up_card: Card,
     rules: &Ruleset,
 ) -> HashMap<CardCol, (f64, HashMap<Move, f64>)> {
+    rules.validate();
     // Remove the up card from the deck (a no-op for the infinite deck).
     shoe.draw(&up_card);
     // make into const after draw
@@ -236,15 +264,43 @@ fn build_evs(
                         .sum::<f64>();
                 evs.push((Move::Double, double_ev));
 
-                // It matters whether surrender is permitted before dealer checks for a
-                // natural.
-                let surrender_ev = if rules.early_surrender {
-                    // We're allowed to surrender regardless of the DealerOutcome
-                    -0.5
-                } else {
-                    late_surrender_ev(&dealer_probs)
+                // Surrender forfeits half the bet. The subtlety is the *basis* of the value we
+                // store: every other entry in this map is measured against `dealer_probs`, which is
+                // conditioned on "no dealer blackjack" when the dealer peeks (`dealer_check`) and
+                // unconditional otherwise. Surrender must be put on the same basis so a plain argmax
+                // over the map stays correct.
+                let surrender_ev = match rules.surrender {
+                    SurrenderRule::None => None,
+                    // Late surrender only happens once the dealer has peeked and shown no natural
+                    // (guaranteed coherent by `rules.validate()`). The map is then conditional on
+                    // exactly that event, so surrendering is worth a flat -0.5.
+                    SurrenderRule::Late => Some(-0.5),
+                    SurrenderRule::Early => Some(if rules.dealer_check {
+                        // Early surrender is decided *before* the peek and forfeits half a unit
+                        // unconditionally (true EV -0.5), but the rest of the map is conditional on
+                        // the dealer not having a natural. Re-express -0.5 on that conditional basis
+                        // so the comparison is exact: early surrender beats a play of conditional EV
+                        // `c` iff -0.5 > P_bj*(-1) + (1 - P_bj)*c, i.e. iff c < (P_bj - 0.5)/(1 -
+                        // P_bj). Storing that threshold makes argmax pick surrender exactly when it
+                        // should (and collapses to -0.5 when P_bj = 0). NOTE: this stored number is
+                        // a decision-equivalent value, not the raw -0.5, so a display layer should
+                        // special-case the early-surrender EV.
+                        //
+                        // We recompute P_bj rather than read `dealer_probs[Natural]`: this is the
+                        // peek branch, so `dealer_probs` has already had its natural stripped and the
+                        // rest renormalized by 1/(1 - P_bj) (see `remove_nat21`), throwing the
+                        // unconditioned mass we need away.
+                        let p_bj = dealer_natural_prob(up_card, &shoe_minus_hand);
+                        (p_bj - 0.5) / (1.0 - p_bj)
+                    } else {
+                        // No peek: the map is already unconditional, so early surrender is directly
+                        // -0.5.
+                        -0.5
+                    }),
                 };
-                evs.push((Move::Surrender, surrender_ev));
+                if let Some(surrender_ev) = surrender_ev {
+                    evs.push((Move::Surrender, surrender_ev));
+                }
 
                 // TODO: Handle splitting. This might actually be quite complicated in general
                 // because each outcome in one arm conditions the results in the other(s). It also
