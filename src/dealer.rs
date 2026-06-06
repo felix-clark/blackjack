@@ -1,4 +1,5 @@
 use crate::Ruleset;
+use crate::card::Card;
 use crate::shoe::{CardCol, Shoe};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
@@ -24,22 +25,6 @@ impl Display for DealerOutcome {
             DealerOutcome::Natural => write!(f, "Nat"),
         }
     }
-}
-
-pub fn dealer_hit(hand: &CardCol, hs17: bool) -> bool {
-    // let hard_count: u8 = hand.iter().map(Card::hard).sum();
-    let hard_count: u8 = hand.hard_count();
-    if hard_count >= 17 {
-        return false;
-    }
-    let has_ace: bool = hand.has_ace();
-    if has_ace && hard_count <= 11 {
-        let soft_target = if hs17 { 18 } else { 17 };
-        if hard_count + 10 >= soft_target {
-            return false;
-        }
-    }
-    true
 }
 
 /// Number of distinct dealer outcomes: Bust, Total(17..=21), Natural.
@@ -74,44 +59,6 @@ fn dealer_dist_to_map(dist: DealerDist) -> HashMap<DealerOutcome, f64> {
         out.insert(DealerOutcome::Natural, dist[6]);
     }
     out
-}
-
-/// A finite shoe as a dense tally of how many of each rank remain, indexed by [`Card::rank_index`]
-/// (so index `i` is the rank with hard value `i + 1`: index 0 is the ace, index 9 is the ten).
-///
-/// Being `Copy` (and a plain array under the hood) is the whole point: the dealer enumeration draws
-/// thousands of times, and a `DenseShoe` is drawn from by *copying* it with one card removed, which
-/// is a handful of stack writes rather than the heap allocation a `CardCol` clone would incur if it
-/// weren't itself `Copy` — and this also caches `total`, which `CardCol` recomputes on demand.
-#[derive(Clone, Copy)]
-struct DenseShoe {
-    counts: [u32; 10],
-    total: u32,
-}
-
-impl DenseShoe {
-    fn from_cards(cards: &CardCol) -> Self {
-        let mut counts = [0u32; 10];
-        for (card, n) in cards.iter() {
-            counts[card.rank_index()] = n as u32;
-        }
-        Self {
-            counts,
-            total: counts.iter().sum(),
-        }
-    }
-
-    /// Probability that the next card drawn is the rank at `index`.
-    fn draw_prob(&self, index: usize) -> f64 {
-        self.counts[index] as f64 / self.total as f64
-    }
-
-    /// The shoe that remains after drawing one card of the rank at `index`.
-    fn draw(mut self, index: usize) -> Self {
-        self.counts[index] -= 1;
-        self.total -= 1;
-        self
-    }
 }
 
 /// The dealer's cards as a dense per-rank tally (indexed by [`Card::rank_index`]).
@@ -197,24 +144,20 @@ impl DealerHand {
     }
 }
 
-/// Exact distribution over dealer outcomes from a given starting hand and finite shoe.
+/// Exact distribution over dealer outcomes from a given starting hand and shoe.
 ///
-/// Equivalent to [`_dealer_outcome_probs`] but built on the `Copy` [`DenseShoe`]/[`DealerHand`]
-/// representations and memoized on the dealer hand, which keeps every `Counter`/`HashMap` operation
-/// out of the recursion. Finite shoe only (the dense tally needs concrete counts); the infinite
-/// deck still goes through [`_dealer_outcome_probs`].
+/// Generic over any [`Shoe`], so it serves both a finite [`CardCol`] (draws deplete the tally) and
+/// the [`InfiniteDeck`](crate::shoe::InfiniteDeck) (draws are no-ops at fixed 1/13 probabilities)
+/// through one code path. The recursion is memoized on the [`DealerHand`]: for a fixed starting shoe
+/// the remaining shoe is a function of the cards the dealer has drawn, so the dealer hand alone is a
+/// sound key, and this collapses the factorial of draw orders to the distinct reachable hands.
 pub fn dealer_outcome_probs(
     hand: CardCol,
-    shoe: CardCol,
+    shoe: impl Shoe,
     rules: &Ruleset,
 ) -> HashMap<DealerOutcome, f64> {
     let mut memo: HashMap<DealerHand, DealerDist> = HashMap::new();
-    let dist = dealer_dist(
-        DealerHand::from_cards(&hand),
-        DenseShoe::from_cards(&shoe),
-        rules.hs17,
-        &mut memo,
-    );
+    let dist = dealer_dist(DealerHand::from_cards(&hand), &shoe, rules.hs17, &mut memo);
     let probs = dealer_dist_to_map(dist);
     // When the dealer peeks for blackjack the player only ever acts in games where the dealer has
     // no natural, so they face the outcome distribution conditioned on `not natural`. Renormalizing
@@ -227,9 +170,9 @@ pub fn dealer_outcome_probs(
     }
 }
 
-fn dealer_dist(
+fn dealer_dist<S: Shoe>(
     hand: DealerHand,
-    shoe: DenseShoe,
+    shoe: &S,
     hs17: bool,
     memo: &mut HashMap<DealerHand, DealerDist>,
 ) -> DealerDist {
@@ -245,11 +188,15 @@ fn dealer_dist(
     // Average the sub-distributions of each possible next card, weighted by its draw probability.
     let mut dist = [0.0; N_DEALER_OUTCOMES];
     for rank in 0..10 {
-        let prob = shoe.draw_prob(rank);
+        let card = Card::from_rank_index(rank);
+        let prob = shoe.draw_prob(&card);
         if prob == 0.0 {
             continue;
         }
-        let sub = dealer_dist(hand.with_card(rank), shoe.draw(rank), hs17, memo);
+        // Branch on drawing `card`: clone the shoe and deplete it (a no-op for the infinite deck).
+        let mut sub_shoe = shoe.clone();
+        sub_shoe.draw(&card);
+        let sub = dealer_dist(hand.with_card(rank), &sub_shoe, hs17, memo);
         for (acc, p) in dist.iter_mut().zip(sub) {
             *acc += prob * p;
         }

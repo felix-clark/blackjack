@@ -1,6 +1,6 @@
 pub(crate) mod card;
 pub(crate) mod dealer;
-// mod legacy;
+mod legacy;
 pub(crate) mod shoe;
 
 use card::*;
@@ -118,18 +118,23 @@ fn resolve_ev(player_hand: &CardCol, dealer_state: DealerOutcome) -> f64 {
     }
 }
 
-/// Returns a map from a given player hand to a probability weight (given by purely combinatorial
-/// factors, not necessarily realistic probabilities) and an expectation value for each move made
-/// with that hand, assuming optimal H/S strategy afterwards.
+/// Returns a map from a given player hand to a probability weight and an expectation value for each
+/// move made with that hand, assuming optimal H/S strategy afterwards.
+///
+/// The weight is the shoe's partition scan-weight for that exact multiset (see
+/// [`Shoe::weighted_partitions`]). Its meaning depends on the shoe: for the [`InfiniteDeck`] it is
+/// the exact multinomial occurrence probability of the hand, but for a finite [`CardCol`] it is the
+/// hypergeometric weight of drawing the hand *in isolation* — a purely combinatorial factor, not the
+/// realistic probability of holding it in play (which would have to account for the up-card and the
+/// dealer's draws depleting the same shoe). It is used only as a relative weight when collapsing
+/// per-hand EVs into per-[`HandState`] summaries in [`consolidate_strategy`].
 // TODO: Should this be a struct so it can recursively build the table by demand?
 fn build_hard_evs(
-    mut shoe: CardCol,
+    mut shoe: impl Shoe,
     up_card: Card,
     rules: &Ruleset,
 ) -> HashMap<CardCol, (f64, HashMap<Move, f64>)> {
-    // Remove the up card from the deck
-    // TODO: Think about weighted partitions for infinite deck, then shoe can be impl Shoe instead
-    // of CardCol.
+    // Remove the up card from the deck (a no-op for the infinite deck).
     shoe.draw(&up_card);
     // make into const after draw
     let shoe = shoe;
@@ -160,12 +165,12 @@ fn build_hard_evs(
             // the soft check.
             assert!(!pl_hand.is_nat21());
             // Assert that we aren't overdrawing; this should be a given if
-            // weighted_hard_partitions() is correct.
-            assert!(pl_hand.is_submultiset(&shoe));
-            let shoe_minus_hand = shoe - pl_hand;
+            // weighted_hard_partitions() is correct (always true for the infinite deck).
+            assert!(shoe.contains_hand(&pl_hand));
+            let shoe_minus_hand = shoe.remove_hand(&pl_hand);
             // The dealer-natural conditioning (peek rule) is applied inside `dealer_outcome_probs`
             // per `rules.dealer_check`.
-            let dealer_probs = dealer_outcome_probs(dealer_hand, shoe_minus_hand, rules);
+            let dealer_probs = dealer_outcome_probs(dealer_hand, shoe_minus_hand.clone(), rules);
             let stand_ev = dealer_probs
                 .into_iter()
                 .map(|(dealer, p)| p * resolve_ev(&pl_hand, dealer))
@@ -292,11 +297,11 @@ fn main() {
     println!("{:?}\nnorm: {}", &base_deal_probs, norm);
     println!("{:?}\nnorm: {}", remove_nat21(base_deal_probs), norm);
 
-    // let dd = InfiniteDeck {};
-    // let base_deal_probs = dealer_outcome_probs(CardCol::new(), dd);
-    // let norm = base_deal_probs.values().sum::<f64>();
-    // assert!((norm - 1.0).abs() < 1e-12);
-    // println!("{:?}\nnorm: {}", base_deal_probs, norm);
+    let dd = InfiniteDeck {};
+    let base_deal_probs = dealer_outcome_probs(CardCol::new(), dd, &no_peek);
+    let norm = base_deal_probs.values().sum::<f64>();
+    assert!((norm - 1.0).abs() < 1e-12);
+    println!("{:?}\nnorm: {}", base_deal_probs, norm);
 
     // NOTE: See https://wizardofodds.com/games/blackjack/appendix/9/1dh17r4/ for precise
     // comparisons

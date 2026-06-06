@@ -1,13 +1,14 @@
 /// Methods we're no longer using, typically because they've been optimized out.
-use crate::{Card, CardCol, dealer::{DealerOutcome, dealer_hit}, shoe::Shoe};
+use crate::{Card, CardCol, dealer::DealerOutcome, shoe::Shoe};
 
 use std::collections::HashMap;
 
-/// TODO: Implement this as an iterator to avoid allocations from collections.
 /// The weights should be the multivariate hypergeometric probability density. This gives the
 /// probability conditioned on the size of the hand; it takes some additional assumptions to infer
 /// a marginal distribution.
-fn _weighted_partitions_legacy(
+/// Now this is implemented as a lazy iterator from a Shoe member method.
+#[allow(unused)]
+fn weighted_partitions_legacy(
     mut deck: CardCol,
     hard_total: u8,
     norm_offset: usize,
@@ -39,7 +40,7 @@ fn _weighted_partitions_legacy(
         if top_cont > hard_total {
             break;
         }
-        let sub_parts = _weighted_partitions_legacy(
+        let sub_parts = weighted_partitions_legacy(
             sub_deck,
             hard_total - top_cont,
             norm_offset + n_top - k_top,
@@ -70,6 +71,22 @@ fn _weighted_partitions_legacy(
     k_perms.into_iter().flatten().collect::<Vec<_>>()
 }
 
+fn dealer_hit(hand: &CardCol, hs17: bool) -> bool {
+    let hard_count: u8 = hand.hard_count();
+    if hard_count >= 17 {
+        return false;
+    }
+    let has_ace: bool = hand.has_ace();
+    if has_ace && hard_count <= 11 {
+        let soft_target = if hs17 { 18 } else { 17 };
+        if hard_count + 10 >= soft_target {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(unused)]
 pub fn dealer_outcome_probs(
     hand: CardCol,
     shoe: impl Shoe,
@@ -132,4 +149,3 @@ fn check_hg_norm_weights(hand: &CardCol, deck: &CardCol) -> f64 {
     let den = choose(deck.len(), hand.len());
     num as f64 / den as f64
 }
-
