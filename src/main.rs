@@ -35,7 +35,7 @@ impl From<&CardCol> for HandState {
         let has_ace = hand.has_ace();
         let hard_count = hand.hard_count();
         assert!(
-            !has_ace || hand.inner.total::<usize>() != 2 || hard_count != 11,
+            !has_ace || hand.len() != 2 || hard_count != 11,
             "Natural 21 should be taken care of already"
         );
         if hard_count > 21 {
