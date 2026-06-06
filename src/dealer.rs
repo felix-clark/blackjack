@@ -4,7 +4,7 @@ use crate::shoe::{CardCol, Shoe};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub enum DealerOutcome {
     Bust, // could also be represented as a zero?
     Total(u8),

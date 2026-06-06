@@ -63,6 +63,9 @@ enum Move {
     Surrender,
 }
 
+// TODO: similar to Move, we might need an enum for recommended strategy, which encodes DoubleHit
+// and DoubleStand (to double if allowed, but Hit/Stand otherwise).
+
 impl Display for Move {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -87,8 +90,8 @@ pub(crate) struct Ruleset {
     pub(crate) dealer_check: bool,
     // /// Double on anything (as opposed to just 10 and 11) -- maybe just assume true
     // doa: bool,
-    // /// Whether surrender is allowed. There are 2 variants, early and late - how to encode this?
-    // surrender: bool,
+    // /// Whether early surrender (before dealer checks) is allowed.
+    early_surrender: bool,
     // TODO: only allowed 1 card after splitting aces? Only allowed to split aces once?
 }
 
@@ -98,6 +101,7 @@ impl Default for Ruleset {
             hs17: true,
             das: true,
             dealer_check: true,
+            early_surrender: false,
         }
     }
 }
@@ -118,6 +122,19 @@ fn resolve_ev(player_hand: &CardCol, dealer_state: DealerOutcome) -> f64 {
     }
 }
 
+fn late_surrender_ev(dealer_probs: &HashMap<DealerOutcome, f64>) -> f64 {
+    -0.5 * dealer_probs
+        .iter()
+        .filter_map(|(&dh, &prob)| {
+            if dh == DealerOutcome::Natural {
+                None
+            } else {
+                Some(prob)
+            }
+        })
+        .sum::<f64>()
+}
+
 /// Returns a map from a given player hand to a probability weight and an expectation value for each
 /// move made with that hand, assuming optimal H/S strategy afterwards.
 ///
@@ -129,7 +146,7 @@ fn resolve_ev(player_hand: &CardCol, dealer_state: DealerOutcome) -> f64 {
 /// dealer's draws depleting the same shoe). It is used only as a relative weight when collapsing
 /// per-hand EVs into per-[`HandState`] summaries in [`consolidate_strategy`].
 // TODO: Should this be a struct so it can recursively build the table by demand?
-fn build_hard_evs(
+fn build_evs(
     mut shoe: impl Shoe,
     up_card: Card,
     rules: &Ruleset,
@@ -147,8 +164,7 @@ fn build_hard_evs(
 
     // Go down to 2 to get all soft options as well
     for pl_tot in (2..=21).rev() {
-        let pl_hands = shoe.weighted_partitions(pl_tot);
-        for (weight, pl_hand) in pl_hands.into_iter() {
+        for (weight, pl_hand) in shoe.weighted_partitions(pl_tot) {
             if pl_hand.len() < 2 {
                 continue;
             }
@@ -172,8 +188,8 @@ fn build_hard_evs(
             // per `rules.dealer_check`.
             let dealer_probs = dealer_outcome_probs(dealer_hand, shoe_minus_hand.clone(), rules);
             let stand_ev = dealer_probs
-                .into_iter()
-                .map(|(dealer, p)| p * resolve_ev(&pl_hand, dealer))
+                .iter()
+                .map(|(&dealer, p)| p * resolve_ev(&pl_hand, dealer))
                 .sum::<f64>();
             let hit_ev = shoe_minus_hand
                 .all_draw_probs()
@@ -193,20 +209,54 @@ fn build_hard_evs(
                     }
                 })
                 .sum::<f64>();
-            let ev_map = HashMap::from_iter([(Move::Stand, stand_ev), (Move::Hit, hit_ev)]);
+            let mut evs = vec![(Move::Stand, stand_ev), (Move::Hit, hit_ev)];
+            // If this is a starting hand (i.e. length two) then we may also have the option to
+            // double down, split, or surrender.
+            if pl_hand.len() == 2 {
+                // While supposedly some casinos allow doubling at any time, I've never encountered
+                // this so I'll just assume it's only permitted at the start. If we don't restrict
+                // this, we could pollute the EV tree with inflated maximum EV that would affect
+                // other values.
+                let double_ev = 2.0
+                    * shoe_minus_hand
+                        .all_draw_probs()
+                        .map(|(c, p_c)| {
+                            let mut pl_hand_dd = pl_hand;
+                            pl_hand_dd.insert(c);
+                            // we need to use updated dealer_probs with this particular card removed. We
+                            // didn't need to do this in the Hit case because that either busts or
+                            // resolves on the existing tree.
+                            let dd_shoe = shoe.remove_hand(&pl_hand_dd);
+                            let dealer_dd_probs = dealer_outcome_probs(dealer_hand, dd_shoe, rules);
+                            p_c * dealer_dd_probs
+                                .iter()
+                                .map(|(&dealer, p)| p * resolve_ev(&pl_hand_dd, dealer))
+                                .sum::<f64>()
+                        })
+                        .sum::<f64>();
+                evs.push((Move::Double, double_ev));
+
+                // It matters whether surrender is permitted before dealer checks for a
+                // natural.
+                let surrender_ev = if rules.early_surrender {
+                    // We're allowed to surrender regardless of the DealerOutcome
+                    -0.5
+                } else {
+                    late_surrender_ev(&dealer_probs)
+                };
+                evs.push((Move::Surrender, surrender_ev));
+
+                // TODO: Handle splitting. This might actually be quite complicated in general
+                // because each outcome in one arm conditions the results in the other(s). It also
+                // can be complicated by multi-splitting (which is sometimes limited to 2 or 4).
+            }
+            let ev_map = HashMap::from_iter(evs);
             let ins_res = full_ev_tree.insert(pl_hand, (weight, ev_map));
             assert!(ins_res.is_none());
         }
         // dbg!(pl_tot);
     }
     full_ev_tree
-}
-
-// TODO: Add the double-down evs to the full hard/soft strategy tree.
-fn add_double_evs(
-    _ev_tree: HashMap<CardCol, HashMap<Move, f64>>,
-) -> HashMap<CardCol, HashMap<Move, f64>> {
-    unimplemented!();
 }
 
 fn consolidate_strategy(
@@ -227,6 +277,10 @@ fn consolidate_strategy(
     for (state, hands_evs) in partitioned_evs.into_iter() {
         // For each move, collect a list of the weights and evs so we can perform a weighted average
         let mut move_wts_evs = HashMap::<Move, Vec<(f64, f64)>>::new();
+        // TODO: Splitting may need to be dealt with here, and/or below. Splitable hands are
+        // evaluated differently in strategy. We might need to expand or rework the HandState enum;
+        // or we might need another concept to distinguish between a starting hand and a given arm's
+        // outcome (which is more what HandState represents right now).
         for (weight, _hand, move_ev) in hands_evs.into_iter() {
             for (strat, ev) in move_ev.into_iter() {
                 move_wts_evs.entry(strat).or_default().push((weight, ev));
@@ -307,8 +361,10 @@ fn main() {
     // comparisons
     let dd = CardCol::from_decks(2);
     // let dd = CardCol::half_deck();
-    // let ev_map = build_hard_evs(dd, Card::Ace, &rules);
-    let ev_map = build_hard_evs(dd, Card::Pip(5), &rules);
+    // let ev_map = build_evs(dd, Card::Ace, &rules);
+    // let ev_map = build_evs(dd, Card::Ten, &rules);
+    // let ev_map = build_evs(dd, Card::Pip(9), &rules);
+    let ev_map = build_evs(dd, Card::Pip(5), &rules);
     let test_hand = CardCol::try_from("9A").unwrap();
     let soft20 = &ev_map[&test_hand];
     dbg!(soft20);

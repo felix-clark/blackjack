@@ -223,7 +223,7 @@ impl<S: Shoe> Iterator for WeightedPartitions<S> {
 
             // Push a child frame for each count `k` of `top_rank`, advancing the running per-level
             // scan-weight `level_weight` as we go. We push k = 0, 1, 2, ... and pop LIFO, so children
-            // come out in reverse k-order; order is irrelevant to the consumer (`build_hard_evs`
+            // come out in reverse k-order; order is irrelevant to the consumer (`build_evs`
             // keys a HashMap).
             let mut level_weight = 1.0;
             match self.shoe.rank_count(&top_rank) {
