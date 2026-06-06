@@ -263,11 +263,9 @@ fn _dealer_outcome_probs(
     let mut prob_map = HashMap::new();
     for (card, weight) in shoe.all_draw_probs() {
         assert!(weight > 0.);
-        let mut new_hand = hand.clone();
-        // new_hand.add(card);
-        new_hand.inner[&card] += 1;
+        let mut new_hand = hand;
+        new_hand.insert(card);
         let mut new_shoe = shoe.clone();
-        // NOTE: Can we do this operation such that the key is removed when zeroed?
         new_shoe.draw(&card);
         let draw_probs = _dealer_outcome_probs(new_hand, new_shoe);
         for (res, prob) in draw_probs.into_iter() {
