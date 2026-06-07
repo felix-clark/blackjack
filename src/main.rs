@@ -78,6 +78,32 @@ impl Display for Move {
     }
 }
 
+/// The row a concrete hand occupies in a strategy table.
+///
+/// Distinct from [`HandState`]: a pair is *also* a hard or soft total, but it is a different
+/// decision (split is available, and only here), so it gets its own category rather than being
+/// pooled into the corresponding total. `A,A` is `Pair(Ace)` and `T,T` is `Pair(Ten)` — neither
+/// falls through to `Soft`/`Hard`/`Natural`. Hard and soft categories still pool every composition
+/// (and size) of that total, which is where composition-dependent strategy is averaged out.
+#[derive(PartialEq, Eq, Debug, Hash, PartialOrd, Ord, Clone, Copy)]
+enum HandCategory {
+    Hard(u8),
+    Soft(u8),
+    Pair(Card),
+    Natural,
+}
+
+impl Display for HandCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HandCategory::Hard(n) => write!(f, "H{}", n),
+            HandCategory::Soft(n) => write!(f, "S{}", n),
+            HandCategory::Pair(c) => write!(f, "{},{}", c, c),
+            HandCategory::Natural => write!(f, "Nat"),
+        }
+    }
+}
+
 /// When (if ever) the player may forfeit half the bet instead of playing the hand out.
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub(crate) enum SurrenderRule {
@@ -128,8 +154,6 @@ impl Default for Ruleset {
             hs17: true,
             das: true,
             dealer_check: true,
-            // Preserves prior behavior: surrender was always evaluated, as late surrender, when the
-            // dealer peeks.
             surrender: SurrenderRule::Late,
         }
     }
@@ -162,16 +186,99 @@ fn dealer_natural_prob(up_card: Card, shoe: &impl Shoe) -> f64 {
     }
 }
 
+/// The rank that completes a dealer natural with `up_card` (Ten under an Ace, Ace under a Ten), or
+/// `None` for any other up-card, where a natural is impossible and no peek conditioning applies.
+fn natural_hole_rank(up_card: Card) -> Option<Card> {
+    match up_card {
+        Card::Ace => Some(Card::Ten),
+        Card::Ten => Some(Card::Ace),
+        _ => None,
+    }
+}
+
+/// Exact dealer outcome distribution **conditioned on the dealer having peeked and shown no
+/// natural**, given the deck `shoe` left after the up-card and the player's hand are removed.
+///
+/// Conditioning on "no dealer natural" is exactly conditioning on the hole card: it cannot be the
+/// `bj_rank`. So we stratify on the hole — for every non-`bj_rank` hole we seed the dealer with
+/// `(up_card, hole)`, remove that hole from the deck the dealer then draws from, and average the
+/// resulting distributions weighted by the conditional hole probability `P(hole | not natural)`.
+/// This is more than dropping the natural and renormalising ([`remove_nat21`]): removing the
+/// concrete hole before the dealer's later draws is what makes it exact on a finite shoe.
+fn conditional_dealer_dist<S: Shoe>(
+    up_card: Card,
+    bj_rank: Card,
+    shoe: &S,
+    hs17: bool,
+) -> HashMap<DealerOutcome, f64> {
+    let norm = 1.0 - shoe.draw_prob(&bj_rank); // P(hole is not the natural-completing rank)
+    let mut acc = HashMap::<DealerOutcome, f64>::new();
+    for (hole, p_hole) in shoe.all_draw_probs() {
+        if hole == bj_rank {
+            continue;
+        }
+        let w = p_hole / norm;
+        let seed = CardCol::from_hand(&[up_card, hole]);
+        let deck = shoe.remove_hand(&CardCol::from_hand(&[hole]));
+        for (outcome, p) in dealer_outcome_probs(seed, &deck, hs17) {
+            *acc.entry(outcome).or_insert(0.0) += w * p;
+        }
+    }
+    acc
+}
+
+/// The player's next-card distribution **conditioned on the dealer having peeked and shown no
+/// natural**, over the deck `shoe` left after the up-card and the player's hand are removed.
+///
+/// The dealer's (unseen) hole has been ruled out as the `bj_rank`, which removes one non-`bj_rank`
+/// card from the deck the player draws from — shifting the composition. Marginalising the hidden
+/// hole gives `P(draw c | not natural) = Σ_hole P(hole | not natural) · P(draw c | hole removed)`,
+/// computed exactly here. Only `Stand`/`Double`/`Hit` *draw* a card, so this is where the
+/// player-side card-removal effect of the peek enters; the recursion's `max` over the child's
+/// already-conditioned move EVs keeps the continuation non-clairvoyant (the player never "sees" the
+/// hole), so the result is the exact achievable EV rather than an upper bound.
+fn conditional_draw_probs<S: Shoe>(bj_rank: Card, shoe: &S) -> Vec<(Card, f64)> {
+    let norm = 1.0 - shoe.draw_prob(&bj_rank);
+    // Each admissible hole, paired with its conditional weight and the deck it leaves behind.
+    let hole_decks: Vec<(f64, S)> = shoe
+        .all_draw_probs()
+        .filter(|&(hole, _)| hole != bj_rank)
+        .map(|(hole, p_hole)| {
+            (
+                p_hole / norm,
+                shoe.remove_hand(&CardCol::from_hand(&[hole])),
+            )
+        })
+        .collect();
+    shoe.all_draw_probs()
+        .map(|(c, _)| {
+            let p_c = hole_decks
+                .iter()
+                .map(|(w, deck)| w * deck.draw_prob(&c))
+                .sum();
+            (c, p_c)
+        })
+        .collect()
+}
+
 /// Returns a map from a given player hand to a probability weight and an expectation value for each
 /// move made with that hand, assuming optimal H/S strategy afterwards.
 ///
+/// **Basis.** When the dealer peeks (`rules.dealer_check`) and the up-card can make a natural
+/// (Ace/Ten), every play EV here is *conditioned on the dealer having peeked and shown no natural* —
+/// the realistic "the hand is live, how do I play it" value, with both the dealer distribution and
+/// the player's own draws conditioned (see [`conditional_dealer_dist`] / [`conditional_draw_probs`]).
+/// Otherwise (no peek, or an up-card that can't make a natural) the EVs are unconditional. A player
+/// natural is always recorded on the unconditional basis — it has no decision and resolves at the
+/// peek, so its honest EV is `(1 - P_bj)·1.5` (a push against a dealer natural) regardless of rules.
+/// The unconditional/house-advantage value of a peek game is recoverable from this tree at the
+/// two-card root: `-P_bj + (1 - P_bj)·V`, exact because the peek precedes the player's move.
+///
 /// The weight is the shoe's partition scan-weight for that exact multiset (see
-/// [`Shoe::weighted_partitions`]). Its meaning depends on the shoe: for the [`InfiniteDeck`] it is
-/// the exact multinomial occurrence probability of the hand, but for a finite [`CardCol`] it is the
-/// hypergeometric weight of drawing the hand *in isolation* — a purely combinatorial factor, not the
-/// realistic probability of holding it in play (which would have to account for the up-card and the
-/// dealer's draws depleting the same shoe). It is used only as a relative weight when collapsing
-/// per-hand EVs into per-[`HandState`] summaries in [`consolidate_strategy`].
+/// [`Shoe::weighted_partitions`]), times `(1 - P_bj)` on the conditional basis so it is the
+/// conditional occurrence probability `P(hold hand | no dealer natural)`. Within a fixed hand size
+/// it is exact; across sizes the scan-weight is not a coherent distribution (a known deferred
+/// imprecision), so it is only a relative pooling weight in [`summarize_evs`].
 // TODO: Should this be a struct so it can recursively build the table by demand?
 fn build_evs(
     mut shoe: impl Shoe,
@@ -188,6 +295,11 @@ fn build_evs(
     // we must wait to resolve the dealer's result conditioned on the players hand.
     let dealer_hand = CardCol::from_hand(&[up_card]);
 
+    // Peek conditioning only bites when the dealer actually peeks *and* the up-card can make a
+    // natural; otherwise the conditional and unconditional bases coincide and we take the plain one.
+    let bj_rank = natural_hole_rank(up_card);
+    let conditional = rules.dealer_check && bj_rank.is_some();
+
     let mut full_ev_tree = HashMap::<CardCol, (f64, HashMap<Move, f64>)>::new();
 
     // Go down to 2 to get all soft options as well
@@ -196,43 +308,68 @@ fn build_evs(
             if pl_hand.len() < 2 {
                 continue;
             }
-            if pl_hand.is_nat21() {
-                continue;
-            }
 
-            // // This should hold, but it's expensive to check big combination factors.
-            // // It compares the weighs with the hypergeometric distribution terms.
-            // let norm_weight = check_hg_norm_weights(&pl_hand, &shoe);
-            // assert!((weight - norm_weight).abs() < 1e-10);
-
-            // We want to neglect naturals from this analysis, but these should be excluded from
-            // the soft check.
-            assert!(!pl_hand.is_nat21());
             // Assert that we aren't overdrawing; this should be a given if
             // weighted_hard_partitions() is correct (always true for the infinite deck).
             assert!(shoe.contains_hand(&pl_hand));
             let shoe_minus_hand = shoe.remove_hand(&pl_hand);
-            // The dealer-natural conditioning (peek rule) is applied inside `dealer_outcome_probs`
-            // per `rules.dealer_check`.
-            let dealer_probs = dealer_outcome_probs(dealer_hand, shoe_minus_hand.clone(), rules);
+
+            // A natural is a terminal two-card hand with no decision to make: it simply resolves
+            // (3:2, or a push against a dealer natural). Record it as a leaf so the consolidation
+            // and house-advantage layers can account for it, but offer it no playable moves — in
+            // particular never a double or surrender. It is always scored on the *unconditional*
+            // dealer distribution: a natural resolves at the peek itself, so its honest EV must keep
+            // the push-against-a-dealer-natural mass rather than condition it away. A natural is
+            // never reached as a hit target (three cards can't total a two-card 21), so the Hit DP
+            // below never looks it up.
+            if pl_hand.is_nat21() {
+                let nat_ev = dealer_outcome_probs(dealer_hand, &shoe_minus_hand, rules.hs17)
+                    .iter()
+                    .map(|(&dealer, p)| p * resolve_ev(&pl_hand, dealer))
+                    .sum::<f64>();
+                let ev_map = HashMap::from_iter([(Move::Stand, nat_ev)]);
+                let ins_res = full_ev_tree.insert(pl_hand, (weight, ev_map));
+                assert!(ins_res.is_none());
+                continue;
+            }
+
+            // Dealer outcome distribution against this hand, conditioned on a clean peek when the
+            // peek applies. On the conditional basis there is no `Natural` outcome at all (it was
+            // conditioned out), so every move below resolves naturally with no peek special-casing.
+            let dealer_probs = if conditional {
+                conditional_dealer_dist(up_card, bj_rank.unwrap(), &shoe_minus_hand, rules.hs17)
+            } else {
+                dealer_outcome_probs(dealer_hand, &shoe_minus_hand, rules.hs17)
+            };
             let stand_ev = dealer_probs
                 .iter()
                 .map(|(&dealer, p)| p * resolve_ev(&pl_hand, dealer))
                 .sum::<f64>();
-            let hit_ev = shoe_minus_hand
-                .all_draw_probs()
-                .map(|(c, p_c)| {
+
+            // The player's next-card distribution, conditioned to match the dealer distribution.
+            let draw_probs: Vec<(Card, f64)> = if conditional {
+                conditional_draw_probs(bj_rank.unwrap(), &shoe_minus_hand)
+            } else {
+                shoe_minus_hand.all_draw_probs().collect()
+            };
+
+            // Hitting draws a card then plays on optimally: the child's *best* move EV. The child
+            // is already in the tree (it totals more, computed on an earlier, higher `pl_tot`).
+            // Taking the max over the child's already-conditioned move EVs keeps the continuation
+            // non-clairvoyant about the hole.
+            let hit_ev = draw_probs
+                .iter()
+                .map(|&(c, p_c)| {
                     let mut pl_hand_hit = pl_hand;
                     pl_hand_hit.insert(c);
-                    let pl_hand_hit = pl_hand_hit;
                     p_c * match full_ev_tree.get(&pl_hand_hit) {
-                        Some((_w, ev_map)) => ev_map
+                        Some((_w, ev_map)) => *ev_map
                             .values()
                             .max_by(|a, b| a.partial_cmp(b).unwrap())
                             .unwrap(),
                         None => {
                             assert!(HandState::from(&pl_hand_hit) == HandState::Bust);
-                            &-1.
+                            -1.
                         }
                     }
                 })
@@ -241,62 +378,39 @@ fn build_evs(
             // If this is a starting hand (i.e. length two) then we may also have the option to
             // double down, split, or surrender.
             if pl_hand.len() == 2 {
-                // While supposedly some casinos allow doubling at any time, I've never encountered
-                // this so I'll just assume it's only permitted at the start. If we don't restrict
-                // this, we could pollute the EV tree with inflated maximum EV that would affect
-                // other values.
-                let double_ev = 2.0
-                    * shoe_minus_hand
-                        .all_draw_probs()
-                        .map(|(c, p_c)| {
-                            let mut pl_hand_dd = pl_hand;
-                            pl_hand_dd.insert(c);
-                            // we need to use updated dealer_probs with this particular card removed. We
-                            // didn't need to do this in the Hit case because that either busts or
-                            // resolves on the existing tree.
-                            let dd_shoe = shoe.remove_hand(&pl_hand_dd);
-                            let dealer_dd_probs = dealer_outcome_probs(dealer_hand, dd_shoe, rules);
-                            p_c * dealer_dd_probs
-                                .iter()
-                                .map(|(&dealer, p)| p * resolve_ev(&pl_hand_dd, dealer))
-                                .sum::<f64>()
-                        })
-                        .sum::<f64>();
+                // Doubling draws exactly one card then stands. The child's stored `Stand` EV already
+                // resolves against the dealer distribution with that card removed and on this same
+                // (conditional or unconditional) basis, so the doubled payoff is just twice it — no
+                // separate dealer recomputation, and no peek special case. On the conditional basis
+                // a dealer natural can't occur; on the no-peek basis the child's `Stand` EV already
+                // carries -1 per natural, so 2x correctly forfeits the whole doubled bet to it.
+                // (Doubling is assumed start-only; allowing it mid-hand would inflate the Hit DP.)
+                let double_ev = draw_probs
+                    .iter()
+                    .map(|&(c, p_c)| {
+                        let mut pl_hand_dd = pl_hand;
+                        pl_hand_dd.insert(c);
+                        let child_stand = match full_ev_tree.get(&pl_hand_dd) {
+                            Some((_w, ev_map)) => ev_map[&Move::Stand],
+                            None => {
+                                assert!(HandState::from(&pl_hand_dd) == HandState::Bust);
+                                -1.
+                            }
+                        };
+                        p_c * 2.0 * child_stand
+                    })
+                    .sum::<f64>();
                 evs.push((Move::Double, double_ev));
 
-                // Surrender forfeits half the bet. The subtlety is the *basis* of the value we
-                // store: every other entry in this map is measured against `dealer_probs`, which is
-                // conditioned on "no dealer blackjack" when the dealer peeks (`dealer_check`) and
-                // unconditional otherwise. Surrender must be put on the same basis so a plain argmax
-                // over the map stays correct.
+                // Surrender forfeits half the bet for a flat -0.5 on whichever basis this tree is
+                // on: late surrender happens after a clean peek (the conditional basis already
+                // excludes the dealer natural), and early surrender escapes the natural before the
+                // peek (an unconditional -0.5). NOTE: early surrender *combined with* a peek is the
+                // one ragged case — that decision is genuinely pre-peek and would need an
+                // unconditional root comparison; it is uncommon and left for later.
                 let surrender_ev = match rules.surrender {
                     SurrenderRule::None => None,
-                    // Late surrender only happens once the dealer has peeked and shown no natural
-                    // (guaranteed coherent by `rules.validate()`). The map is then conditional on
-                    // exactly that event, so surrendering is worth a flat -0.5.
-                    SurrenderRule::Late => Some(-0.5),
-                    SurrenderRule::Early => Some(if rules.dealer_check {
-                        // Early surrender is decided *before* the peek and forfeits half a unit
-                        // unconditionally (true EV -0.5), but the rest of the map is conditional on
-                        // the dealer not having a natural. Re-express -0.5 on that conditional basis
-                        // so the comparison is exact: early surrender beats a play of conditional EV
-                        // `c` iff -0.5 > P_bj*(-1) + (1 - P_bj)*c, i.e. iff c < (P_bj - 0.5)/(1 -
-                        // P_bj). Storing that threshold makes argmax pick surrender exactly when it
-                        // should (and collapses to -0.5 when P_bj = 0). NOTE: this stored number is
-                        // a decision-equivalent value, not the raw -0.5, so a display layer should
-                        // special-case the early-surrender EV.
-                        //
-                        // We recompute P_bj rather than read `dealer_probs[Natural]`: this is the
-                        // peek branch, so `dealer_probs` has already had its natural stripped and the
-                        // rest renormalized by 1/(1 - P_bj) (see `remove_nat21`), throwing the
-                        // unconditioned mass we need away.
-                        let p_bj = dealer_natural_prob(up_card, &shoe_minus_hand);
-                        (p_bj - 0.5) / (1.0 - p_bj)
-                    } else {
-                        // No peek: the map is already unconditional, so early surrender is directly
-                        // -0.5.
-                        -0.5
-                    }),
+                    SurrenderRule::Early | SurrenderRule::Late => Some(-0.5),
                 };
                 if let Some(surrender_ev) = surrender_ev {
                     evs.push((Move::Surrender, surrender_ev));
@@ -306,8 +420,15 @@ fn build_evs(
                 // because each outcome in one arm conditions the results in the other(s). It also
                 // can be complicated by multi-splitting (which is sometimes limited to 2 or 4).
             }
+            // On the conditional basis the pooling weight becomes the conditional occurrence
+            // probability P(hold hand | no dealer natural) ∝ scan-weight · (1 - P_bj).
+            let stored_weight = if conditional {
+                weight * (1.0 - dealer_natural_prob(up_card, &shoe_minus_hand))
+            } else {
+                weight
+            };
             let ev_map = HashMap::from_iter(evs);
-            let ins_res = full_ev_tree.insert(pl_hand, (weight, ev_map));
+            let ins_res = full_ev_tree.insert(pl_hand, (stored_weight, ev_map));
             assert!(ins_res.is_none());
         }
         // dbg!(pl_tot);
@@ -315,57 +436,78 @@ fn build_evs(
     full_ev_tree
 }
 
-fn consolidate_strategy(
-    ev_tree: HashMap<CardCol, (f64, HashMap<Move, f64>)>,
-    // ) -> HashMap<HandState, HashMap<Move, f64>> {
-) -> HashMap<HandState, Move> {
-    let mut summary_tree = HashMap::new();
+/// The rank of a two-card pair, if the hand is one (exactly two cards of the same rank).
+fn pair_rank(hand: &CardCol) -> Option<Card> {
+    if hand.len() != 2 {
+        return None;
+    }
+    hand.iter().find(|&(_, n)| n == 2).map(|(c, _)| c)
+}
 
-    let mut partitioned_evs = HashMap::<HandState, Vec<(f64, CardCol, HashMap<Move, f64>)>>::new();
+/// Route a concrete hand to its strategy-table row (see [`HandCategory`]). Pairs take priority over
+/// the hard/soft total they also form; everything else defers to [`HandState`].
+fn categorize(hand: &CardCol) -> HandCategory {
+    if let Some(rank) = pair_rank(hand) {
+        return HandCategory::Pair(rank);
+    }
+    match HandState::from(hand) {
+        HandState::Natural => HandCategory::Natural,
+        HandState::Soft(n) => HandCategory::Soft(n),
+        HandState::Hard(n) => HandCategory::Hard(n),
+        // The tree only holds hands totalling at most 21, so a stored hand is never bust.
+        HandState::Bust => unreachable!("a stored hand totals at most 21, so it is never bust"),
+    }
+}
+
+/// Collapse the per-exact-hand EV tree into one move→EV map per strategy-table [`HandCategory`],
+/// pooling every composition (and size) of a category by a weighted average.
+///
+/// The pooling weight is the tree's combinatorial scan-weight. Within a fixed hand size it is the
+/// exact occurrence probability, but across sizes it is not a coherent distribution (see the
+/// cross-size weighting note); it is the best stand-in available until a game-time
+/// probability-of-hand is implemented, at which point only this weighting need change. A move only
+/// contributes from the hands that actually offer it, so e.g. `Double`/`Surrender` for a hard total
+/// reflect only its two-card members.
+fn summarize_evs(
+    ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
+) -> HashMap<HandCategory, HashMap<Move, f64>> {
+    // category -> move -> (Σ weight, Σ weight·ev), accumulated for a streaming weighted average.
+    let mut acc = HashMap::<HandCategory, HashMap<Move, (f64, f64)>>::new();
     for (hand, (weight, move_ev)) in ev_tree.iter() {
-        let state = HandState::from(hand);
-        partitioned_evs
-            .entry(state)
-            .or_default()
-            .push((*weight, *hand, move_ev.clone()));
-    }
-
-    for (state, hands_evs) in partitioned_evs.into_iter() {
-        // For each move, collect a list of the weights and evs so we can perform a weighted average
-        let mut move_wts_evs = HashMap::<Move, Vec<(f64, f64)>>::new();
-        // TODO: Splitting may need to be dealt with here, and/or below. Splitable hands are
-        // evaluated differently in strategy. We might need to expand or rework the HandState enum;
-        // or we might need another concept to distinguish between a starting hand and a given arm's
-        // outcome (which is more what HandState represents right now).
-        for (weight, _hand, move_ev) in hands_evs.into_iter() {
-            for (strat, ev) in move_ev.into_iter() {
-                move_wts_evs.entry(strat).or_default().push((weight, ev));
-            }
+        let moves = acc.entry(categorize(hand)).or_default();
+        for (&mv, &ev) in move_ev.iter() {
+            let (wt_sum, wt_ev_sum) = moves.entry(mv).or_insert((0.0, 0.0));
+            *wt_sum += *weight;
+            *wt_ev_sum += *weight * ev;
         }
-        // Average out the EVs from each specific hand to collapse the move-EV relationship over all
-        // specific hands to one summary (e.g. Hard 16).
-        // This should represent more complete information than what is returned in this method.
-        // TODO: Factor this consolidate_strategy() method into one that generates this move-EV
-        // mapping and stores it for each HandState, and one that returns the best move for each
-        // HandState given that mapping.
-        let move_evs =
-            HashMap::<Move, f64>::from_iter(move_wts_evs.into_iter().map(|(strat, wts_evs)| {
-                let total_wt: f64 = wts_evs.iter().map(|(w, _)| w).sum();
-                let weighted_ev: f64 = wts_evs.iter().map(|(w, ev)| w * ev).sum();
-                (strat, weighted_ev / total_wt)
-            }));
-
-        let best_move = move_evs
-            .into_iter()
-            // This will crash on NaNs but we shouldn't be getting any
-            .max_by(|(_, eva), (_, evb)| eva.partial_cmp(evb).unwrap())
-            .map(|(strat, _)| strat)
-            .expect("There should be at least one move here");
-
-        let ins_res = summary_tree.insert(state, best_move);
-        assert!(ins_res.is_none());
     }
-    summary_tree
+    acc.into_iter()
+        .map(|(cat, moves)| {
+            let move_evs = moves
+                .into_iter()
+                .map(|(mv, (wt_sum, wt_ev_sum))| (mv, wt_ev_sum / wt_sum))
+                .collect();
+            (cat, move_evs)
+        })
+        .collect()
+}
+
+/// Reduce a per-category move→EV summary (from [`summarize_evs`]) to the single best move per row.
+fn best_strategy(
+    summary: &HashMap<HandCategory, HashMap<Move, f64>>,
+) -> HashMap<HandCategory, Move> {
+    summary
+        .iter()
+        .map(|(&cat, move_evs)| {
+            let best = move_evs
+                .iter()
+                // Panics on a NaN EV, which the solver should never produce.
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(&mv, _)| mv)
+                .expect("every category has at least one move");
+            (cat, best)
+        })
+        .collect()
 }
 
 fn main() {
@@ -395,20 +537,16 @@ fn main() {
 
     let rules = Ruleset::default();
     let dd = CardCol::from_decks(2);
-    // `dealer_check: false` keeps the raw distribution (natural included) so we can show both the
-    // unconditioned probs and the peek-conditioned ones side by side.
-    let no_peek = Ruleset {
-        dealer_check: false,
-        ..Ruleset::default()
-    };
-    let base_deal_probs = dealer_outcome_probs(CardCol::new(), dd, &no_peek);
+    // `dealer_outcome_probs` is now always the raw (natural-included) distribution; apply
+    // `remove_nat21` to show the peek-conditioned version side by side.
+    let base_deal_probs = dealer_outcome_probs(CardCol::new(), &dd, rules.hs17);
     let norm = base_deal_probs.values().sum::<f64>();
     assert!((norm - 1.0).abs() < 1e-12);
     println!("{:?}\nnorm: {}", &base_deal_probs, norm);
     println!("{:?}\nnorm: {}", remove_nat21(base_deal_probs), norm);
 
     let dd = InfiniteDeck {};
-    let base_deal_probs = dealer_outcome_probs(CardCol::new(), dd, &no_peek);
+    let base_deal_probs = dealer_outcome_probs(CardCol::new(), &dd, rules.hs17);
     let norm = base_deal_probs.values().sum::<f64>();
     assert!((norm - 1.0).abs() < 1e-12);
     println!("{:?}\nnorm: {}", base_deal_probs, norm);
@@ -417,18 +555,19 @@ fn main() {
     // comparisons
     let dd = CardCol::from_decks(2);
     // let dd = CardCol::half_deck();
-    // let ev_map = build_evs(dd, Card::Ace, &rules);
-    // let ev_map = build_evs(dd, Card::Ten, &rules);
+    // let ev_map = build_evs(dd, Card::Pip(5), &rules);
+    // let ev_map = build_evs(dd, Card::Pip(5), &rules);
     // let ev_map = build_evs(dd, Card::Pip(9), &rules);
     let ev_map = build_evs(dd, Card::Pip(5), &rules);
     let test_hand = CardCol::try_from("9A").unwrap();
     let soft20 = &ev_map[&test_hand];
     dbg!(soft20);
 
-    let strat = consolidate_strategy(ev_map);
+    let summary = summarize_evs(&ev_map);
+    let strat = best_strategy(&summary);
     let mut sorted_strat: Vec<_> = strat.into_iter().collect();
-    sorted_strat.sort_by_key(|(h, _m)| *h);
-    for (hand, strat) in sorted_strat.into_iter() {
-        println!("{}: {}", hand, strat);
+    sorted_strat.sort_by_key(|(cat, _m)| *cat);
+    for (cat, strat) in sorted_strat.into_iter() {
+        println!("{}: {}", cat, strat);
     }
 }

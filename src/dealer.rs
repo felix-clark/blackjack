@@ -1,4 +1,3 @@
-use crate::Ruleset;
 use crate::card::Card;
 use crate::shoe::{CardCol, Shoe};
 use std::collections::HashMap;
@@ -144,7 +143,15 @@ impl DealerHand {
     }
 }
 
-/// Exact distribution over dealer outcomes from a given starting hand and shoe.
+/// Exact, *unconditional* distribution over dealer outcomes from a given starting hand and shoe —
+/// the dealer natural is left in as its own outcome (mass `P(nat)`), never stripped here.
+///
+/// This is deliberately rule-agnostic apart from `hs17`. The dealer-natural (peek) conditioning is
+/// **not** applied in this hot path: a natural is a flat `-1` on every player line of three-plus
+/// cards, so conditioning on "no dealer natural" is an affine transform with the same constants for
+/// every move and only changes *reported* EVs, not the argmax. It therefore belongs once, at the
+/// 2-card root of the EV tree (see `build_evs`), not threaded through this recursion. Callers that
+/// genuinely want the conditioned distribution can apply [`remove_nat21`] themselves.
 ///
 /// Generic over any [`Shoe`], so it serves both a finite [`CardCol`] (draws deplete the tally) and
 /// the [`InfiniteDeck`](crate::shoe::InfiniteDeck) (draws are no-ops at fixed 1/13 probabilities)
@@ -153,21 +160,12 @@ impl DealerHand {
 /// sound key, and this collapses the factorial of draw orders to the distinct reachable hands.
 pub fn dealer_outcome_probs(
     hand: CardCol,
-    shoe: impl Shoe,
-    rules: &Ruleset,
+    shoe: &impl Shoe,
+    hs17: bool,
 ) -> HashMap<DealerOutcome, f64> {
     let mut memo: HashMap<DealerHand, DealerDist> = HashMap::new();
-    let dist = dealer_dist(DealerHand::from_cards(&hand), &shoe, rules.hs17, &mut memo);
-    let probs = dealer_dist_to_map(dist);
-    // When the dealer peeks for blackjack the player only ever acts in games where the dealer has
-    // no natural, so they face the outcome distribution conditioned on `not natural`. Renormalizing
-    // the terminal distribution is exact, not an approximation: a natural is a terminal state
-    // disjoint from every other outcome, so `P(o | not-nat) = P(o) / (1 - P(nat))` for each `o`.
-    if rules.dealer_check {
-        remove_nat21(probs)
-    } else {
-        probs
-    }
+    let dist = dealer_dist(DealerHand::from_cards(&hand), shoe, hs17, &mut memo);
+    dealer_dist_to_map(dist)
 }
 
 fn dealer_dist<S: Shoe>(
