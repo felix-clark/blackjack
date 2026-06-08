@@ -16,6 +16,7 @@ pub(crate) enum SurrenderRule {
 }
 
 /// The stipulation of miscellaneous rules other than the number of decks (?).
+#[derive(Clone, Copy, PartialEq)]
 pub(crate) struct Ruleset {
     /// Whether the dealer hits soft 17
     pub(crate) hs17: bool,

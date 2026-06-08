@@ -5,17 +5,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 - Build: `cargo build`
-- Run: `cargo run` (the binary's `main` is currently a scratchpad of assertions and demos, not a real CLI)
+- Run: `cargo run` (launches the TUI — see `src/tui.rs`)
 - Check without building: `cargo check`
 - Lint: `cargo clippy`
 - Format: `cargo fmt`
-- Tests: `cargo test` (no `#[test]` functions exist yet; correctness is currently enforced by `assert!`/`dbg!` inside the compute functions and in `main`)
+- Tests: `cargo test` (regression `#[test]`s pin verified EVs/strategy cells in `src/simulation.rs` and `src/split.rs`; some compute functions also self-check with `assert!`)
 
-This is edition 2024 Rust with **no external dependencies** (the standard library only).
+This is edition 2024 Rust. The **only external dependency is `ratatui`** (the TUI), and it is confined to `src/tui.rs`; the solver engine and all other modules remain standard-library-only.
 
 ## Architecture
 
-The project computes **optimal blackjack basic strategy and per-hand expected values (EVs)** by exact enumeration over a finite shoe (or an infinite deck). There is no game loop or player interaction — it's a solver.
+The project computes **optimal blackjack basic strategy and per-hand expected values (EVs)** by exact enumeration over a finite shoe (or an infinite deck). There is no game *loop* — the solver computes EVs/strategy outright — but there is now a front end: a `ratatui` TUI (`src/tui.rs`) that renders the strategy chart and per-move EVs over the solver.
 
 ### Core data model (`src/card.rs`, `src/shoe.rs`)
 
@@ -41,7 +41,7 @@ The target is a **TUI** for asking arbitrary probability questions about blackja
 - a ruleset,
 - optionally a running/true count under a chosen card-counting system,
 
-and the program displays the EV of each available player move. Alternative views are also planned, e.g. printing the full basic-strategy chart for a given ruleset (and optional count). The current solver (`build_evs` → `consolidate_strategy`) is the compute backend for that front end; `main` is throwaway scaffolding around it.
+and the program displays the EV of each available player move. The first cut of this front end exists in `src/tui.rs`: a `ratatui` strategy-chart view (three Hard/Soft/Pairs panes navigable with vim motions) with an EV popup per highlighted hand/up-card, and a rules-editing modal. The chart is solved asynchronously — one worker thread per up-card, results streamed back over an `mpsc` channel and tagged with an `epoch` so a rules/deck change discards stale results. Still planned: a concrete/abstract single-hand query view (`9A` or `Hard 14`) and the card-counting dimension. The solver (`build_evs` → `summarize_evs`/`best_strategy`) is the compute backend; `main` just calls `tui::run`.
 
 Implications for current work:
 - The count dimension means draw probabilities must be conditionable on a known partial-deck composition — `Shoe`/`CardCol` are already the right seam for this, but a counting system is a *mapping from deck composition to a count value* and the reverse (count → adjusted draw distribution) is the new piece.
@@ -49,4 +49,4 @@ Implications for current work:
 
 ### Status
 
-The code is mid-development and intentionally annotated. Several things are stubbed or partial: `add_double_evs` is `unimplemented!()`, `Move::{Double, Split, Surrender}` exist but aren't yet scored, the (so far unused) `Ruleset` struct is the planned home for rule variants, and many `TODO`s flag where weights/iterators/allocations are meant to be revisited. There is no TUI layer yet. When extending, mirror the existing convention: enumerate exactly, assert distributions sum to 1 within ~1e-12, and validate new weights against the hypergeometric cross-checks. Reference EV/strategy numbers come from wizardofodds.com (linked in `main`).
+The code is mid-development and intentionally annotated. Several things are stubbed or partial: `add_double_evs` is `unimplemented!()`, `Move::{Double, Split, Surrender}` exist but aren't yet scored, the (so far unused) `Ruleset` struct is the planned home for rule variants, and many `TODO`s flag where weights/iterators/allocations are meant to be revisited. The TUI (`src/tui.rs`) covers the chart + EV-popup + rules-modal views; the single-hand query view and card-counting input are not built yet (counting isn't in the solver at all — `ShoeChoice` in the TUI is the seam where a count-adjusted draw distribution would plug in). When extending, mirror the existing convention: enumerate exactly, assert distributions sum to 1 within ~1e-12, and validate new weights against the hypergeometric cross-checks. Reference EV/strategy numbers come from wizardofodds.com (linked in `main`).

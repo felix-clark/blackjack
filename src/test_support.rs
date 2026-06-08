@@ -8,7 +8,7 @@ use crate::card::*;
 use crate::hand::{HandCategory, Move};
 use crate::rules::Ruleset;
 use crate::shoe::*;
-use crate::simulation::{best_strategy, build_evs, summarize_evs};
+use crate::simulation::{build_evs, summarize_evs};
 
 /// The default ruleset with only the split-accuracy budget overridden — the single knob the tests
 /// vary (`0` = independent arms, [`Ruleset::EXACT_SPLIT`] = full exact cross-arm search).
@@ -30,6 +30,25 @@ pub(crate) fn ev_tree(up_card: Card) -> HashMap<CardCol, (f64, HashMap<Move, f64
 /// The consolidated best-move-per-category strategy for `up_card` on the 2-deck [`ev_tree`].
 pub(crate) fn strategy_for(up_card: Card) -> HashMap<HandCategory, Move> {
     best_strategy(&summarize_evs(&ev_tree(up_card)))
+}
+
+/// Reduce a per-category move→EV summary (from [`summarize_evs`]) to the single best move per row.
+/// Exercised by the strategy tests; the TUI argmaxes per cell inline rather than calling this.
+fn best_strategy(
+    summary: &HashMap<HandCategory, HashMap<Move, f64>>,
+) -> HashMap<HandCategory, Move> {
+    summary
+        .iter()
+        .map(|(&cat, move_evs)| {
+            let best = move_evs
+                .iter()
+                // Panics on a NaN EV, which the solver should never produce.
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(&mv, _)| mv)
+                .expect("every category has at least one move");
+            (cat, best)
+        })
+        .collect()
 }
 
 #[track_caller]

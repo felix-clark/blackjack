@@ -1,8 +1,8 @@
 //! The solver engine: the exact-enumeration EV computation over a shoe.
 //!
 //! [`build_evs`] is the main driver — a dynamic program over the partition lattice that produces the
-//! per-exact-hand move→EV tree for one up-card. [`summarize_evs`]/[`best_strategy`] collapse that
-//! tree into the strategy chart. [`Basis`] bundles the dealer-outcome and player-draw distributions
+//! per-exact-hand move→EV tree for one up-card. [`summarize_evs`] collapses that
+//! tree into the per-category move→EV summary behind the strategy chart. [`Basis`] bundles the dealer-outcome and player-draw distributions
 //! (and the peek conditioning) shared with the split solver ([`crate::split`]); [`resolve_ev`] is the
 //! terminal payoff table. The hand/move vocabulary lives in [`crate::hand`], rule knobs in
 //! [`crate::rules`].
@@ -70,7 +70,7 @@ fn natural_hole_rank(up_card: Card) -> Option<Card> {
 /// `bj_rank`. So we stratify on the hole — for every non-`bj_rank` hole we seed the dealer with
 /// `(up_card, hole)`, remove that hole from the deck the dealer then draws from, and average the
 /// resulting distributions weighted by the conditional hole probability `P(hole | not natural)`.
-/// This is more than dropping the natural and renormalising ([`remove_nat21`](crate::dealer::remove_nat21)):
+/// This is more than dropping the natural and renormalising ([`remove_nat21`](crate::legacy::remove_nat21)):
 /// removing the concrete hole before the dealer's later draws is what makes it exact on a finite shoe.
 fn conditional_dealer_dist<S: Shoe>(
     up_card: Card,
@@ -391,23 +391,6 @@ pub(crate) fn summarize_evs(
         .collect()
 }
 
-/// Reduce a per-category move→EV summary (from [`summarize_evs`]) to the single best move per row.
-pub(crate) fn best_strategy(
-    summary: &HashMap<HandCategory, HashMap<Move, f64>>,
-) -> HashMap<HandCategory, Move> {
-    summary
-        .iter()
-        .map(|(&cat, move_evs)| {
-            let best = move_evs
-                .iter()
-                // Panics on a NaN EV, which the solver should never produce.
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(&mv, _)| mv)
-                .expect("every category has at least one move");
-            (cat, best)
-        })
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {

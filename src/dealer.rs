@@ -151,7 +151,7 @@ impl DealerHand {
 /// cards, so conditioning on "no dealer natural" is an affine transform with the same constants for
 /// every move and only changes *reported* EVs, not the argmax. It therefore belongs once, at the
 /// 2-card root of the EV tree (see `build_evs`), not threaded through this recursion. Callers that
-/// genuinely want the conditioned distribution can apply [`remove_nat21`] themselves.
+/// genuinely want the conditioned distribution can apply [`remove_nat21`](crate::legacy::remove_nat21) themselves.
 ///
 /// Generic over any [`Shoe`], so it serves both a finite [`CardCol`] (draws deplete the tally) and
 /// the [`InfiniteDeck`](crate::shoe::InfiniteDeck) (draws are no-ops at fixed 1/13 probabilities)
@@ -201,18 +201,4 @@ fn dealer_dist<S: Shoe>(
     }
     memo.insert(hand, dist);
     dist
-}
-
-pub fn remove_nat21(dealer_outcomes: HashMap<DealerOutcome, f64>) -> HashMap<DealerOutcome, f64> {
-    let nat_prob: f64 = *dealer_outcomes.get(&DealerOutcome::Natural).unwrap_or(&0.);
-    let scale = 1.0 / (1.0 - nat_prob);
-    let new_map = HashMap::from_iter(dealer_outcomes.into_iter().filter_map(|(o, p)| {
-        if let DealerOutcome::Natural = o {
-            None
-        } else {
-            Some((o, p * scale))
-        }
-    }));
-    assert!((new_map.values().sum::<f64>() - 1.0).abs() < 1e-12);
-    new_map
 }

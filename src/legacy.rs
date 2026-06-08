@@ -1,5 +1,5 @@
 /// Methods we're no longer using, typically because they've been optimized out.
-use crate::{Card, CardCol, dealer::DealerOutcome, shoe::Shoe};
+use crate::{card::Card, dealer::DealerOutcome, shoe::CardCol, shoe::Shoe};
 
 use std::collections::HashMap;
 
@@ -148,4 +148,22 @@ fn check_hg_norm_weights(hand: &CardCol, deck: &CardCol) -> f64 {
     // This is prohibitively expensive for multiple decks:
     let den = choose(deck.len(), hand.len());
     num as f64 / den as f64
+}
+
+/// Used to display the peek-conditioned dealer distribution alongside the raw one; not on the solver
+/// hot path (which conditions exactly). The solver applies the peek conditioning once at the 2-card
+/// root of the EV tree, so this standalone renormalisation is no longer called.
+#[allow(dead_code)]
+pub fn remove_nat21(dealer_outcomes: HashMap<DealerOutcome, f64>) -> HashMap<DealerOutcome, f64> {
+    let nat_prob: f64 = *dealer_outcomes.get(&DealerOutcome::Natural).unwrap_or(&0.);
+    let scale = 1.0 / (1.0 - nat_prob);
+    let new_map = HashMap::from_iter(dealer_outcomes.into_iter().filter_map(|(o, p)| {
+        if let DealerOutcome::Natural = o {
+            None
+        } else {
+            Some((o, p * scale))
+        }
+    }));
+    assert!((new_map.values().sum::<f64>() - 1.0).abs() < 1e-12);
+    new_map
 }
