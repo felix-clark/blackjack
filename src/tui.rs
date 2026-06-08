@@ -4,7 +4,7 @@
 //! a rules modal edits the [`Ruleset`] (and deck count).
 //!
 //! Compute is asynchronous: each of the ten up-cards is solved on its own worker thread
-//! ([`build_evs`] + [`summarize_evs`]) and the chart fills in column-by-column as results arrive, so
+//! ([`build_evs`] + [`summarize_cells`]) and the chart fills in column-by-column as results arrive, so
 //! the interface never blocks. A monotonic `epoch` tags every batch; results from a superseded epoch
 //! (a rules/deck change happened) are discarded rather than interrupting the worker.
 //!
@@ -26,8 +26,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::card::Card;
-use crate::hand::{best_move, HandCategory, Move};
-use crate::reach::{reach_weights, summarize_with};
+use crate::hand::{HandCategory, Move};
+use crate::reach::{CellInfo, reach_weights, summarize_cells};
 use crate::rules::{BjPayout, PeekRule, PeekSurrender, Ruleset};
 use crate::shoe::{CardCol, InfiniteDeck, Shoe};
 use crate::simulation::{EdgeTerm, build_evs, edge_term};
@@ -90,17 +90,18 @@ impl ShoeChoice {
     }
 }
 
-/// Solve and consolidate one up-card column on a concrete shoe `S`. Cells are pooled by the game-time
-/// **reaching weight** ([`reach_weights`] → [`summarize_with`], split arms folded in): how often each
-/// composition is actually the hand in front of a deciding player. This corrects the combinatorial
-/// scan-weight's cross-size bias (chiefly by zeroing the unreachable compositions); the reaching pass
-/// is cheap next to `build_evs`. `p_up` is the up-card's draw probability from the *full* shoe
-/// (before `build_evs` removes it).
+/// Solve and consolidate one up-card column on a concrete shoe `S`. Cells are consolidated by the
+/// game-time **reaching weight** ([`reach_weights`] → [`summarize_cells`], split arms folded in): how
+/// often each composition is actually the hand in front of a deciding player. Each cell's headline is
+/// decided on its two-card decision population (so a start-only move is compared only against the
+/// Hit/Stand EVs of hands that can take it), and carries its composition-dependence flag and
+/// per-composition breakdown. `p_up` is the up-card's draw probability from the *full* shoe (before
+/// `build_evs` removes it).
 fn solve_on<S: Shoe + Copy + Eq + Hash + Sync>(shoe: S, up_card: Card, rules: &Ruleset) -> Column {
     let tree = build_evs(shoe, up_card, rules);
     let weights = reach_weights(shoe, up_card, rules, &tree, true);
     Column {
-        summary: summarize_with(&tree, &weights),
+        summary: summarize_cells(&tree, &weights),
         p_up: shoe.draw_prob(&up_card),
         edge: edge_term(&tree),
     }
@@ -119,16 +120,17 @@ const DECK_OPTIONS: [ShoeChoice; 6] = [
 /// Split-precision options the rules modal cycles through (`split_cards` budget). The fully exact
 /// cross-arm search (a budget larger than any reachable draw count) is intentionally not offered — it
 /// is combinatorially infeasible on a big shoe and only used in tests.
-const SPLIT_OPTIONS: [u8; 4] = [0, 2, 4, 8];
+const SPLIT_OPTIONS: [u8; 7] = [0, 1, 2, 3, 4, 6, 8];
 
-/// One up-card's strategy summary: per chart-row category, the EV of every available move.
-type ColumnSummary = HashMap<HandCategory, HashMap<Move, f64>>;
+/// One up-card's strategy summary: per chart-row category, its consolidated [`CellInfo`] (recommended
+/// move, composition-dependence flag, per-move EVs, and the per-composition breakdown).
+type ColumnSummary = HashMap<HandCategory, CellInfo>;
 
 /// Everything a finished up-card column carries: the chart summary, the up-card's draw probability,
 /// and its two-card-root edge contribution. Cached whole per `(shoe, ruleset)`.
 #[derive(Clone)]
 struct Column {
-    /// Per-cell move EVs, pooled by the game-time reaching weight (see [`solve_on`]).
+    /// Per-category [`CellInfo`], consolidated by the game-time reaching weight (see [`solve_on`]).
     summary: ColumnSummary,
     /// Draw probability of this up-card from the full shoe — its weight in the overall edge.
     p_up: f64,
@@ -170,9 +172,9 @@ impl Pane {
             Pane::Soft => (13..=21)
                 .map(|n| {
                     let label = if n < 21 {
-                        format!("A,{}", n - 11)
+                        format!("A{}", n - 11)
                     } else {
-                        "A,T".to_string()
+                        "AT".to_string()
                     };
                     (HandCategory::Soft(n), label)
                 })
@@ -190,7 +192,7 @@ impl Pane {
                 Card::Ace,
             ]
             .iter()
-            .map(|&r| (HandCategory::Pair(r), format!("{r},{r}")))
+            .map(|&r| (HandCategory::Pair(r), format!("{r}{r}")))
             .collect(),
         }
     }
@@ -316,8 +318,8 @@ impl App {
         (cat, UP_CARDS[self.cursor.col])
     }
 
-    /// The per-move EV map for the current selection, if its column has finished computing.
-    fn selected_evs(&self) -> Option<&HashMap<Move, f64>> {
+    /// The consolidated cell for the current selection, if its column has finished computing.
+    fn selected_cell(&self) -> Option<&CellInfo> {
         let (cat, _) = self.selection();
         self.columns[self.cursor.col].as_ref()?.summary.get(&cat)
     }
@@ -437,16 +439,18 @@ impl App {
                 // Toggle the peek, carrying the surrender choice across as far as the target state
                 // allows: a no-peek game cannot hold *late* surrender, so it lands on early instead.
                 self.rules.peek = match self.rules.peek {
-                    PeekRule::Peek(PeekSurrender::None) => {
-                        PeekRule::NoPeek { early_surrender: false }
-                    }
-                    PeekRule::Peek(_) => PeekRule::NoPeek { early_surrender: true },
-                    PeekRule::NoPeek { early_surrender: false } => {
-                        PeekRule::Peek(PeekSurrender::None)
-                    }
-                    PeekRule::NoPeek { early_surrender: true } => {
-                        PeekRule::Peek(PeekSurrender::Early)
-                    }
+                    PeekRule::Peek(PeekSurrender::None) => PeekRule::NoPeek {
+                        early_surrender: false,
+                    },
+                    PeekRule::Peek(_) => PeekRule::NoPeek {
+                        early_surrender: true,
+                    },
+                    PeekRule::NoPeek {
+                        early_surrender: false,
+                    } => PeekRule::Peek(PeekSurrender::None),
+                    PeekRule::NoPeek {
+                        early_surrender: true,
+                    } => PeekRule::Peek(PeekSurrender::Early),
                 };
             }
             4 => {
@@ -458,15 +462,18 @@ impl App {
             5 => {
                 self.rules.peek = match self.rules.peek {
                     PeekRule::Peek(s) => {
-                        let order =
-                            [PeekSurrender::None, PeekSurrender::Early, PeekSurrender::Late];
+                        let order = [
+                            PeekSurrender::None,
+                            PeekSurrender::Early,
+                            PeekSurrender::Late,
+                        ];
                         let i = order.iter().position(|&x| x == s).unwrap_or(0) as i32;
                         PeekRule::Peek(order[(i + delta).rem_euclid(3) as usize])
                     }
                     // No peek: late surrender is impossible, so this is just an early-surrender toggle.
-                    PeekRule::NoPeek { early_surrender } => {
-                        PeekRule::NoPeek { early_surrender: !early_surrender }
-                    }
+                    PeekRule::NoPeek { early_surrender } => PeekRule::NoPeek {
+                        early_surrender: !early_surrender,
+                    },
                 };
             }
             6 => {
@@ -567,9 +574,18 @@ impl App {
                 let (text, mut style) = match &self.columns[c] {
                     None => ("\u{00b7}".to_string(), Style::default().fg(Color::DarkGray)),
                     Some(col) => match col.summary.get(&cat) {
-                        Some(moves) => {
-                            let mv = best_move(moves);
-                            (mv.to_string(), Style::default().fg(move_color(mv)))
+                        Some(cell) => {
+                            // The headline move, asterisked when the right play genuinely varies by
+                            // composition. The letter sits in the middle column either way (a bare
+                            // letter centers to " H "); the leading space on the starred form keeps
+                            // it there and lets the `*` merely append: " H*".
+                            let mv = cell.headline;
+                            let text = if cell.composition_dependent {
+                                format!(" {mv}*")
+                            } else {
+                                format!("{mv}")
+                            };
+                            (text, Style::default().fg(move_color(mv)))
                         }
                         None => (" ".to_string(), Style::default()),
                     },
@@ -602,13 +618,14 @@ impl App {
         };
 
         let (cat, up) = self.selection();
-        let sel = match self.selected_evs() {
-            Some(moves) => {
-                let mv = best_move(moves);
+        let sel = match self.selected_cell() {
+            Some(cell) => {
+                let mv = cell.headline;
+                let star = if cell.composition_dependent { "*" } else { "" };
                 format!(
-                    "{cat} vs {up} \u{2192} {} {:+.3}",
+                    "{cat} vs {up} \u{2192} {}{star} {:+.3}",
                     move_name(mv),
-                    moves[&mv]
+                    cell.move_evs[&mv]
                 )
             }
             None => format!("{cat} vs {up} \u{2192} \u{2026}"),
@@ -639,13 +656,14 @@ impl App {
         let (cat, up) = self.selection();
         let title = format!(" {cat} vs {up} ");
 
+        let width = 48u16;
         let mut lines: Vec<Line> = Vec::new();
-        match self.selected_evs() {
+        match self.selected_cell() {
             None => lines.push(Line::from("computing\u{2026}")),
-            Some(moves) => {
-                let best = best_move(moves);
+            Some(cell) => {
+                let best = cell.headline;
                 for mv in MOVE_ORDER {
-                    if let Some(&ev) = moves.get(&mv) {
+                    if let Some(&ev) = cell.move_evs.get(&mv) {
                         // The best move is bolded; the move name keeps its chart color and the EV is
                         // colored by sign, so each column reads independently.
                         let emphasis = if mv == best {
@@ -662,6 +680,40 @@ impl App {
                         ]));
                     }
                 }
+                // Per-composition breakdown: which hands actually prefer which move, ordered by
+                // game-time probability. Only worth showing when more than one move wins somewhere.
+                if cell.breakdown.len() > 1 {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            " {:─^w$}",
+                            " by hand (game-time order) ",
+                            w = width as usize - 3
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    // Budget: inner width minus the "  X  " move-letter prefix.
+                    let budget = (width as usize).saturating_sub(2 + 5);
+                    for (mv, hands) in &cell.breakdown {
+                        let (listed, overflow) = pack_hand_labels(hands, budget);
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("  {mv}  "),
+                                Style::default()
+                                    .fg(move_color(*mv))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(listed),
+                            Span::styled(
+                                if overflow > 0 {
+                                    format!(" +{overflow}")
+                                } else {
+                                    String::new()
+                                },
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                    }
+                }
             }
         }
         lines.push(Line::from(""));
@@ -670,7 +722,6 @@ impl App {
             Style::default().fg(Color::DarkGray),
         )));
 
-        let width = 30u16;
         let height = lines.len() as u16 + 2;
         let area = centered_rect(width, height, f.area());
         let block = Block::default()
@@ -748,6 +799,43 @@ fn pane_height(pane: Pane) -> u16 {
     pane.rows().len() as u16 + 3
 }
 
+/// A concrete hand as a compact rank string, e.g. `T5` or `T32`. Aces lead, then tens high→low pips,
+/// so the label reads like the hand a player would name. Each rank is a single character, so no
+/// separator is needed — and dropping it packs more hands into the breakdown.
+fn compact_hand_label(hand: &CardCol) -> String {
+    let order = |c: Card| match c {
+        Card::Ace => 0,
+        Card::Ten => 1,
+        Card::Pip(n) => 11 - n as u32,
+    };
+    let mut cards: Vec<(Card, u16)> = hand.iter().collect();
+    cards.sort_by_key(|&(c, _)| order(c));
+    let mut parts: Vec<String> = Vec::new();
+    for (c, n) in cards {
+        for _ in 0..n {
+            parts.push(c.to_string());
+        }
+    }
+    parts.concat()
+}
+
+/// Greedily fit hand labels into `budget` columns, space-separated. Returns the joined string and the
+/// count that didn't fit (rendered as a `+N` overflow). Always lists at least the first hand, so a
+/// single very long label still shows rather than collapsing to a bare `+N`.
+fn pack_hand_labels(hands: &[CardCol], budget: usize) -> (String, usize) {
+    let labels: Vec<String> = hands.iter().map(compact_hand_label).collect();
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for (i, label) in labels.iter().enumerate() {
+        let need = if i == 0 { label.len() } else { 1 + label.len() };
+        if i > 0 && used + need > budget {
+            break;
+        }
+        used += need;
+        shown += 1;
+    }
+    (labels[..shown].join(" "), labels.len() - shown)
+}
 
 fn move_name(mv: Move) -> &'static str {
     match mv {

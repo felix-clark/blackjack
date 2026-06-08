@@ -323,7 +323,11 @@ fn solve_hand<S: Shoe + Copy + Eq + Hash>(
         let nat_ev = dealer_outcome_probs(dealer_hand, &shoe_minus_hand, rules.hs17)
             .iter()
             .map(|(&dealer, p)| {
-                p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout.multiplier())
+                p * resolve_ev(
+                    HandState::from(&pl_hand),
+                    dealer,
+                    rules.bj_payout.multiplier(),
+                )
             })
             .sum::<f64>();
         let ev_map = HashMap::from_iter([(Move::Stand, nat_ev)]);
@@ -337,7 +341,11 @@ fn solve_hand<S: Shoe + Copy + Eq + Hash>(
     let stand_ev = dealer_probs
         .iter()
         .map(|(&dealer, p)| {
-            p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout.multiplier())
+            p * resolve_ev(
+                HandState::from(&pl_hand),
+                dealer,
+                rules.bj_payout.multiplier(),
+            )
         })
         .sum::<f64>();
 
@@ -492,7 +500,6 @@ pub(crate) fn summarize_evs(
         .collect()
 }
 
-
 /// One up-card's two-card-root contribution to the overall player edge, read straight off a
 /// [`build_evs`] tree. Keeping it separate from any whole-shoe edge pass lets the TUI accumulate
 /// these from the per-up-card trees it already computes for the chart, instead of a second solver pass.
@@ -527,14 +534,14 @@ pub(crate) fn edge_term(ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>) -
         if hand.len() != 2 {
             continue;
         }
-        let best = move_ev
-            .values()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
+        let best = move_ev.values().copied().fold(f64::NEG_INFINITY, f64::max);
         weight += *w;
         weighted_ev += *w * best;
     }
-    EdgeTerm { weighted_ev, weight }
+    EdgeTerm {
+        weighted_ev,
+        weight,
+    }
 }
 
 #[cfg(test)]
@@ -640,9 +647,16 @@ mod tests {
             split_cards: 0,
             ..Ruleset::default()
         };
-        let peek_edge = player_edge(InfiniteDeck {}, &with_peek(PeekRule::Peek(PeekSurrender::None)));
-        let no_peek_edge =
-            player_edge(InfiniteDeck {}, &with_peek(PeekRule::NoPeek { early_surrender: false }));
+        let peek_edge = player_edge(
+            InfiniteDeck {},
+            &with_peek(PeekRule::Peek(PeekSurrender::None)),
+        );
+        let no_peek_edge = player_edge(
+            InfiniteDeck {},
+            &with_peek(PeekRule::NoPeek {
+                early_surrender: false,
+            }),
+        );
         assert!(
             no_peek_edge < peek_edge,
             "no-peek edge {no_peek_edge} should be below peek edge {peek_edge}"
@@ -658,5 +672,65 @@ mod tests {
         assert_eq!(strat[&HandCategory::Hard(11)], Move::Double, "H11 vs 5");
         assert_eq!(strat[&HandCategory::Hard(8)], Move::Hit, "H8 vs 5");
         assert_eq!(strat[&HandCategory::Soft(18)], Move::Double, "S18 vs 5");
+    }
+
+    /// Locks the surrender-cell bug fix: single-deck Hard 15 vs Ten. The old all-sizes argmax charted
+    /// this as Surrender by comparing an all-sizes Hit EV (dragged down by un-surrenderable multi-card
+    /// 15s) against a two-card-only Surrender EV. Restricted to the two-card 15s where surrender is
+    /// actually legal, the pooled Hit EV (~-0.498) beats Surrender's flat -0.5, so the corrected
+    /// headline is Hit — matching wizardofodds. The flip is single-deck only (see the 2-deck test).
+    #[test]
+    fn single_deck_h15_vs_ten_hits() {
+        let cells = cells_for(1, Card::Ten);
+        let h15 = &cells[&HandCategory::Hard(15)];
+        assert_eq!(h15.headline, Move::Hit, "single-deck H15 vs T should hit");
+        assert!(
+            h15.composition_dependent,
+            "H15 vs T varies by composition (8,7 hits; T,5/9,6 surrender)"
+        );
+    }
+
+    /// The composition-dependence flag is independent of the headline. On 2 decks Hard 15 vs Ten still
+    /// *charts* as Surrender, yet the 8,7 fifteen prefers Hit, so the cell is genuinely
+    /// composition-dependent and renders `R*` rather than a bare `R`.
+    #[test]
+    fn two_deck_h15_vs_ten_surrenders_but_flagged() {
+        let cells = cells_for(2, Card::Ten);
+        let h15 = &cells[&HandCategory::Hard(15)];
+        assert_eq!(
+            h15.headline,
+            Move::Surrender,
+            "2-deck H15 vs T still surrenders"
+        );
+        assert!(
+            h15.composition_dependent,
+            "2-deck H15 vs T is still composition-dependent"
+        );
+    }
+
+    /// A cleanly decided, composition-uniform cell must NOT be flagged: hard 20 vs 6 always stands.
+    #[test]
+    fn uniform_cell_not_flagged() {
+        let cells = cells_for(2, Card::Pip(6));
+        let h20 = &cells[&HandCategory::Hard(20)];
+        assert_eq!(h20.headline, Move::Stand);
+        assert!(
+            !h20.composition_dependent,
+            "hard 20 vs 6 is uniformly stand"
+        );
+    }
+
+    /// Baseline guard for the combinatorial [`summarize_evs`] (retained as the reference weighting
+    /// behind the corrected game-time consolidation): its pooled Stand EV for hard 20 vs 5 is pinned,
+    /// so a regression in the scan-weight pooling is caught even though the chart no longer argmaxes it.
+    #[test]
+    fn summarize_evs_baseline_h20_vs_5() {
+        let summary = summarize_evs(&ev_tree(Card::Pip(5)));
+        let stand = summary[&HandCategory::Hard(20)][&Move::Stand];
+        assert_close(
+            stand,
+            0.675_691_276_588_821_4,
+            "combinatoric H20 vs 5 stand",
+        );
     }
 }

@@ -35,11 +35,10 @@
 use std::collections::HashMap;
 
 use crate::card::Card;
-use crate::hand::{best_move, categorize, pair_rank, HandCategory, Move};
+use crate::hand::{HandCategory, Move, best_move, categorize, pair_rank};
 use crate::rules::Ruleset;
 use crate::shoe::{CardCol, Shoe};
 use crate::simulation::Basis;
-
 
 /// Decision-arrival mass per concrete hand: `P(player is at this hand, with a decision to make)`,
 /// summed over a round of optimal play. The two-card seed sums to the total deal probability (1 on a
@@ -219,7 +218,11 @@ pub(crate) fn category_breakdown(
     let mut rows: Vec<(CardCol, f64, f64)> = members
         .iter()
         .map(|h| {
-            let combo = if combo_tot > 0.0 { ev_tree[*h].0 / combo_tot } else { 0.0 };
+            let combo = if combo_tot > 0.0 {
+                ev_tree[*h].0 / combo_tot
+            } else {
+                0.0
+            };
             let reach_share = if reach_tot > 0.0 {
                 reach.get(*h).copied().unwrap_or(0.0) / reach_tot
             } else {
@@ -264,6 +267,192 @@ pub(crate) fn summarize_with(
         .collect()
 }
 
+/// Reach share below which a composition is treated as not actually faced (float dust / a hand no
+/// optimal-play path reaches). Used to drop noise from the composition-dependence test and breakdown.
+const REACH_EPS: f64 = 1e-9;
+/// EV margin a hand must clear over the runner-up to count as *strictly* preferring a move. Float
+/// non-associativity in the pooled sums can otherwise flip a near-tie and manufacture a spurious
+/// composition-dependence flag; near-ties are genuinely indifferent and should not be flagged.
+const PREF_MARGIN: f64 = 1e-6;
+
+/// The chart-cell view of a [`HandCategory`]: the recommended move, whether that recommendation is
+/// genuinely composition-dependent, and the per-composition breakdown the EV popup lists.
+///
+/// The headline is decided on the **two-card decision population** (or, for the few categories with
+/// no two-card member — Hard 20/21, Soft 21 — all members), so a start-only move like `Surrender` is
+/// compared only against the `Hit`/`Stand` EVs of the hands that can actually take it. This fixes the
+/// apples-to-oranges argmax where an all-sizes `Hit` EV (dragged down by multi-card hands that can't
+/// surrender) was compared against a two-card-only `Surrender` EV.
+#[derive(Clone)]
+pub(crate) struct CellInfo {
+    /// Per-move EVs over the decision population, reach-weighted. Internally consistent with
+    /// `headline` (its argmax *is* `headline`), so the popup's per-move list and the starred move agree.
+    pub(crate) move_evs: HashMap<Move, f64>,
+    /// The chart's recommended move (argmax of `move_evs`).
+    pub(crate) headline: Move,
+    /// The EV-optimal move genuinely varies across reachable compositions — not merely because a
+    /// start-only move is unavailable to the longer hands (that legality difference is excluded).
+    pub(crate) composition_dependent: bool,
+    /// Every reachable composition grouped by its own best legal move; hands within a group ordered by
+    /// game-time probability descending, groups ordered by total game-time mass descending.
+    pub(crate) breakdown: Vec<(Move, Vec<CardCol>)>,
+}
+
+/// The full chart consolidation: one [`CellInfo`] per category, given a `build_evs` tree and a
+/// game-time `reach` weighting (see [`reach_weights`]). Replaces [`summarize_with`] as the TUI's
+/// consolidation; `summarize_with`/`summarize_evs` are kept as the combinatorial baseline.
+pub(crate) fn summarize_cells(
+    ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
+    reach: &HashMap<CardCol, f64>,
+) -> HashMap<HandCategory, CellInfo> {
+    let mut by_cat: HashMap<HandCategory, Vec<CardCol>> = HashMap::new();
+    for hand in ev_tree.keys() {
+        by_cat.entry(categorize(hand)).or_default().push(*hand);
+    }
+    by_cat
+        .into_iter()
+        .map(|(cat, members)| (cat, cell_info(&members, ev_tree, reach)))
+        .collect()
+}
+
+/// The game-time weight of a hand, `0` when absent (unreachable under the optimal policy).
+fn reach_of(h: &CardCol, reach: &HashMap<CardCol, f64>) -> f64 {
+    reach.get(h).copied().unwrap_or(0.0)
+}
+
+/// A hand's argmax over `allowed` moves, but only when it *strictly* beats the runner-up by
+/// [`PREF_MARGIN`]. `None` on a near-tie (genuine indifference) or when it offers none of `allowed`,
+/// so the composition-dependence test never fires on float noise.
+fn strict_best(move_ev: &HashMap<Move, f64>, allowed: &[Move]) -> Option<Move> {
+    let mut vals: Vec<(Move, f64)> = allowed
+        .iter()
+        .filter_map(|&m| move_ev.get(&m).map(|&v| (m, v)))
+        .collect();
+    vals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    match vals.as_slice() {
+        [] => None,
+        [(m, _)] => Some(*m),
+        [(m, top), (_, next), ..] => (top - next > PREF_MARGIN).then_some(*m),
+    }
+}
+
+/// `true` iff the reachable members do not all agree on the EV-best move once legality differences are
+/// excluded: either two two-card members disagree on their full best move, or any two reachable
+/// members disagree on `Hit`-vs-`Stand` (the move set every hand shares). A start-only move being
+/// unavailable to the longer hands is therefore *not* counted as composition-dependence.
+fn composition_dependent(
+    members: &[CardCol],
+    ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
+    reach: &HashMap<CardCol, f64>,
+) -> bool {
+    const ALL: [Move; 5] = [
+        Move::Hit,
+        Move::Stand,
+        Move::Double,
+        Move::Split,
+        Move::Surrender,
+    ];
+    const HIT_STAND: [Move; 2] = [Move::Hit, Move::Stand];
+    let reachable = |h: &&CardCol| reach_of(h, reach) > REACH_EPS;
+
+    let disagree = |allowed: &[Move], only_two_card: bool| {
+        let mut seen: Option<Move> = None;
+        members
+            .iter()
+            .filter(reachable)
+            .filter(|h| !only_two_card || h.len() == 2)
+            .filter_map(|h| strict_best(&ev_tree[h].1, allowed))
+            .any(|m| match seen {
+                None => {
+                    seen = Some(m);
+                    false
+                }
+                Some(prev) => prev != m,
+            })
+    };
+
+    disagree(&ALL, true) || disagree(&HIT_STAND, false)
+}
+
+/// Build one category's [`CellInfo`] from its members.
+fn cell_info(
+    members: &[CardCol],
+    ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
+    reach: &HashMap<CardCol, f64>,
+) -> CellInfo {
+    // Decision population: two-card members if any, else all members (Hard 20/21, Soft 21).
+    let two_card: Vec<CardCol> = members.iter().copied().filter(|h| h.len() == 2).collect();
+    let decision: &[CardCol] = if two_card.is_empty() {
+        members
+    } else {
+        &two_card
+    };
+
+    let move_evs = pooled_move_evs(decision, ev_tree, reach);
+    let headline = best_move(&move_evs);
+    let composition_dependent = composition_dependent(members, ev_tree, reach);
+
+    // Breakdown: every reachable composition under its own best legal move. Fall back to the
+    // combinatorial weight if nothing is reachable, so a degenerate cell still lists its hands.
+    let any_reach = members.iter().any(|h| reach_of(h, reach) > REACH_EPS);
+    let mut groups: HashMap<Move, Vec<(CardCol, f64)>> = HashMap::new();
+    for h in members {
+        let w = if any_reach {
+            reach_of(h, reach)
+        } else {
+            ev_tree[h].0
+        };
+        if w <= REACH_EPS {
+            continue;
+        }
+        groups
+            .entry(best_move(&ev_tree[h].1))
+            .or_default()
+            .push((*h, w));
+    }
+    let mut ranked: Vec<(Move, f64, Vec<CardCol>)> = groups
+        .into_iter()
+        .map(|(mv, mut hands)| {
+            hands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let total = hands.iter().map(|(_, w)| w).sum();
+            (mv, total, hands.into_iter().map(|(h, _)| h).collect())
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let breakdown = ranked
+        .into_iter()
+        .map(|(mv, _, hands)| (mv, hands))
+        .collect();
+
+    CellInfo {
+        move_evs,
+        headline,
+        composition_dependent,
+        breakdown,
+    }
+}
+
+/// Reach-weighted per-move EV average over `hands`. If the population carries no reach mass (a
+/// multi-card-only category no policy path reaches) every hand is weighted equally so the cell still
+/// resolves — only `Hit`/`Stand` matter there and they agree, so the weighting is immaterial.
+fn pooled_move_evs(
+    hands: &[CardCol],
+    ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
+    reach: &HashMap<CardCol, f64>,
+) -> HashMap<Move, f64> {
+    let degenerate = hands.iter().map(|h| reach_of(h, reach)).sum::<f64>() <= REACH_EPS;
+    let mut acc: HashMap<Move, (f64, f64)> = HashMap::new();
+    for h in hands {
+        let w = if degenerate { 1.0 } else { reach_of(h, reach) };
+        for (&mv, &ev) in &ev_tree[h].1 {
+            let e = acc.entry(mv).or_insert((0.0, 0.0));
+            e.0 += w;
+            e.1 += w * ev;
+        }
+    }
+    acc.into_iter().map(|(m, (w, we))| (m, we / w)).collect()
+}
+
 /// The combinatorial scan-weight map straight off a `build_evs` tree — the weighting
 /// `summarize_evs` currently uses, packaged so it can be A/B'd against [`reach_weights`].
 pub(crate) fn combinatoric_weights(
@@ -289,7 +478,10 @@ mod tests {
     #[test]
     fn reach_weights_on_infinite_deck() {
         let up = Card::Pip(6);
-        let rules = Ruleset { split_cards: 0, ..Ruleset::default() };
+        let rules = Ruleset {
+            split_cards: 0,
+            ..Ruleset::default()
+        };
         let tree = build_evs(InfiniteDeck {}, up, &rules);
         let reach = reach_weights(InfiniteDeck {}, up, &rules, &tree, true);
         assert!(reach.values().all(|&m| m >= 0.0 && m.is_finite()));
@@ -318,17 +510,19 @@ mod tests {
         let up = Card::Pip(6);
         let shoe = CardCol::from_decks(2);
         // Independent-arms split budget: fast, and split arms don't feed the decision lattice here.
-        let rules = Ruleset { split_cards: 0, ..Ruleset::default() };
+        let rules = Ruleset {
+            split_cards: 0,
+            ..Ruleset::default()
+        };
         let tree = build_evs(shoe, up, &rules);
         let reach = reach_weights(shoe, up, &rules, &tree, false);
 
         // Two-card seed is the deal distribution: it sums to 1 off-peek.
-        let two_card_mass: f64 = tree
-            .keys()
-            .filter(|h| h.len() == 2)
-            .map(|h| reach[h])
-            .sum();
-        assert!((two_card_mass - 1.0).abs() < 1e-9, "two-card seed = {two_card_mass}");
+        let two_card_mass: f64 = tree.keys().filter(|h| h.len() == 2).map(|h| reach[h]).sum();
+        assert!(
+            (two_card_mass - 1.0).abs() < 1e-9,
+            "two-card seed = {two_card_mass}"
+        );
         assert!(reach.values().all(|&m| m >= 0.0));
 
         let rows = category_breakdown(HandCategory::Hard(16), &tree, &reach);
@@ -359,7 +553,10 @@ mod tests {
     fn reweighting_decision_shift_vs_ten() {
         let up = Card::Ten;
         let shoe = CardCol::from_decks(2);
-        let rules = Ruleset { split_cards: 0, ..Ruleset::default() };
+        let rules = Ruleset {
+            split_cards: 0,
+            ..Ruleset::default()
+        };
         let tree = build_evs(shoe, up, &rules);
 
         let combo = summarize_with(&tree, &combinatoric_weights(&tree));
@@ -388,7 +585,10 @@ mod tests {
     /// downstream split mass is the difference in totals — what the split-free weighting omits.
     #[test]
     fn split_arm_correction() {
-        let rules = Ruleset { split_cards: 0, ..Ruleset::default() };
+        let rules = Ruleset {
+            split_cards: 0,
+            ..Ruleset::default()
+        };
         eprintln!("up | split-entry | no-split total | with-split total | downstream split mass");
         for up in [Card::Pip(6), Card::Ten, Card::Ace, Card::Pip(2)] {
             let shoe = CardCol::from_decks(2);
@@ -419,7 +619,10 @@ mod tests {
     fn split_arm_lands_on_pair_fed_cells() {
         let up = Card::Pip(6);
         let shoe = CardCol::from_decks(2);
-        let rules = Ruleset { split_cards: 0, ..Ruleset::default() };
+        let rules = Ruleset {
+            split_cards: 0,
+            ..Ruleset::default()
+        };
         let tree = build_evs(shoe, up, &rules);
         let no_split = reach_weights(shoe, up, &rules, &tree, false);
         let with_split = reach_weights(shoe, up, &rules, &tree, true);
@@ -450,5 +653,3 @@ mod tests {
         }
     }
 }
-
-
