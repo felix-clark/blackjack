@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn exact_split_matches_independent_on_infinite_deck() {
         let indep = ruleset_with(0);
-        let exact = ruleset_with(Ruleset::EXACT_SPLIT);
+        let exact = ruleset_with(u8::MAX);
         let shoe = InfiniteDeck {};
         for r in [Card::Pip(8), Card::Pip(9), Card::Ace] {
             let pair = CardCol::from_hand(&[r, r]);
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn exact_split_runs_on_finite_shoe() {
         let indep = ruleset_with(0);
-        let exact = ruleset_with(Ruleset::EXACT_SPLIT);
+        let exact = ruleset_with(u8::MAX);
         let pair = CardCol::from_hand(&[Card::Pip(8), Card::Pip(8)]);
         // The pair is already removed in the shoe `build_evs` hands to `split_move_ev`.
         let shoe = CardCol::half_deck().remove_hand(&pair);
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn limited_split_matches_extremes_on_infinite_deck() {
         let shoe = InfiniteDeck {};
-        let exact = ruleset_with(Ruleset::EXACT_SPLIT);
+        let exact = ruleset_with(u8::MAX);
         for cards in [0u8, 1, 2, 5, u8::MAX] {
             let lim = ruleset_with(cards);
             for r in [Card::Pip(8), Card::Pip(9), Card::Ace] {
@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn limited_split_approaches_exact_on_finite_shoe() {
         let indep = ruleset_with(0);
-        let exact = ruleset_with(Ruleset::EXACT_SPLIT);
+        let exact = ruleset_with(u8::MAX);
         let lim = ruleset_with(6);
         let pair = CardCol::from_hand(&[Card::Pip(8), Card::Pip(8)]);
         let shoe = CardCol::half_deck().remove_hand(&pair);

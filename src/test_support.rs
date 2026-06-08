@@ -11,7 +11,7 @@ use crate::shoe::*;
 use crate::simulation::{build_evs, summarize_evs};
 
 /// The default ruleset with only the split-accuracy budget overridden — the single knob the tests
-/// vary (`0` = independent arms, [`Ruleset::EXACT_SPLIT`] = full exact cross-arm search).
+/// vary (`0` = independent arms, `u8::MAX` = full exact cross-arm search).
 pub(crate) fn ruleset_with(split_cards: u8) -> Ruleset {
     Ruleset {
         split_cards,

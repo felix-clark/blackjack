@@ -1,40 +1,111 @@
-//! Rule configuration: the [`Ruleset`] knobs (and the [`SurrenderRule`] axis) that parametrise the
-//! solver. Pure data — no compute lives here. CLAUDE.md anticipates these becoming first-class and
-//! threaded through the dealer/payoff logic in place of hardcoded defaults.
+//! Rule configuration: the [`Ruleset`] knobs (and the [`PeekRule`] peek+surrender axis) that
+//! parametrise the solver. Pure data — no compute lives here. CLAUDE.md anticipates these becoming
+//! first-class and threaded through the dealer/payoff logic in place of hardcoded defaults.
 
-/// When (if ever) the player may forfeit half the bet instead of playing the hand out.
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub(crate) enum SurrenderRule {
+/// The dealer's hole-card peek and the player's surrender option, as a *single* axis because they are
+/// not independent: *late* surrender is defined as surrendering after a clean peek, so it cannot exist
+/// in a no-peek game. Bundling them lets the type system enforce that — the invalid (no-peek, late)
+/// combination is simply unrepresentable, so the solver needs no runtime check to reject it.
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+pub(crate) enum PeekRule {
+    /// The dealer peeks at the hole card before the player acts, so a dealer natural takes only the
+    /// original bet (doubled and split bets are returned). Surrender, if offered, may be early or late.
+    Peek(PeekSurrender),
+    /// European no-hole-card: the dealer draws the hole card only after the player finishes, so a
+    /// late-revealed natural takes doubled and split bets too. Late surrender is incoherent here (there
+    /// is no "after the peek"), so the only choice is whether *early* surrender is offered.
+    NoPeek { early_surrender: bool },
+}
+
+/// When (if ever) the player may forfeit half the bet in a peek game.
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+pub(crate) enum PeekSurrender {
     /// Surrender is not offered.
     None,
-    /// Surrender *before* the dealer peeks for blackjack, escaping the dealer-natural loss too.
-    /// EV is an unconditional -0.5.
+    /// Surrender *before* the dealer peeks, escaping the dealer-natural loss too. Unconditional -0.5.
     Early,
-    /// Surrender *after* the dealer peeks and shows no blackjack. Only coherent when the dealer
-    /// actually peeks (`dealer_check`), since otherwise there is no "after the check".
+    /// Surrender *after* the dealer peeks and shows no blackjack. Conditional -0.5.
     Late,
 }
 
+impl PeekRule {
+    /// Whether the dealer peeks at the hole card. This is the bit that changes the EV basis: off peek,
+    /// doubled and split bets are also forfeited to a dealer natural revealed at the end.
+    pub(crate) fn peeks(self) -> bool {
+        matches!(self, PeekRule::Peek(_))
+    }
+
+    /// Whether the player may surrender at all. The EV is a flat -0.5 whenever surrender is offered, on
+    /// whichever basis the tree is built, so the solver only needs this boolean.
+    pub(crate) fn surrender_offered(self) -> bool {
+        match self {
+            PeekRule::Peek(s) => s != PeekSurrender::None,
+            PeekRule::NoPeek { early_surrender } => early_surrender,
+        }
+    }
+
+    /// A short label for the surrender option, for display.
+    pub(crate) fn surrender_label(self) -> &'static str {
+        match self {
+            PeekRule::Peek(PeekSurrender::None)
+            | PeekRule::NoPeek {
+                early_surrender: false,
+            } => "none",
+            PeekRule::Peek(PeekSurrender::Early)
+            | PeekRule::NoPeek {
+                early_surrender: true,
+            } => "early",
+            PeekRule::Peek(PeekSurrender::Late) => "late",
+        }
+    }
+}
+
+/// What a player natural (two-card blackjack) pays, as a multiple of the bet. Modelled as an enum
+/// rather than an `f64` because only a tiny set of discrete payouts is ever used: this keeps the value
+/// `Eq + Hash` so the enclosing [`Ruleset`] can *derive* those (and key a cache) instead of hand-rolling
+/// bit-comparison around a float, and lets call sites match on the rule instead of fuzzy `==` on a float.
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+pub(crate) enum BjPayout {
+    /// 3:2 — the good, near-universal payout.
+    ThreeToTwo,
+    /// 6:5 — a strictly worse rule found on some tables.
+    SixToFive,
+}
+
+impl BjPayout {
+    /// The payout as a multiple of the bet, the form [`resolve_ev`](crate::simulation::resolve_ev)
+    /// consumes.
+    pub(crate) fn multiplier(self) -> f64 {
+        match self {
+            BjPayout::ThreeToTwo => 1.5,
+            BjPayout::SixToFive => 1.2,
+        }
+    }
+
+    /// A short label for display.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            BjPayout::ThreeToTwo => "3:2",
+            BjPayout::SixToFive => "6:5",
+        }
+    }
+}
+
 /// The stipulation of miscellaneous rules other than the number of decks (?).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Ruleset {
     /// Whether the dealer hits soft 17
     pub(crate) hs17: bool,
     /// Allowed to double after split
     pub(crate) das: bool,
-    /// Whether the dealer checks their hole card for blackjack
-    /// Note that the worst version of this being false causes a dealer blackjack to take
-    /// all splits and doubles.
-    pub(crate) dealer_check: bool,
-    // /// Double on anything (as opposed to just 10 and 11) -- maybe just assume true
-    // doa: bool,
-    /// What a player natural (a two-card blackjack) pays, as a multiple of the bet. The good and
-    /// near-universal value is `1.5` (3:2); some tables pay `1.2` (6:5), a strictly worse rule.
-    /// Only ever applies to a genuine first-deal natural — a split-arm 21 is *not* a blackjack and
-    /// pays even money regardless (see [`arm_stand_ev`](crate::split::arm_stand_ev)).
-    pub(crate) bj_payout: f64,
-    /// Whether (and when) the player may surrender.
-    pub(crate) surrender: SurrenderRule,
+    /// The dealer's hole-card peek and the player's surrender option (see [`PeekRule`]; they share an
+    /// axis because late surrender requires a peek). Off peek, a dealer natural revealed at the end
+    /// takes doubled and split bets too, not just the original.
+    pub(crate) peek: PeekRule,
+    /// What a player natural (a two-card blackjack) pays (see [`BjPayout`]). Only ever applies to a
+    /// genuine first-deal natural — a split-arm 21 is *not* a blackjack and pays even money regardless
+    /// (see [`arm_stand_ev`](crate::split::arm_stand_ev)).
+    pub(crate) bj_payout: BjPayout,
     /// Maximum number of hands the player may end up with after splitting (so the number of splits
     /// allowed is `max_split_hands - 1`). Caps the split recursion — and is what keeps the infinite
     /// deck terminating, since otherwise a pair could be re-split without bound. Setting it to
@@ -53,35 +124,14 @@ pub(crate) struct Ruleset {
     /// largest. The carried-shoe diversity is bounded by ≤K-card removals from the post-split shoe, a
     /// count independent of deck size, so a small K stays tractable even on 8 decks where a full search
     /// is infeasible. `0` is the old independent-arms approximation (no cross-arm correlation); a K
-    /// larger than any reachable draw count (see [`Ruleset::EXACT_SPLIT`]) never resets and so is the
-    /// full exact search. The default `4` is ~5–10× more accurate than independent (sub-1e-4 vs the
-    /// exact value) while staying sub-second per query.
+    /// larger than any reachable draw count (e.g. `u8::MAX`) never resets and so is the full exact
+    /// search — combinatorially infeasible on a big shoe, so it is only used for single-query test
+    /// validation, never exposed as a chart option. The default `4` is ~5–10× more accurate than
+    /// independent (sub-1e-4 vs the exact value) while staying sub-second per query.
     pub(crate) split_cards: u8,
     // TODO: finer split-aces rules. Currently split aces always get exactly one card and cannot be
     // re-split (the common rule); a future axis could relax either, and "no double on split aces /
     // tens" would refine `das` per split rank — see the `SplitSolver` field comments.
-}
-
-impl Ruleset {
-    /// A `split_cards` budget larger than any draw count a split can reach, so the cross-arm
-    /// truncation never fires: the full exact split search (every drawn card tracked, all arms). Not a
-    /// magic sentinel — it is just a large `K` that never decrements to `0` in practice.
-    /// Combinatorially infeasible on a big shoe — use it for single-query validation, not whole-chart
-    /// builds. See [`Ruleset::split_cards`].
-    #[allow(dead_code)] // public knob; currently only the tests construct an exact ruleset
-    pub(crate) const EXACT_SPLIT: u8 = u8::MAX;
-
-    /// Reject rule combinations that don't correspond to a real game. Late surrender is defined as
-    /// surrendering after the dealer peeks, so it only makes sense when the dealer peeks at all.
-    pub(crate) fn validate(&self) {
-        if self.surrender == SurrenderRule::Late {
-            assert!(
-                self.dealer_check,
-                "Late surrender requires the dealer to peek for blackjack (dealer_check); \
-                 use SurrenderRule::Early for a no-peek game."
-            );
-        }
-    }
 }
 
 impl Default for Ruleset {
@@ -89,9 +139,8 @@ impl Default for Ruleset {
         Self {
             hs17: true,
             das: true,
-            dealer_check: true,
-            bj_payout: 1.5,
-            surrender: SurrenderRule::Late,
+            peek: PeekRule::Peek(PeekSurrender::Late),
+            bj_payout: BjPayout::ThreeToTwo,
             max_split_hands: 4,
             // This is technically not a ruleset option, but a computational precision vs.
             // investment option that specifies the depth of the exact enumeration in multiple

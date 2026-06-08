@@ -26,9 +26,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::card::Card;
 use crate::hand::{HandCategory, Move};
-use crate::rules::{Ruleset, SurrenderRule};
-use crate::shoe::{CardCol, InfiniteDeck};
-use crate::simulation::{build_evs, summarize_evs};
+use crate::rules::{BjPayout, PeekRule, PeekSurrender, Ruleset};
+use crate::shoe::{CardCol, InfiniteDeck, Shoe};
+use crate::simulation::{EdgeTerm, build_evs, edge_term, summarize_evs};
 
 /// Dealer up-cards in chart-column order (2..9, T, A).
 const UP_CARDS: [Card; 10] = [
@@ -55,7 +55,7 @@ const MOVE_ORDER: [Move; 5] = [
 
 /// The shoe the chart is solved against: an infinite (non-depleting) deck or a finite `n`-deck shoe.
 /// This is the seam a future card-counting input would adjust.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ShoeChoice {
     Infinite,
     Decks(u8),
@@ -71,14 +71,27 @@ impl std::fmt::Display for ShoeChoice {
 }
 
 impl ShoeChoice {
-    /// Solve one up-card's full EV tree on this shoe and collapse it to the per-category strategy
-    /// summary the chart renders. Runs on a worker thread.
-    fn solve(self, up_card: Card, rules: &Ruleset) -> ColumnSummary {
-        let tree = match self {
-            ShoeChoice::Infinite => build_evs(InfiniteDeck {}, up_card, rules),
-            ShoeChoice::Decks(n) => build_evs(CardCol::from_decks(n), up_card, rules),
+    /// Solve one up-card's full EV tree on this shoe, collapsing it to the per-category strategy
+    /// summary the chart renders and the two-card-root [`EdgeTerm`] the footer's overall edge sums.
+    /// Both are read off the same tree, so the edge costs no extra solve. Runs on a worker thread.
+    fn solve(self, up_card: Card, rules: &Ruleset) -> Column {
+        // `p_up` is the up-card's draw probability from the *full* shoe (before `build_evs` removes
+        // it); it weights this column in the overall edge.
+        let (tree, p_up) = match self {
+            ShoeChoice::Infinite => {
+                let shoe = InfiniteDeck {};
+                (build_evs(shoe, up_card, rules), shoe.draw_prob(&up_card))
+            }
+            ShoeChoice::Decks(n) => {
+                let shoe = CardCol::from_decks(n);
+                (build_evs(shoe, up_card, rules), shoe.draw_prob(&up_card))
+            }
         };
-        summarize_evs(&tree)
+        Column {
+            summary: summarize_evs(&tree),
+            p_up,
+            edge: edge_term(&tree),
+        }
     }
 }
 
@@ -92,18 +105,29 @@ const DECK_OPTIONS: [ShoeChoice; 6] = [
     ShoeChoice::Decks(8),
 ];
 
-/// Split-precision options the rules modal cycles through (`split_cards` budget; last is the full
-/// exact search — opt-in, can be slow on big shoes).
-const SPLIT_OPTIONS: [u8; 5] = [0, 2, 4, 8, Ruleset::EXACT_SPLIT];
+/// Split-precision options the rules modal cycles through (`split_cards` budget). The fully exact
+/// cross-arm search (a budget larger than any reachable draw count) is intentionally not offered — it
+/// is combinatorially infeasible on a big shoe and only used in tests.
+const SPLIT_OPTIONS: [u8; 4] = [0, 2, 4, 8];
 
 /// One up-card's strategy summary: per chart-row category, the EV of every available move.
 type ColumnSummary = HashMap<HandCategory, HashMap<Move, f64>>;
 
-/// A finished worker result: the summary for one column, tagged with the epoch it was computed for.
+/// Everything a finished up-card column carries: the chart summary, the up-card's draw probability,
+/// and its two-card-root edge contribution. Cached whole per `(shoe, ruleset)`.
+#[derive(Clone)]
+struct Column {
+    summary: ColumnSummary,
+    /// Draw probability of this up-card from the full shoe — its weight in the overall edge.
+    p_up: f64,
+    edge: EdgeTerm,
+}
+
+/// A finished worker result: one solved column, tagged with the epoch it was computed for.
 struct ColumnResult {
     epoch: u64,
     col: usize,
-    summary: ColumnSummary,
+    column: Column,
 }
 
 /// The three chart panes.
@@ -180,8 +204,15 @@ struct App {
     shoe: ShoeChoice,
     /// Bumped on every recompute; stamped onto worker results so stale ones can be dropped.
     epoch: u64,
-    /// Per up-card column summary, `None` until that worker finishes.
-    columns: [Option<ColumnSummary>; 10],
+    /// The `(shoe, rules)` the current epoch is being solved for. Captured at recompute time (not read
+    /// from `self` later) so a completed batch is cached under the rules it was actually computed with,
+    /// even if the rules modal has since edited `self.rules` without re-solving.
+    epoch_key: (ShoeChoice, Ruleset),
+    /// Finished chart batches, keyed by `(shoe, rules)`, so flipping back to a prior ruleset is instant
+    /// instead of a re-solve. Populated once all ten columns of an epoch arrive.
+    cache: HashMap<(ShoeChoice, Ruleset), [Column; 10]>,
+    /// Per up-card column, `None` until that worker finishes (or filled at once from the cache).
+    columns: [Option<Column>; 10],
     cursor: Cursor,
     mode: Mode,
     /// Selected field in the rules modal.
@@ -199,6 +230,8 @@ impl App {
             rules: Ruleset::default(),
             shoe: ShoeChoice::Infinite,
             epoch: 0,
+            epoch_key: (ShoeChoice::Infinite, Ruleset::default()),
+            cache: HashMap::new(),
             columns: std::array::from_fn(|_| None),
             cursor: Cursor {
                 pane: 0,
@@ -213,19 +246,17 @@ impl App {
         }
     }
 
-    /// Keep the ruleset self-consistent (the only invariant the solver enforces): late surrender
-    /// requires the dealer to peek, so drop it to early surrender if peek is turned off.
-    fn normalize_rules(&mut self) {
-        if self.rules.surrender == SurrenderRule::Late && !self.rules.dealer_check {
-            self.rules.surrender = SurrenderRule::Early;
-        }
-    }
-
-    /// Start a fresh batch of ten worker threads, one per up-card, and blank the chart. Old in-flight
-    /// workers keep running but their results are discarded by epoch on arrival.
+    /// Refresh the chart for the current `(shoe, rules)`. A cached batch is restored instantly;
+    /// otherwise a fresh epoch of ten worker threads (one per up-card) is launched and the chart is
+    /// blanked. Old in-flight workers keep running but their results are discarded by epoch on arrival.
     fn recompute(&mut self) {
-        self.normalize_rules();
         self.epoch += 1;
+        self.epoch_key = (self.shoe, self.rules);
+        // Cache hit: restore all ten columns at once, no workers (so nothing arrives for this epoch).
+        if let Some(cached) = self.cache.get(&self.epoch_key) {
+            self.columns = std::array::from_fn(|i| Some(cached[i].clone()));
+            return;
+        }
         self.columns = std::array::from_fn(|_| None);
         for (col, &up_card) in UP_CARDS.iter().enumerate() {
             let tx = self.tx.clone();
@@ -233,23 +264,25 @@ impl App {
             let shoe = self.shoe;
             let epoch = self.epoch;
             thread::spawn(move || {
-                let summary = shoe.solve(up_card, &rules);
+                let column = shoe.solve(up_card, &rules);
                 // Receiver gone (app exiting) is fine — just drop the result.
-                let _ = tx.send(ColumnResult {
-                    epoch,
-                    col,
-                    summary,
-                });
+                let _ = tx.send(ColumnResult { epoch, col, column });
             });
         }
     }
 
-    /// Drain any finished worker results, applying those from the current epoch.
+    /// Drain any finished worker results, applying those from the current epoch. When a batch
+    /// completes (all ten columns in), cache it under the epoch's `(shoe, rules)` key so returning to
+    /// that ruleset later is instant.
     fn drain_results(&mut self) {
         while let Ok(res) = self.rx.try_recv() {
             if res.epoch == self.epoch {
-                self.columns[res.col] = Some(res.summary);
+                self.columns[res.col] = Some(res.column);
             }
+        }
+        if self.columns.iter().all(Option::is_some) && !self.cache.contains_key(&self.epoch_key) {
+            let batch = std::array::from_fn(|i| self.columns[i].clone().unwrap());
+            self.cache.insert(self.epoch_key, batch);
         }
     }
 
@@ -267,7 +300,19 @@ impl App {
     /// The per-move EV map for the current selection, if its column has finished computing.
     fn selected_evs(&self) -> Option<&HashMap<Move, f64>> {
         let (cat, _) = self.selection();
-        self.columns[self.cursor.col].as_ref()?.get(&cat)
+        self.columns[self.cursor.col].as_ref()?.summary.get(&cat)
+    }
+
+    /// The overall player edge (negative = house edge) under the current rules, available only once
+    /// every column has been solved (each contributes its draw-probability-weighted two-card-root
+    /// value). `None` while any column is still pending.
+    fn total_edge(&self) -> Option<f64> {
+        let mut edge = 0.0;
+        for col in &self.columns {
+            let col = col.as_ref()?;
+            edge += col.p_up * col.edge.value();
+        }
+        Some(edge)
     }
 
     fn clamp_row(&mut self) {
@@ -339,7 +384,6 @@ impl App {
     fn handle_rules(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('q') => {
-                self.normalize_rules();
                 if (self.rules, self.shoe) != self.rules_snapshot {
                     self.recompute();
                 }
@@ -370,25 +414,41 @@ impl App {
             }
             1 => self.rules.hs17 = !self.rules.hs17,
             2 => self.rules.das = !self.rules.das,
-            3 => self.rules.dealer_check = !self.rules.dealer_check,
+            3 => {
+                // Toggle the peek, carrying the surrender choice across as far as the target state
+                // allows: a no-peek game cannot hold *late* surrender, so it lands on early instead.
+                self.rules.peek = match self.rules.peek {
+                    PeekRule::Peek(PeekSurrender::None) => {
+                        PeekRule::NoPeek { early_surrender: false }
+                    }
+                    PeekRule::Peek(_) => PeekRule::NoPeek { early_surrender: true },
+                    PeekRule::NoPeek { early_surrender: false } => {
+                        PeekRule::Peek(PeekSurrender::None)
+                    }
+                    PeekRule::NoPeek { early_surrender: true } => {
+                        PeekRule::Peek(PeekSurrender::Early)
+                    }
+                };
+            }
             4 => {
-                self.rules.bj_payout = if (self.rules.bj_payout - 1.5).abs() < 1e-9 {
-                    1.2
-                } else {
-                    1.5
+                self.rules.bj_payout = match self.rules.bj_payout {
+                    BjPayout::ThreeToTwo => BjPayout::SixToFive,
+                    BjPayout::SixToFive => BjPayout::ThreeToTwo,
                 };
             }
             5 => {
-                let order = [
-                    SurrenderRule::None,
-                    SurrenderRule::Early,
-                    SurrenderRule::Late,
-                ];
-                let i = order
-                    .iter()
-                    .position(|&s| s == self.rules.surrender)
-                    .unwrap_or(0) as i32;
-                self.rules.surrender = order[(i + delta).rem_euclid(3) as usize];
+                self.rules.peek = match self.rules.peek {
+                    PeekRule::Peek(s) => {
+                        let order =
+                            [PeekSurrender::None, PeekSurrender::Early, PeekSurrender::Late];
+                        let i = order.iter().position(|&x| x == s).unwrap_or(0) as i32;
+                        PeekRule::Peek(order[(i + delta).rem_euclid(3) as usize])
+                    }
+                    // No peek: late surrender is impossible, so this is just an early-surrender toggle.
+                    PeekRule::NoPeek { early_surrender } => {
+                        PeekRule::NoPeek { early_surrender: !early_surrender }
+                    }
+                };
             }
             6 => {
                 let v = self.rules.max_split_hands as i32 + delta;
@@ -487,7 +547,7 @@ impl App {
             for c in 0..UP_CARDS.len() {
                 let (text, mut style) = match &self.columns[c] {
                     None => ("\u{00b7}".to_string(), Style::default().fg(Color::DarkGray)),
-                    Some(summary) => match summary.get(&cat) {
+                    Some(col) => match col.summary.get(&cat) {
                         Some(moves) => {
                             let mv = best_move(moves);
                             (mv.to_string(), Style::default().fg(move_color(mv)))
@@ -508,19 +568,14 @@ impl App {
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
         let r = &self.rules;
-        let bj = if (r.bj_payout - 1.5).abs() < 1e-9 {
-            "3:2"
-        } else if (r.bj_payout - 1.2).abs() < 1e-9 {
-            "6:5"
-        } else {
-            "?"
-        };
-        let surr = match r.surrender {
-            SurrenderRule::None => "none",
-            SurrenderRule::Early => "early",
-            SurrenderRule::Late => "late",
-        };
+        let bj = r.bj_payout.label();
+        let surr = r.peek.surrender_label();
         let pending = self.columns.iter().filter(|c| c.is_none()).count();
+        // The overall edge needs every column, so show a placeholder until the batch finishes.
+        let edge = match self.total_edge() {
+            Some(e) => format!("{:+.3}%", e * 100.0),
+            None => "\u{2026}".to_string(),
+        };
         let computing = if pending > 0 {
             format!("  computing {}/10", 10 - pending)
         } else {
@@ -541,11 +596,11 @@ impl App {
         };
 
         let status = format!(
-            "decks {} | {} | DAS {} | peek {} | BJ {bj} | surr {surr} | split\u{2264}{}{computing}",
+            "decks {} | {} | DAS {} | peek {} | BJ {bj} | surr {surr} | split\u{2264}{} | edge {edge}{computing}",
             self.shoe,
             if r.hs17 { "H17" } else { "S17" },
             yn(r.das),
-            yn(r.dealer_check),
+            yn(r.peek.peeks()),
             r.max_split_hands,
         );
         let keys =
@@ -613,32 +668,11 @@ impl App {
             format!("Decks         {}", self.shoe),
             format!("Dealer H17    {}", yn(r.hs17)),
             format!("DAS           {}", yn(r.das)),
-            format!("Dealer peek   {}", yn(r.dealer_check)),
-            format!(
-                "Blackjack     {}",
-                if (r.bj_payout - 1.5).abs() < 1e-9 {
-                    "3:2"
-                } else {
-                    "6:5"
-                }
-            ),
-            format!(
-                "Surrender     {}",
-                match r.surrender {
-                    SurrenderRule::None => "none",
-                    SurrenderRule::Early => "early",
-                    SurrenderRule::Late => "late",
-                }
-            ),
+            format!("Dealer peek   {}", yn(r.peek.peeks())),
+            format!("Blackjack     {}", r.bj_payout.label()),
+            format!("Surrender     {}", r.peek.surrender_label()),
             format!("Max hands     {}", r.max_split_hands),
-            format!(
-                "Split prec.   {}",
-                if r.split_cards == Ruleset::EXACT_SPLIT {
-                    "exact".to_string()
-                } else {
-                    r.split_cards.to_string()
-                }
-            ),
+            format!("Split prec.   {}", r.split_cards),
         ];
 
         let mut lines: Vec<Line> = Vec::new();

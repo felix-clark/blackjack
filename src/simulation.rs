@@ -13,7 +13,7 @@ use std::hash::Hash;
 use crate::card::Card;
 use crate::dealer::{DealerOutcome, dealer_outcome_probs};
 use crate::hand::{HandCategory, HandState, Move, categorize, pair_rank};
-use crate::rules::{Ruleset, SurrenderRule};
+use crate::rules::Ruleset;
 use crate::shoe::{CardCol, Shoe};
 use crate::split::split_move_ev;
 
@@ -158,7 +158,7 @@ impl Basis {
         Self {
             up_card,
             bj_rank,
-            conditional: rules.dealer_check && bj_rank.is_some(),
+            conditional: rules.peek.peeks() && bj_rank.is_some(),
             hs17: rules.hs17,
         }
     }
@@ -206,7 +206,6 @@ pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash>(
     up_card: Card,
     rules: &Ruleset,
 ) -> HashMap<CardCol, (f64, HashMap<Move, f64>)> {
-    rules.validate();
     // Remove the up card from the deck (a no-op for the infinite deck).
     shoe.draw(&up_card);
     // make into const after draw
@@ -247,7 +246,7 @@ pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash>(
                 let nat_ev = dealer_outcome_probs(dealer_hand, &shoe_minus_hand, rules.hs17)
                     .iter()
                     .map(|(&dealer, p)| {
-                        p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout)
+                        p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout.multiplier())
                     })
                     .sum::<f64>();
                 let ev_map = HashMap::from_iter([(Move::Stand, nat_ev)]);
@@ -263,7 +262,7 @@ pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash>(
             let stand_ev = dealer_probs
                 .iter()
                 .map(|(&dealer, p)| {
-                    p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout)
+                    p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout.multiplier())
                 })
                 .sum::<f64>();
 
@@ -325,12 +324,8 @@ pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash>(
                 // peek (an unconditional -0.5). NOTE: early surrender *combined with* a peek is the
                 // one ragged case — that decision is genuinely pre-peek and would need an
                 // unconditional root comparison; it is uncommon and left for later.
-                let surrender_ev = match rules.surrender {
-                    SurrenderRule::None => None,
-                    SurrenderRule::Early | SurrenderRule::Late => Some(-0.5),
-                };
-                if let Some(surrender_ev) = surrender_ev {
-                    evs.push((Move::Surrender, surrender_ev));
+                if rules.peek.surrender_offered() {
+                    evs.push((Move::Surrender, -0.5));
                 }
 
                 // A pair may be split (creating at least two hands, so only when the rules allow at
@@ -392,6 +387,50 @@ pub(crate) fn summarize_evs(
 }
 
 
+/// One up-card's two-card-root contribution to the overall player edge, read straight off a
+/// [`build_evs`] tree. Keeping it separate from any whole-shoe edge pass lets the TUI accumulate
+/// these from the per-up-card trees it already computes for the chart, instead of a second solver pass.
+///
+/// `weighted_ev` is `Σ weight·max_move_EV` over the *starting* (two-card) hands — the optimal-play
+/// value on the tree's basis. `weight` is `Σ weight` over those same hands; it is `1` off-peek but
+/// falls short of it on the peek basis by exactly the dealer-natural loss mass (each such hand a flat
+/// −1). So the honest unconditional value of this up-card is `weighted_ev − (1 − weight)`: the
+/// `−P_bj + (1 − P_bj)·V` two-card-root identity from [`build_evs`], summed over starting hands.
+#[derive(Clone, Copy)]
+pub(crate) struct EdgeTerm {
+    pub(crate) weighted_ev: f64,
+    pub(crate) weight: f64,
+}
+
+impl EdgeTerm {
+    /// The unconditional per-up-card edge: the conditional play value with the dealer-natural loss
+    /// deficit (`1 − weight`) added back as a flat −1 per non-natural-vs-dealer-natural hand.
+    pub(crate) fn value(&self) -> f64 {
+        self.weighted_ev - (1.0 - self.weight)
+    }
+}
+
+/// Accumulate one up-card's two-card-root edge contribution from its EV tree. Only starting
+/// (two-card) hands count: within a fixed hand size the scan-weights are an exact occurrence
+/// distribution (summing to 1 off-peek), so this sidesteps the cross-size weighting imprecision that
+/// [`summarize_evs`] carries. A natural's lone `Stand` EV is its `max`, so naturals fold in correctly.
+pub(crate) fn edge_term(ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>) -> EdgeTerm {
+    let mut weighted_ev = 0.0;
+    let mut weight = 0.0;
+    for (hand, (w, move_ev)) in ev_tree.iter() {
+        if hand.len() != 2 {
+            continue;
+        }
+        let best = move_ev
+            .values()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        weight += *w;
+        weighted_ev += *w * best;
+    }
+    EdgeTerm { weighted_ev, weight }
+}
+
 #[cfg(test)]
 mod tests {
     //! Regression guard pinning the verified general (non-split) solver output. Split-specific tests
@@ -405,7 +444,22 @@ mod tests {
     //! within ~1e-12 of each other for these decided cells. Reference strategy:
     //! <https://wizardofodds.com/games/blackjack/appendix/9/2dh17r4/>.
     use super::*;
+    use crate::rules::BjPayout;
     use crate::test_support::*;
+
+    /// The overall player edge (house edge, signed for the player so it is typically negative) under
+    /// `rules`, assuming optimal composition-dependent play. Each up-card's [`build_evs`] tree gives a
+    /// two-card-root [`EdgeTerm`]; they are averaged by the up-card's draw probability from the full
+    /// shoe. Production code (the TUI) accumulates the per-up-card [`edge_term`]s incrementally from
+    /// the chart trees it already computes, so this whole-shoe convenience pass exists only here.
+    fn player_edge<S: Shoe + Copy + Eq + Hash>(shoe: S, rules: &Ruleset) -> f64 {
+        shoe.all_draw_probs()
+            .map(|(up, p_up)| {
+                let tree = build_evs(shoe, up, rules);
+                p_up * edge_term(&tree).value()
+            })
+            .sum()
+    }
 
     /// The per-move EVs of soft 20 (9,A) vs a 5 — the unconditional path (P_bj = 0), so a clean
     /// control. These exact magnitudes were the cross-check anchor through the basis redesign.
@@ -430,7 +484,7 @@ mod tests {
         assert_close(tree_32[&nat].1[&Move::Stand], 1.5, "3:2 natural vs 5");
 
         let six_five = Ruleset {
-            bj_payout: 1.2,
+            bj_payout: BjPayout::SixToFive,
             split_cards: 0,
             ..Ruleset::default()
         };
@@ -451,6 +505,42 @@ mod tests {
         assert_eq!(vs_ace[&HandCategory::Hard(15)], Move::Surrender, "H15 vs A");
         assert_eq!(vs_ace[&HandCategory::Hard(16)], Move::Surrender, "H16 vs A");
         assert_eq!(vs_ace[&HandCategory::Hard(17)], Move::Surrender, "H17 vs A");
+    }
+
+    /// The overall player edge (negative = house advantage) under optimal play, full default rules
+    /// (H17, DAS, late surrender, splits) on the infinite deck — fast and deterministic there since
+    /// split arms are independent (no depletion). Lands in the canonical sub-percent house-edge band;
+    /// the Ten/Ace columns exercise the dealer-natural deficit correction.
+    #[test]
+    fn player_edge_band() {
+        use crate::shoe::InfiniteDeck;
+        // split_cards is irrelevant on a non-depleting deck (no cross-arm correlation to track).
+        let edge = player_edge(InfiniteDeck {}, &ruleset_with(0));
+        assert_close(edge, -0.006_294_265_713_365_8, "infinite-deck edge");
+    }
+
+    /// Peek strictly dominates no-peek (ENHC) when every *other* rule is held fixed: off peek the
+    /// player forfeits doubled and split bets to a natural revealed at the end, a loss no strategy
+    /// adjustment can recover. (The intuition that "no peek helps the player" only appears to hold
+    /// when toggling peek silently also upgrades the surrender rule — which the combined [`PeekRule`]
+    /// axis now makes impossible.) Surrender is held at `None` on both sides so the comparison is
+    /// purely the peek mechanic.
+    #[test]
+    fn peek_dominates_no_peek() {
+        use crate::rules::{PeekRule, PeekSurrender};
+        use crate::shoe::InfiniteDeck;
+        let with_peek = |peek| Ruleset {
+            peek,
+            split_cards: 0,
+            ..Ruleset::default()
+        };
+        let peek_edge = player_edge(InfiniteDeck {}, &with_peek(PeekRule::Peek(PeekSurrender::None)));
+        let no_peek_edge =
+            player_edge(InfiniteDeck {}, &with_peek(PeekRule::NoPeek { early_surrender: false }));
+        assert!(
+            no_peek_edge < peek_edge,
+            "no-peek edge {no_peek_edge} should be below peek edge {peek_edge}"
+        );
     }
 
     /// A couple of uncontroversial basic-strategy anchors on the unconditional path, so the guard
