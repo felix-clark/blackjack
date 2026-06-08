@@ -404,7 +404,7 @@ impl Shoe for CardCol {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct InfiniteDeck {}
 
 impl Shoe for InfiniteDeck {

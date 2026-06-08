@@ -2,19 +2,24 @@ pub(crate) mod card;
 pub(crate) mod dealer;
 mod legacy;
 pub(crate) mod shoe;
+mod split;
+#[cfg(test)]
+mod test_support;
 
 use card::*;
 use dealer::*;
 use shoe::*;
+use split::split_move_ev;
 
 use std::{
     collections::HashMap,
     default::Default,
     fmt::{Debug, Display},
+    hash::Hash,
 };
 
 #[derive(PartialEq, Eq, Debug, Hash, PartialOrd, Ord, Clone, Copy)]
-enum HandState {
+pub(crate) enum HandState {
     Bust,
     Soft(u8),
     Hard(u8),
@@ -55,7 +60,7 @@ impl From<&CardCol> for HandState {
 }
 
 #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
-enum Move {
+pub(crate) enum Move {
     Hit,
     Stand,
     Double,
@@ -86,7 +91,7 @@ impl Display for Move {
 /// falls through to `Soft`/`Hard`/`Natural`. Hard and soft categories still pool every composition
 /// (and size) of that total, which is where composition-dependent strategy is averaged out.
 #[derive(PartialEq, Eq, Debug, Hash, PartialOrd, Ord, Clone, Copy)]
-enum HandCategory {
+pub(crate) enum HandCategory {
     Hard(u8),
     Soft(u8),
     Pair(Card),
@@ -129,12 +134,49 @@ pub(crate) struct Ruleset {
     pub(crate) dealer_check: bool,
     // /// Double on anything (as opposed to just 10 and 11) -- maybe just assume true
     // doa: bool,
+    /// What a player natural (a two-card blackjack) pays, as a multiple of the bet. The good and
+    /// near-universal value is `1.5` (3:2); some tables pay `1.2` (6:5), a strictly worse rule.
+    /// Only ever applies to a genuine first-deal natural — a split-arm 21 is *not* a blackjack and
+    /// pays even money regardless (see [`arm_stand_ev`]).
+    pub(crate) bj_payout: f64,
     /// Whether (and when) the player may surrender.
     pub(crate) surrender: SurrenderRule,
-    // TODO: only allowed 1 card after splitting aces? Only allowed to split aces once?
+    /// Maximum number of hands the player may end up with after splitting (so the number of splits
+    /// allowed is `max_split_hands - 1`). Caps the split recursion — and is what keeps the infinite
+    /// deck terminating, since otherwise a pair could be re-split without bound. Setting it to
+    /// `4 * n_decks` recovers unbounded splitting on a finite shoe. `< 2` disables splitting.
+    pub(crate) max_split_hands: u8,
+    /// Split accuracy as a single budget on the **total number of cards drawn** (across all arms)
+    /// that are tracked with exact cross-arm depletion. While the budget lasts the depleting shoe
+    /// carries forward between arms (each arm sees the cards earlier arms removed — the true
+    /// finite-shoe correlation); once this many cards have been drawn, further arms restart from the
+    /// pristine post-split shoe (within-arm depletion stays exact throughout — it is cheap and
+    /// self-contained; only the expensive cross-arm linkage is truncated).
+    ///
+    /// One total-cards cap because it sets the truncation *order* directly: a draw path of n cards has
+    /// probability ~1/13ⁿ, so capping at K neglects the cross-arm correction uniformly at ~1/13^(K+1),
+    /// and the budget is spent first on the shallow, high-probability draws where the correction is
+    /// largest. The carried-shoe diversity is bounded by ≤K-card removals from the post-split shoe, a
+    /// count independent of deck size, so a small K stays tractable even on 8 decks where a full search
+    /// is infeasible. `0` is the old independent-arms approximation (no cross-arm correlation); a K
+    /// larger than any reachable draw count (see [`Ruleset::EXACT_SPLIT`]) never resets and so is the
+    /// full exact search. The default `4` is ~5–10× more accurate than independent (sub-1e-4 vs the
+    /// exact value) while staying sub-second per query.
+    pub(crate) split_cards: u8,
+    // TODO: finer split-aces rules. Currently split aces always get exactly one card and cannot be
+    // re-split (the common rule); a future axis could relax either, and "no double on split aces /
+    // tens" would refine `das` per split rank — see the `SplitSolver` field comments.
 }
 
 impl Ruleset {
+    /// A `split_cards` budget larger than any draw count a split can reach, so the cross-arm
+    /// truncation never fires: the full exact split search (every drawn card tracked, all arms). Not a
+    /// magic sentinel — it is just a large `K` that never decrements to `0` in practice.
+    /// Combinatorially infeasible on a big shoe — use it for single-query validation, not whole-chart
+    /// builds. See [`Ruleset::split_cards`].
+    #[allow(dead_code)] // public knob; currently only the tests construct an exact ruleset
+    pub(crate) const EXACT_SPLIT: u8 = u8::MAX;
+
     /// Reject rule combinations that don't correspond to a real game. Late surrender is defined as
     /// surrendering after the dealer peeks, so it only makes sense when the dealer peeks at all.
     fn validate(&self) {
@@ -154,17 +196,27 @@ impl Default for Ruleset {
             hs17: true,
             das: true,
             dealer_check: true,
+            bj_payout: 1.5,
             surrender: SurrenderRule::Late,
+            max_split_hands: 4,
+            // This is technically not a ruleset option, but a computational precision vs.
+            // investment option that specifies the depth of the exact enumeration in multiple
+            // splits.
+            split_cards: 4,
         }
     }
 }
 
-fn resolve_ev(player_hand: &CardCol, dealer_state: DealerOutcome) -> f64 {
-    let player_state = HandState::from(player_hand);
+/// Terminal payoff of a standing/resolved player hand against one dealer outcome, as a multiple of
+/// the bet. Keyed on the collapsed [`HandState`] so callers control natural-eligibility: only a
+/// hand presented as [`HandState::Natural`] earns `bj_payout` (and pushes a dealer natural) — a
+/// split-arm 21 is presented as an ordinary total and so loses to a dealer natural and pays even
+/// money (see [`arm_stand_ev`]). `bj_payout` is the table's blackjack payout (3:2 = 1.5, 6:5 = 1.2).
+pub(crate) fn resolve_ev(player_state: HandState, dealer_state: DealerOutcome, bj_payout: f64) -> f64 {
     match (player_state, dealer_state) {
         (HandState::Natural, DealerOutcome::Natural) => 0.,
         (_, DealerOutcome::Natural) => -1.,
-        (HandState::Natural, _) => 1.5, // This can change based on the rules, but should be 3/2
+        (HandState::Natural, _) => bj_payout,
         (HandState::Bust, _) => -1.,
         (_, DealerOutcome::Bust) => 1.,
         (HandState::Hard(p) | HandState::Soft(p), DealerOutcome::Total(d)) => match p.cmp(&d) {
@@ -261,6 +313,60 @@ fn conditional_draw_probs<S: Shoe>(bj_rank: Card, shoe: &S) -> Vec<(Card, f64)> 
         .collect()
 }
 
+/// The evaluation **basis** for one up-card: the dealer-outcome distribution and the player's
+/// next-card distribution as functions of the remaining shoe.
+///
+/// This is the shared kernel both player-EV traversals rest on. `build_evs` (its bottom-up
+/// partition DP) and [`SplitSolver`] (its top-down arm recursion) are deliberately *different*
+/// traversals — one produces the whole weighted tree, the other a single arm's value with a re-split
+/// budget — but they ask the deck the *same* two questions, conditioned the *same* way. Centralising
+/// that here keeps the subtle peek-conditioning (on which the affine-collapse property depends) in one
+/// place instead of three. When `conditional` (the dealer peeks and the up-card can make a natural)
+/// both distributions are the marginal, hole-averaged ones conditioned on no dealer natural
+/// ([`conditional_dealer_dist`] / [`conditional_draw_probs`]); otherwise they are the plain
+/// unconditional ones. It is cacheless by design — `build_evs` queries each shoe once (every hand has
+/// a distinct remaining shoe), while `SplitSolver` wraps it in its own caches where arms revisit
+/// shoes.
+#[derive(Clone, Copy)]
+pub(crate) struct Basis {
+    up_card: Card,
+    /// The hole rank that completes a dealer natural (`Some` only for an Ace/Ten up); `None` off peek.
+    bj_rank: Option<Card>,
+    /// Whether to condition on a clean dealer peek (no natural).
+    conditional: bool,
+    hs17: bool,
+}
+
+impl Basis {
+    pub(crate) fn new(up_card: Card, rules: &Ruleset) -> Self {
+        let bj_rank = natural_hole_rank(up_card);
+        Self {
+            up_card,
+            bj_rank,
+            conditional: rules.dealer_check && bj_rank.is_some(),
+            hs17: rules.hs17,
+        }
+    }
+
+    /// Dealer outcome distribution from `shoe` on this basis.
+    pub(crate) fn dealer_dist<S: Shoe>(&self, shoe: &S) -> HashMap<DealerOutcome, f64> {
+        if self.conditional {
+            conditional_dealer_dist(self.up_card, self.bj_rank.unwrap(), shoe, self.hs17)
+        } else {
+            dealer_outcome_probs(CardCol::from_hand(&[self.up_card]), shoe, self.hs17)
+        }
+    }
+
+    /// The player's next-card distribution from `shoe` on this basis.
+    pub(crate) fn draw_probs<S: Shoe>(&self, shoe: &S) -> Vec<(Card, f64)> {
+        if self.conditional {
+            conditional_draw_probs(self.bj_rank.unwrap(), shoe)
+        } else {
+            shoe.all_draw_probs().collect()
+        }
+    }
+}
+
 /// Returns a map from a given player hand to a probability weight and an expectation value for each
 /// move made with that hand, assuming optimal H/S strategy afterwards.
 ///
@@ -280,8 +386,8 @@ fn conditional_draw_probs<S: Shoe>(bj_rank: Card, shoe: &S) -> Vec<(Card, f64)> 
 /// it is exact; across sizes the scan-weight is not a coherent distribution (a known deferred
 /// imprecision), so it is only a relative pooling weight in [`summarize_evs`].
 // TODO: Should this be a struct so it can recursively build the table by demand?
-fn build_evs(
-    mut shoe: impl Shoe,
+pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash>(
+    mut shoe: S,
     up_card: Card,
     rules: &Ruleset,
 ) -> HashMap<CardCol, (f64, HashMap<Move, f64>)> {
@@ -292,13 +398,13 @@ fn build_evs(
     let shoe = shoe;
 
     // The future dealer draws are not totally independent from the player choices, so to be precise
-    // we must wait to resolve the dealer's result conditioned on the players hand.
+    // we must wait to resolve the dealer's result conditioned on the players hand. The basis bundles
+    // the dealer/draw distributions and the peek conditioning (shared with the split solver).
     let dealer_hand = CardCol::from_hand(&[up_card]);
-
+    let basis = Basis::new(up_card, rules);
     // Peek conditioning only bites when the dealer actually peeks *and* the up-card can make a
-    // natural; otherwise the conditional and unconditional bases coincide and we take the plain one.
-    let bj_rank = natural_hole_rank(up_card);
-    let conditional = rules.dealer_check && bj_rank.is_some();
+    // natural; otherwise the conditional and unconditional bases coincide.
+    let conditional = basis.conditional;
 
     let mut full_ev_tree = HashMap::<CardCol, (f64, HashMap<Move, f64>)>::new();
 
@@ -325,7 +431,9 @@ fn build_evs(
             if pl_hand.is_nat21() {
                 let nat_ev = dealer_outcome_probs(dealer_hand, &shoe_minus_hand, rules.hs17)
                     .iter()
-                    .map(|(&dealer, p)| p * resolve_ev(&pl_hand, dealer))
+                    .map(|(&dealer, p)| {
+                        p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout)
+                    })
                     .sum::<f64>();
                 let ev_map = HashMap::from_iter([(Move::Stand, nat_ev)]);
                 let ins_res = full_ev_tree.insert(pl_hand, (weight, ev_map));
@@ -336,22 +444,16 @@ fn build_evs(
             // Dealer outcome distribution against this hand, conditioned on a clean peek when the
             // peek applies. On the conditional basis there is no `Natural` outcome at all (it was
             // conditioned out), so every move below resolves naturally with no peek special-casing.
-            let dealer_probs = if conditional {
-                conditional_dealer_dist(up_card, bj_rank.unwrap(), &shoe_minus_hand, rules.hs17)
-            } else {
-                dealer_outcome_probs(dealer_hand, &shoe_minus_hand, rules.hs17)
-            };
+            let dealer_probs = basis.dealer_dist(&shoe_minus_hand);
             let stand_ev = dealer_probs
                 .iter()
-                .map(|(&dealer, p)| p * resolve_ev(&pl_hand, dealer))
+                .map(|(&dealer, p)| {
+                    p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout)
+                })
                 .sum::<f64>();
 
             // The player's next-card distribution, conditioned to match the dealer distribution.
-            let draw_probs: Vec<(Card, f64)> = if conditional {
-                conditional_draw_probs(bj_rank.unwrap(), &shoe_minus_hand)
-            } else {
-                shoe_minus_hand.all_draw_probs().collect()
-            };
+            let draw_probs: Vec<(Card, f64)> = basis.draw_probs(&shoe_minus_hand);
 
             // Hitting draws a card then plays on optimally: the child's *best* move EV. The child
             // is already in the tree (it totals more, computed on an earlier, higher `pl_tot`).
@@ -416,9 +518,14 @@ fn build_evs(
                     evs.push((Move::Surrender, surrender_ev));
                 }
 
-                // TODO: Handle splitting. This might actually be quite complicated in general
-                // because each outcome in one arm conditions the results in the other(s). It also
-                // can be complicated by multi-splitting (which is sometimes limited to 2 or 4).
+                // A pair may be split (creating at least two hands, so only when the rules allow at
+                // least two). The arms are played out exactly from the shared depleting shoe; see
+                // `split_move_ev`. On the conditional basis this is computed by the same hole
+                // stratification as the other moves, so all the EVs in this map stay comparable.
+                if rules.max_split_hands >= 2 && pair_rank(&pl_hand).is_some() {
+                    let split_ev = split_move_ev(&pl_hand, &shoe_minus_hand, basis, rules);
+                    evs.push((Move::Split, split_ev));
+                }
             }
             // On the conditional basis the pooling weight becomes the conditional occurrence
             // probability P(hold hand | no dealer natural) ∝ scan-weight · (1 - P_bj).
@@ -437,7 +544,7 @@ fn build_evs(
 }
 
 /// The rank of a two-card pair, if the hand is one (exactly two cards of the same rank).
-fn pair_rank(hand: &CardCol) -> Option<Card> {
+pub(crate) fn pair_rank(hand: &CardCol) -> Option<Card> {
     if hand.len() != 2 {
         return None;
     }
@@ -468,7 +575,7 @@ fn categorize(hand: &CardCol) -> HandCategory {
 /// probability-of-hand is implemented, at which point only this weighting need change. A move only
 /// contributes from the hands that actually offer it, so e.g. `Double`/`Surrender` for a hard total
 /// reflect only its two-card members.
-fn summarize_evs(
+pub(crate) fn summarize_evs(
     ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
 ) -> HashMap<HandCategory, HashMap<Move, f64>> {
     // category -> move -> (Σ weight, Σ weight·ev), accumulated for a streaming weighted average.
@@ -493,7 +600,7 @@ fn summarize_evs(
 }
 
 /// Reduce a per-category move→EV summary (from [`summarize_evs`]) to the single best move per row.
-fn best_strategy(
+pub(crate) fn best_strategy(
     summary: &HashMap<HandCategory, HashMap<Move, f64>>,
 ) -> HashMap<HandCategory, Move> {
     summary
@@ -570,4 +677,78 @@ fn main() {
     for (cat, strat) in sorted_strat.into_iter() {
         println!("{}: {}", cat, strat);
     }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression guard pinning the verified general (non-split) solver output. Split-specific tests
+    //! — the `SplitSolver` budget modes and the pair-cell chart decisions — live in [`crate::split`].
+    //!
+    //! All numbers are for a **2-deck shoe under [`Ruleset::default`]** (H17, DAS, dealer peeks,
+    //! late surrender) — the configuration every reference value in the design notes was captured
+    //! under. EV magnitudes are checked to a tolerance, not bit-exactly: `stand`/`hit` EVs sum over
+    //! `HashMap` iteration, whose order is randomized per run, so float non-associativity can move
+    //! the last bit. The argmax (chart) cells are robust to that because the competing EVs are not
+    //! within ~1e-12 of each other for these decided cells. Reference strategy:
+    //! <https://wizardofodds.com/games/blackjack/appendix/9/2dh17r4/>.
+    use super::*;
+    use crate::test_support::*;
+
+    /// The per-move EVs of soft 20 (9,A) vs a 5 — the unconditional path (P_bj = 0), so a clean
+    /// control. These exact magnitudes were the cross-check anchor through the basis redesign.
+    #[test]
+    fn soft20_vs_5_move_evs() {
+        let tree = ev_tree(Card::Pip(5));
+        let (_w, evs) = &tree[&CardCol::try_from("9A").unwrap()];
+        assert_close(evs[&Move::Stand], 0.674_582_770_421_14, "stand");
+        assert_close(evs[&Move::Hit], 0.261_623_004_258_03, "hit");
+        assert_close(evs[&Move::Double], 0.523_246_008_516_06, "double");
+        assert_close(evs[&Move::Surrender], -0.5, "surrender");
+    }
+
+    /// The blackjack payout is a rule parameter. Against a 5 the dealer can't have a natural, so a
+    /// player natural always pays out: its Stand EV equals `bj_payout` exactly (3:2 by default, and
+    /// 6:5 when configured). This pins the new `Ruleset::bj_payout` axis through the shared resolver.
+    #[test]
+    fn bj_payout_rule_axis() {
+        let nat = CardCol::try_from("TA").unwrap();
+
+        let tree_32 = build_evs(CardCol::from_decks(2), Card::Pip(5), &ruleset_with(0));
+        assert_close(tree_32[&nat].1[&Move::Stand], 1.5, "3:2 natural vs 5");
+
+        let six_five = Ruleset {
+            bj_payout: 1.2,
+            split_cards: 0,
+            ..Ruleset::default()
+        };
+        let tree_65 = build_evs(CardCol::from_decks(2), Card::Pip(5), &six_five);
+        assert_close(tree_65[&nat].1[&Move::Stand], 1.2, "6:5 natural vs 5");
+    }
+
+    /// Late-surrender cells (hard hands) against a ten and an ace up-card — the peek-conditional
+    /// path. The H17-specific H17-vs-A surrender is the H17 tell. Pair cells are checked separately
+    /// in `split_decisions_under_peek`, since with split scored 8,8 is split (not surrendered) here.
+    #[test]
+    fn late_surrender_hard_cells() {
+        let vs_ten = strategy_for(Card::Ten);
+        assert_eq!(vs_ten[&HandCategory::Hard(15)], Move::Surrender, "H15 vs T");
+        assert_eq!(vs_ten[&HandCategory::Hard(16)], Move::Surrender, "H16 vs T");
+
+        let vs_ace = strategy_for(Card::Ace);
+        assert_eq!(vs_ace[&HandCategory::Hard(15)], Move::Surrender, "H15 vs A");
+        assert_eq!(vs_ace[&HandCategory::Hard(16)], Move::Surrender, "H16 vs A");
+        assert_eq!(vs_ace[&HandCategory::Hard(17)], Move::Surrender, "H17 vs A");
+    }
+
+    /// A couple of uncontroversial basic-strategy anchors on the unconditional path, so the guard
+    /// also covers ordinary hit/stand/double argmax, not just the surrender corners.
+    #[test]
+    fn basic_strategy_anchors_vs_5() {
+        let strat = strategy_for(Card::Pip(5));
+        assert_eq!(strat[&HandCategory::Hard(16)], Move::Stand, "H16 vs 5");
+        assert_eq!(strat[&HandCategory::Hard(11)], Move::Double, "H11 vs 5");
+        assert_eq!(strat[&HandCategory::Hard(8)], Move::Hit, "H8 vs 5");
+        assert_eq!(strat[&HandCategory::Soft(18)], Move::Double, "S18 vs 5");
+    }
+
 }
