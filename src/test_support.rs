@@ -5,8 +5,10 @@
 use std::collections::HashMap;
 
 use crate::card::*;
+use crate::hand::{HandCategory, Move};
+use crate::rules::Ruleset;
 use crate::shoe::*;
-use crate::{HandCategory, Move, Ruleset, best_strategy, build_evs, summarize_evs};
+use crate::simulation::{best_strategy, build_evs, summarize_evs};
 
 /// The default ruleset with only the split-accuracy budget overridden — the single knob the tests
 /// vary (`0` = independent arms, [`Ruleset::EXACT_SPLIT`] = full exact cross-arm search).

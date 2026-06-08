@@ -11,8 +11,10 @@ use std::hash::Hash;
 
 use crate::card::*;
 use crate::dealer::*;
+use crate::hand::{HandState, pair_rank};
+use crate::rules::Ruleset;
 use crate::shoe::*;
-use crate::{Basis, HandState, Ruleset, pair_rank, resolve_ev};
+use crate::simulation::{Basis, resolve_ev};
 
 /// Payoff of a **split arm** standing on `total` against a dealer-outcome distribution.
 ///
@@ -67,8 +69,8 @@ fn arm_stand_ev(total: u8, dealer_probs: &HashMap<DealerOutcome, f64>) -> f64 {
 /// follow; with independent arms the siblings' value is unaffected by this arm's play except through
 /// the shared re-split budget, so this reduces to playing each arm for its own EV.
 ///
-/// [`conditional_dealer_dist`]: crate::conditional_dealer_dist
-/// [`conditional_draw_probs`]: crate::conditional_draw_probs
+/// [`conditional_dealer_dist`]: crate::simulation::conditional_dealer_dist
+/// [`conditional_draw_probs`]: crate::simulation::conditional_draw_probs
 struct SplitSolver<S: Shoe + Copy + Eq + Hash> {
     /// The shoe each arm starts from (up card and both pair cards already removed): the independent
     /// arms never see one another's depletion, so this is restored at every arm boundary.
@@ -333,8 +335,9 @@ mod tests {
     //! the focused budget tests built on the infinite deck or a half deck as noted per test.
     //! Reference strategy: <https://wizardofodds.com/games/blackjack/appendix/9/2dh17r4/>.
     use super::*;
+    use crate::hand::{HandCategory, Move};
+    use crate::simulation::build_evs;
     use crate::test_support::*;
-    use crate::{HandCategory, Move, build_evs};
 
     /// Pair decisions on the peek-conditional path (ten and ace up). Aces always split; nines stand
     /// against a ten or ace (18 is good enough, splitting into two 9s is worse); 8,8 splits vs a ten.
