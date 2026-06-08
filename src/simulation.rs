@@ -9,12 +9,13 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::card::Card;
 use crate::dealer::{DealerOutcome, dealer_outcome_probs};
-use crate::hand::{HandCategory, HandState, Move, categorize, pair_rank};
+use crate::hand::{HandCategory, HandState, Move, categorize};
 use crate::rules::Ruleset;
-use crate::shoe::{CardCol, Shoe};
+use crate::shoe::{CardCol, N_RANKS, Shoe};
 use crate::split::split_move_ev;
 
 /// Terminal payoff of a standing/resolved player hand against one dealer outcome, as a multiple of
@@ -201,7 +202,7 @@ impl Basis {
 /// it is exact; across sizes the scan-weight is not a coherent distribution (a known deferred
 /// imprecision), so it is only a relative pooling weight in [`summarize_evs`].
 // TODO: Should this be a struct so it can recursively build the table by demand?
-pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash>(
+pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash + Sync>(
     mut shoe: S,
     up_card: Card,
     rules: &Ruleset,
@@ -220,137 +221,240 @@ pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash>(
     // natural; otherwise the conditional and unconditional bases coincide.
     let conditional = basis.conditional;
 
+    // The split solves dominate runtime by far (e.g. on a 6-deck shoe the whole non-split DP is
+    // ~0.6s while the pair splits sum to ~34s) and each is independent of the DP tree, so they are
+    // computed up front across all cores; the DP below just looks the result up. This is the engine's
+    // parallelism — what lets a single column use more than one core (one split runs per pair, so the
+    // per-level DP loop could never parallelise it). See [`pair_split_evs`].
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let split_evs = pair_split_evs(&shoe, basis, rules, n_threads);
+
     let mut full_ev_tree = HashMap::<CardCol, (f64, HashMap<Move, f64>)>::new();
 
-    // Go down to 2 to get all soft options as well
+    // Go down to 2 to get all soft options as well. The 21→2 order is the DP dependency: a hit/double
+    // child totals strictly more, so it is already in the tree when looked up.
     for pl_tot in (2..=21).rev() {
         for (weight, pl_hand) in shoe.weighted_partitions(pl_tot) {
             if pl_hand.len() < 2 {
                 continue;
             }
-
-            // Assert that we aren't overdrawing; this should be a given if
-            // weighted_hard_partitions() is correct (always true for the infinite deck).
-            assert!(shoe.contains_hand(&pl_hand));
-            let shoe_minus_hand = shoe.remove_hand(&pl_hand);
-
-            // A natural is a terminal two-card hand with no decision to make: it simply resolves
-            // (3:2, or a push against a dealer natural). Record it as a leaf so the consolidation
-            // and house-advantage layers can account for it, but offer it no playable moves — in
-            // particular never a double or surrender. It is always scored on the *unconditional*
-            // dealer distribution: a natural resolves at the peek itself, so its honest EV must keep
-            // the push-against-a-dealer-natural mass rather than condition it away. A natural is
-            // never reached as a hit target (three cards can't total a two-card 21), so the Hit DP
-            // below never looks it up.
-            if pl_hand.is_nat21() {
-                let nat_ev = dealer_outcome_probs(dealer_hand, &shoe_minus_hand, rules.hs17)
-                    .iter()
-                    .map(|(&dealer, p)| {
-                        p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout.multiplier())
-                    })
-                    .sum::<f64>();
-                let ev_map = HashMap::from_iter([(Move::Stand, nat_ev)]);
-                let ins_res = full_ev_tree.insert(pl_hand, (weight, ev_map));
-                assert!(ins_res.is_none());
-                continue;
-            }
-
-            // Dealer outcome distribution against this hand, conditioned on a clean peek when the
-            // peek applies. On the conditional basis there is no `Natural` outcome at all (it was
-            // conditioned out), so every move below resolves naturally with no peek special-casing.
-            let dealer_probs = basis.dealer_dist(&shoe_minus_hand);
-            let stand_ev = dealer_probs
-                .iter()
-                .map(|(&dealer, p)| {
-                    p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout.multiplier())
-                })
-                .sum::<f64>();
-
-            // The player's next-card distribution, conditioned to match the dealer distribution.
-            let draw_probs: Vec<(Card, f64)> = basis.draw_probs(&shoe_minus_hand);
-
-            // Hitting draws a card then plays on optimally: the child's *best* move EV. The child
-            // is already in the tree (it totals more, computed on an earlier, higher `pl_tot`).
-            // Taking the max over the child's already-conditioned move EVs keeps the continuation
-            // non-clairvoyant about the hole.
-            let hit_ev = draw_probs
-                .iter()
-                .map(|&(c, p_c)| {
-                    let mut pl_hand_hit = pl_hand;
-                    pl_hand_hit.insert(c);
-                    p_c * match full_ev_tree.get(&pl_hand_hit) {
-                        Some((_w, ev_map)) => *ev_map
-                            .values()
-                            .max_by(|a, b| a.partial_cmp(b).unwrap())
-                            .unwrap(),
-                        None => {
-                            assert!(HandState::from(&pl_hand_hit) == HandState::Bust);
-                            -1.
-                        }
-                    }
-                })
-                .sum::<f64>();
-            let mut evs = vec![(Move::Stand, stand_ev), (Move::Hit, hit_ev)];
-            // If this is a starting hand (i.e. length two) then we may also have the option to
-            // double down, split, or surrender.
-            if pl_hand.len() == 2 {
-                // Doubling draws exactly one card then stands. The child's stored `Stand` EV already
-                // resolves against the dealer distribution with that card removed and on this same
-                // (conditional or unconditional) basis, so the doubled payoff is just twice it — no
-                // separate dealer recomputation, and no peek special case. On the conditional basis
-                // a dealer natural can't occur; on the no-peek basis the child's `Stand` EV already
-                // carries -1 per natural, so 2x correctly forfeits the whole doubled bet to it.
-                // (Doubling is assumed start-only; allowing it mid-hand would inflate the Hit DP.)
-                let double_ev = draw_probs
-                    .iter()
-                    .map(|&(c, p_c)| {
-                        let mut pl_hand_dd = pl_hand;
-                        pl_hand_dd.insert(c);
-                        let child_stand = match full_ev_tree.get(&pl_hand_dd) {
-                            Some((_w, ev_map)) => ev_map[&Move::Stand],
-                            None => {
-                                assert!(HandState::from(&pl_hand_dd) == HandState::Bust);
-                                -1.
-                            }
-                        };
-                        p_c * 2.0 * child_stand
-                    })
-                    .sum::<f64>();
-                evs.push((Move::Double, double_ev));
-
-                // Surrender forfeits half the bet for a flat -0.5 on whichever basis this tree is
-                // on: late surrender happens after a clean peek (the conditional basis already
-                // excludes the dealer natural), and early surrender escapes the natural before the
-                // peek (an unconditional -0.5). NOTE: early surrender *combined with* a peek is the
-                // one ragged case — that decision is genuinely pre-peek and would need an
-                // unconditional root comparison; it is uncommon and left for later.
-                if rules.peek.surrender_offered() {
-                    evs.push((Move::Surrender, -0.5));
-                }
-
-                // A pair may be split (creating at least two hands, so only when the rules allow at
-                // least two). The arms are played out exactly from the shared depleting shoe; see
-                // `split_move_ev`. On the conditional basis this is computed by the same hole
-                // stratification as the other moves, so all the EVs in this map stay comparable.
-                if rules.max_split_hands >= 2 && pair_rank(&pl_hand).is_some() {
-                    let split_ev = split_move_ev(&pl_hand, &shoe_minus_hand, basis, rules);
-                    evs.push((Move::Split, split_ev));
-                }
-            }
-            // On the conditional basis the pooling weight becomes the conditional occurrence
-            // probability P(hold hand | no dealer natural) ∝ scan-weight · (1 - P_bj).
-            let stored_weight = if conditional {
-                weight * (1.0 - dealer_natural_prob(up_card, &shoe_minus_hand))
-            } else {
-                weight
-            };
-            let ev_map = HashMap::from_iter(evs);
-            let ins_res = full_ev_tree.insert(pl_hand, (stored_weight, ev_map));
+            let (pl_hand, entry) = solve_hand(
+                weight,
+                pl_hand,
+                &shoe,
+                &full_ev_tree,
+                basis,
+                rules,
+                dealer_hand,
+                up_card,
+                conditional,
+                &split_evs,
+            );
+            let ins_res = full_ev_tree.insert(pl_hand, entry);
             assert!(ins_res.is_none());
         }
-        // dbg!(pl_tot);
     }
     full_ev_tree
+}
+
+/// Solve every splittable pair's split EV up front, in parallel — the engine's one expensive,
+/// embarrassingly-parallel phase. Each [`split_move_ev`] is self-contained (it spins up its own
+/// arm recursion and reads nothing from the main DP tree), so they fan out cleanly across cores via
+/// [`par_map`]; the [`build_evs`] DP then just looks each pair up. Returns `{pair → split EV}`, empty
+/// when splitting is disabled. A pair is included iff the shoe actually holds two of that rank.
+fn pair_split_evs<S: Shoe + Copy + Eq + Hash + Sync>(
+    shoe: &S,
+    basis: Basis,
+    rules: &Ruleset,
+    n_threads: usize,
+) -> HashMap<CardCol, f64> {
+    if rules.max_split_hands < 2 {
+        return HashMap::new();
+    }
+    let pairs: Vec<CardCol> = (0..N_RANKS)
+        .map(|i| {
+            let r = Card::from_rank_index(i);
+            CardCol::from_hand(&[r, r])
+        })
+        .filter(|pair| shoe.contains_hand(pair))
+        .collect();
+    par_map(&pairs, n_threads, |&pair| {
+        let shoe_minus_hand = shoe.remove_hand(&pair);
+        (pair, split_move_ev(&pair, &shoe_minus_hand, basis, rules))
+    })
+    .into_iter()
+    .collect()
+}
+
+/// Compute the move→EV map for one concrete player hand against the dealer up-card, reading
+/// already-solved (higher-total) children out of `full_ev_tree`. Pure and read-only w.r.t. the tree
+/// (and everything else), which is what makes the per-level [`par_map`] safe and exact. Returns the
+/// hand and its `(pooling weight, move→EV)` entry, ready to insert. Factored out of [`build_evs`]'s
+/// level loop verbatim — see there for the running commentary on each branch.
+#[allow(clippy::too_many_arguments)]
+fn solve_hand<S: Shoe + Copy + Eq + Hash>(
+    weight: f64,
+    pl_hand: CardCol,
+    shoe: &S,
+    full_ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
+    basis: Basis,
+    rules: &Ruleset,
+    dealer_hand: CardCol,
+    up_card: Card,
+    conditional: bool,
+    split_evs: &HashMap<CardCol, f64>,
+) -> (CardCol, (f64, HashMap<Move, f64>)) {
+    // Assert that we aren't overdrawing; this should be a given if
+    // weighted_hard_partitions() is correct (always true for the infinite deck).
+    assert!(shoe.contains_hand(&pl_hand));
+    let shoe_minus_hand = shoe.remove_hand(&pl_hand);
+
+    // A natural is a terminal two-card hand with no decision to make: it simply resolves
+    // (3:2, or a push against a dealer natural). Record it as a leaf so the consolidation
+    // and house-advantage layers can account for it, but offer it no playable moves — in
+    // particular never a double or surrender. It is always scored on the *unconditional*
+    // dealer distribution: a natural resolves at the peek itself, so its honest EV must keep
+    // the push-against-a-dealer-natural mass rather than condition it away. A natural is
+    // never reached as a hit target (three cards can't total a two-card 21), so the Hit DP
+    // below never looks it up.
+    if pl_hand.is_nat21() {
+        let nat_ev = dealer_outcome_probs(dealer_hand, &shoe_minus_hand, rules.hs17)
+            .iter()
+            .map(|(&dealer, p)| {
+                p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout.multiplier())
+            })
+            .sum::<f64>();
+        let ev_map = HashMap::from_iter([(Move::Stand, nat_ev)]);
+        return (pl_hand, (weight, ev_map));
+    }
+
+    // Dealer outcome distribution against this hand, conditioned on a clean peek when the
+    // peek applies. On the conditional basis there is no `Natural` outcome at all (it was
+    // conditioned out), so every move below resolves naturally with no peek special-casing.
+    let dealer_probs = basis.dealer_dist(&shoe_minus_hand);
+    let stand_ev = dealer_probs
+        .iter()
+        .map(|(&dealer, p)| {
+            p * resolve_ev(HandState::from(&pl_hand), dealer, rules.bj_payout.multiplier())
+        })
+        .sum::<f64>();
+
+    // The player's next-card distribution, conditioned to match the dealer distribution.
+    let draw_probs: Vec<(Card, f64)> = basis.draw_probs(&shoe_minus_hand);
+
+    // Hitting draws a card then plays on optimally: the child's *best* move EV. The child
+    // is already in the tree (it totals more, computed on an earlier, higher `pl_tot`).
+    // Taking the max over the child's already-conditioned move EVs keeps the continuation
+    // non-clairvoyant about the hole.
+    let hit_ev = draw_probs
+        .iter()
+        .map(|&(c, p_c)| {
+            let mut pl_hand_hit = pl_hand;
+            pl_hand_hit.insert(c);
+            p_c * match full_ev_tree.get(&pl_hand_hit) {
+                Some((_w, ev_map)) => *ev_map
+                    .values()
+                    .max_by(|a, b| a.partial_cmp(b).unwrap())
+                    .unwrap(),
+                None => {
+                    assert!(HandState::from(&pl_hand_hit) == HandState::Bust);
+                    -1.
+                }
+            }
+        })
+        .sum::<f64>();
+    let mut evs = vec![(Move::Stand, stand_ev), (Move::Hit, hit_ev)];
+    // If this is a starting hand (i.e. length two) then we may also have the option to
+    // double down, split, or surrender.
+    if pl_hand.len() == 2 {
+        // Doubling draws exactly one card then stands. The child's stored `Stand` EV already
+        // resolves against the dealer distribution with that card removed and on this same
+        // (conditional or unconditional) basis, so the doubled payoff is just twice it — no
+        // separate dealer recomputation, and no peek special case. On the conditional basis
+        // a dealer natural can't occur; on the no-peek basis the child's `Stand` EV already
+        // carries -1 per natural, so 2x correctly forfeits the whole doubled bet to it.
+        // (Doubling is assumed start-only; allowing it mid-hand would inflate the Hit DP.)
+        let double_ev = draw_probs
+            .iter()
+            .map(|&(c, p_c)| {
+                let mut pl_hand_dd = pl_hand;
+                pl_hand_dd.insert(c);
+                let child_stand = match full_ev_tree.get(&pl_hand_dd) {
+                    Some((_w, ev_map)) => ev_map[&Move::Stand],
+                    None => {
+                        assert!(HandState::from(&pl_hand_dd) == HandState::Bust);
+                        -1.
+                    }
+                };
+                p_c * 2.0 * child_stand
+            })
+            .sum::<f64>();
+        evs.push((Move::Double, double_ev));
+
+        // Surrender forfeits half the bet for a flat -0.5 on whichever basis this tree is
+        // on: late surrender happens after a clean peek (the conditional basis already
+        // excludes the dealer natural), and early surrender escapes the natural before the
+        // peek (an unconditional -0.5). NOTE: early surrender *combined with* a peek is the
+        // one ragged case — that decision is genuinely pre-peek and would need an
+        // unconditional root comparison; it is uncommon and left for later.
+        if rules.peek.surrender_offered() {
+            evs.push((Move::Surrender, -0.5));
+        }
+
+        // A pair may be split (creating at least two hands, so only when the rules allow at
+        // least two). The arms are played out exactly from the shared depleting shoe; that solve is
+        // done up front in parallel (see `pair_split_evs`), so here we just look it up. On the
+        // conditional basis it was computed by the same hole stratification as the other moves, so
+        // all the EVs in this map stay comparable.
+        if let Some(&split_ev) = split_evs.get(&pl_hand) {
+            evs.push((Move::Split, split_ev));
+        }
+    }
+    // On the conditional basis the pooling weight becomes the conditional occurrence
+    // probability P(hold hand | no dealer natural) ∝ scan-weight · (1 - P_bj).
+    let stored_weight = if conditional {
+        weight * (1.0 - dealer_natural_prob(up_card, &shoe_minus_hand))
+    } else {
+        weight
+    };
+    let ev_map = HashMap::from_iter(evs);
+    (pl_hand, (stored_weight, ev_map))
+}
+
+/// Map `f` over `items` across up to `n_threads` scoped worker threads, returning the results in an
+/// unspecified order. Work is handed out one item at a time via an atomic cursor, so the very uneven
+/// split solves are absorbed by whichever worker is free rather than stalling a fixed shard. Each item
+/// here is a whole pair's split solve (seconds of work), so the parallel path is worth taking for as
+/// few as two; below that, or single-threaded, it falls back to a plain serial map.
+fn par_map<T: Sync, R: Send>(items: &[T], n_threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if n_threads <= 1 || items.len() < 2 {
+        return items.iter().map(&f).collect();
+    }
+    let cursor = AtomicUsize::new(0);
+    let n = n_threads.min(items.len());
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..n)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        if i >= items.len() {
+                            break;
+                        }
+                        local.push(f(&items[i]));
+                    }
+                    local
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect()
+    })
 }
 
 /// Collapse the per-exact-hand EV tree into one move→EV map per strategy-table [`HandCategory`],
@@ -358,10 +462,12 @@ pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash>(
 ///
 /// The pooling weight is the tree's combinatorial scan-weight. Within a fixed hand size it is the
 /// exact occurrence probability, but across sizes it is not a coherent distribution (see the
-/// cross-size weighting note); it is the best stand-in available until a game-time
-/// probability-of-hand is implemented, at which point only this weighting need change. A move only
-/// contributes from the hands that actually offer it, so e.g. `Double`/`Surrender` for a hard total
-/// reflect only its two-card members.
+/// cross-size weighting note). The **live chart now pools by the game-time reaching weight instead**
+/// ([`crate::reach::reach_weights`] → [`crate::reach::summarize_with`], wired in `tui::solve_on`);
+/// this combinatorial version is retained as the reference baseline the regression tests pin against
+/// (and is `summarize_with` with the scan-weight). A move only contributes from the hands that
+/// actually offer it, so e.g. `Double`/`Surrender` for a hard total reflect only its two-card members.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn summarize_evs(
     ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
 ) -> HashMap<HandCategory, HashMap<Move, f64>> {
@@ -452,7 +558,7 @@ mod tests {
     /// two-card-root [`EdgeTerm`]; they are averaged by the up-card's draw probability from the full
     /// shoe. Production code (the TUI) accumulates the per-up-card [`edge_term`]s incrementally from
     /// the chart trees it already computes, so this whole-shoe convenience pass exists only here.
-    fn player_edge<S: Shoe + Copy + Eq + Hash>(shoe: S, rules: &Ruleset) -> f64 {
+    fn player_edge<S: Shoe + Copy + Eq + Hash + Sync>(shoe: S, rules: &Ruleset) -> f64 {
         shoe.all_draw_probs()
             .map(|(up, p_up)| {
                 let tree = build_evs(shoe, up, rules);

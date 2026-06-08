@@ -2,6 +2,7 @@ pub(crate) mod card;
 pub(crate) mod dealer;
 pub(crate) mod hand;
 mod legacy;
+pub(crate) mod reach;
 pub(crate) mod rules;
 pub(crate) mod shoe;
 pub(crate) mod simulation;

@@ -3,6 +3,7 @@
 //! [`pair_rank`]/[`categorize`] helpers that route a concrete [`CardCol`] into these. The exact-hand
 //! EV engine lives in [`crate::simulation`]; this is the abstract layer the charts are built over.
 
+use std::collections::HashMap;
 use std::fmt::Display;
 
 use crate::card::Card;
@@ -56,6 +57,17 @@ pub(crate) enum Move {
     Double,
     Split,
     Surrender,
+}
+
+/// The policy's chosen action for a hand: the argmax over its stored move EVs. `build_evs` stores a
+/// move only when it is actually available, so e.g. a three-card hand's map is just `{Hit, Stand}`
+/// and a category always carries at least one move — hence the panic on an empty map.
+pub(crate) fn best_move(move_ev: &HashMap<Move, f64>) -> Move {
+    *move_ev
+        .iter()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .expect("a charted hand/category always offers at least one move")
+        .0
 }
 
 // TODO: similar to Move, we might need an enum for recommended strategy, which encodes DoubleHit

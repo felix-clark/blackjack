@@ -13,6 +13,7 @@
 //! plug in.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -25,10 +26,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::card::Card;
-use crate::hand::{HandCategory, Move};
+use crate::hand::{best_move, HandCategory, Move};
+use crate::reach::{reach_weights, summarize_with};
 use crate::rules::{BjPayout, PeekRule, PeekSurrender, Ruleset};
 use crate::shoe::{CardCol, InfiniteDeck, Shoe};
-use crate::simulation::{EdgeTerm, build_evs, edge_term, summarize_evs};
+use crate::simulation::{EdgeTerm, build_evs, edge_term};
 
 /// Dealer up-cards in chart-column order (2..9, T, A).
 const UP_CARDS: [Card; 10] = [
@@ -43,6 +45,12 @@ const UP_CARDS: [Card; 10] = [
     Card::Ten,
     Card::Ace,
 ];
+
+/// Column solve order: indices into [`UP_CARDS`], longest-running column first. Measured per-column
+/// solve time falls off monotonically from the Ace through the low cards to the Ten (the Ace peeks
+/// and low up-cards make the dealer draw deeper), so `A, 2, 3, …, 9, T` is the longest-processing-time
+/// schedule — it keeps the heavy work off the tail where it would run under-parallelised.
+const SOLVE_ORDER: [usize; 10] = [9, 0, 1, 2, 3, 4, 5, 6, 7, 8];
 
 /// Moves in the fixed order the EV popup lists them.
 const MOVE_ORDER: [Move; 5] = [
@@ -75,23 +83,26 @@ impl ShoeChoice {
     /// summary the chart renders and the two-card-root [`EdgeTerm`] the footer's overall edge sums.
     /// Both are read off the same tree, so the edge costs no extra solve. Runs on a worker thread.
     fn solve(self, up_card: Card, rules: &Ruleset) -> Column {
-        // `p_up` is the up-card's draw probability from the *full* shoe (before `build_evs` removes
-        // it); it weights this column in the overall edge.
-        let (tree, p_up) = match self {
-            ShoeChoice::Infinite => {
-                let shoe = InfiniteDeck {};
-                (build_evs(shoe, up_card, rules), shoe.draw_prob(&up_card))
-            }
-            ShoeChoice::Decks(n) => {
-                let shoe = CardCol::from_decks(n);
-                (build_evs(shoe, up_card, rules), shoe.draw_prob(&up_card))
-            }
-        };
-        Column {
-            summary: summarize_evs(&tree),
-            p_up,
-            edge: edge_term(&tree),
+        match self {
+            ShoeChoice::Infinite => solve_on(InfiniteDeck {}, up_card, rules),
+            ShoeChoice::Decks(n) => solve_on(CardCol::from_decks(n), up_card, rules),
         }
+    }
+}
+
+/// Solve and consolidate one up-card column on a concrete shoe `S`. Cells are pooled by the game-time
+/// **reaching weight** ([`reach_weights`] → [`summarize_with`], split arms folded in): how often each
+/// composition is actually the hand in front of a deciding player. This corrects the combinatorial
+/// scan-weight's cross-size bias (chiefly by zeroing the unreachable compositions); the reaching pass
+/// is cheap next to `build_evs`. `p_up` is the up-card's draw probability from the *full* shoe
+/// (before `build_evs` removes it).
+fn solve_on<S: Shoe + Copy + Eq + Hash + Sync>(shoe: S, up_card: Card, rules: &Ruleset) -> Column {
+    let tree = build_evs(shoe, up_card, rules);
+    let weights = reach_weights(shoe, up_card, rules, &tree, true);
+    Column {
+        summary: summarize_with(&tree, &weights),
+        p_up: shoe.draw_prob(&up_card),
+        edge: edge_term(&tree),
     }
 }
 
@@ -117,6 +128,7 @@ type ColumnSummary = HashMap<HandCategory, HashMap<Move, f64>>;
 /// and its two-card-root edge contribution. Cached whole per `(shoe, ruleset)`.
 #[derive(Clone)]
 struct Column {
+    /// Per-cell move EVs, pooled by the game-time reaching weight (see [`solve_on`]).
     summary: ColumnSummary,
     /// Draw probability of this up-card from the full shoe — its weight in the overall edge.
     p_up: f64,
@@ -258,13 +270,20 @@ impl App {
             return;
         }
         self.columns = std::array::from_fn(|_| None);
-        for (col, &up_card) in UP_CARDS.iter().enumerate() {
+        // Spawn the ten columns concurrently, longest-first (the low up-cards and the Ace are the
+        // slow ones — the dealer draws more, and the Ace peek-conditions). The heavy work *inside*
+        // each column is the pair-split solves, which `build_evs` already fans across cores; running
+        // the columns concurrently lets those splits from every column share the machine, so all
+        // cores stay busy instead of one column's splits being a single-core tail. On a box with
+        // fewer cores than columns the longest-first spawn order is what gets the big columns going
+        // first. Results stream to the chart as each finishes; stale epochs are dropped on arrival.
+        for &col in &SOLVE_ORDER {
             let tx = self.tx.clone();
             let rules = self.rules;
             let shoe = self.shoe;
             let epoch = self.epoch;
             thread::spawn(move || {
-                let column = shoe.solve(up_card, &rules);
+                let column = shoe.solve(UP_CARDS[col], &rules);
                 // Receiver gone (app exiting) is fine — just drop the result.
                 let _ = tx.send(ColumnResult { epoch, col, column });
             });
@@ -729,13 +748,6 @@ fn pane_height(pane: Pane) -> u16 {
     pane.rows().len() as u16 + 3
 }
 
-fn best_move(moves: &HashMap<Move, f64>) -> Move {
-    *moves
-        .iter()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .expect("a charted category always has at least one move")
-        .0
-}
 
 fn move_name(mv: Move) -> &'static str {
     match mv {
