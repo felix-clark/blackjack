@@ -51,7 +51,7 @@ use crate::simulation::Basis;
 /// With `include_split_arms`, the mass that enters a split is *not* dropped: each arm is seeded as a
 /// fresh decision node and folded back into the same forward pass (see [`inject_split_arms`]). Off,
 /// split-entry mass simply leaves the lattice (the cheaper, split-free weighting).
-pub(crate) fn reach_weights<S: Shoe + Copy>(
+pub(crate) fn reach_weights<S: Shoe + Clone>(
     mut shoe: S,
     up_card: Card,
     rules: &Ruleset,
@@ -129,7 +129,7 @@ pub(crate) fn reach_weights<S: Shoe + Copy>(
 /// - *Per-line resplit depth*: the budget is spent along each resplit line rather than as a global
 ///   hand cap, so multi-resplit rounds (probability ~`p_r²`) can slightly overcount arms. Exact for
 ///   `max_split_hands ≤ 3` and for the common single-resplit case.
-fn inject_split_arms<S: Shoe + Copy>(
+fn inject_split_arms<S: Shoe + Clone>(
     shoe_minus_up: &S,
     basis: &Basis,
     rules: &Ruleset,

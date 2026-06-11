@@ -71,7 +71,7 @@ fn arm_stand_ev(total: u8, dealer_probs: &HashMap<DealerOutcome, f64>) -> f64 {
 ///
 /// [`conditional_dealer_dist`]: crate::simulation::conditional_dealer_dist
 /// [`conditional_draw_probs`]: crate::simulation::conditional_draw_probs
-struct SplitSolver<S: Shoe + Copy + Eq + Hash> {
+struct SplitSolver<S: Shoe + Clone + Eq + Hash> {
     /// The shoe each arm starts from (up card and both pair cards already removed): the independent
     /// arms never see one another's depletion, so this is restored at every arm boundary.
     shoe0: S,
@@ -105,7 +105,7 @@ struct SplitSolver<S: Shoe + Copy + Eq + Hash> {
     memo: HashMap<(CardCol, bool, u8, u8, S, u8), f64>,
 }
 
-impl<S: Shoe + Copy + Eq + Hash> SplitSolver<S> {
+impl<S: Shoe + Clone + Eq + Hash> SplitSolver<S> {
     fn new(shoe0: S, basis: Basis, split_card: Card, das: bool, budget: u8) -> Self {
         Self {
             shoe0,
@@ -126,7 +126,7 @@ impl<S: Shoe + Copy + Eq + Hash> SplitSolver<S> {
     /// independent fallback). The budget itself is not spent here — only card *draws* spend it (see
     /// [`SplitSolver::draw`]); an arm boundary draws no card.
     fn advance_arm(&self, shoe: S, budget: u8) -> S {
-        if budget == 0 { self.shoe0 } else { shoe }
+        if budget == 0 { self.shoe0.clone() } else { shoe }
     }
 
     /// Draw card `c`, depleting the shoe (within-arm depletion is always exact) and spending one unit
@@ -144,7 +144,7 @@ impl<S: Shoe + Copy + Eq + Hash> SplitSolver<S> {
             return dist.clone();
         }
         let dist = self.basis.dealer_dist(shoe);
-        self.dealer_cache.insert(*shoe, dist.clone());
+        self.dealer_cache.insert(shoe.clone(), dist.clone());
         dist
     }
 
@@ -154,7 +154,7 @@ impl<S: Shoe + Copy + Eq + Hash> SplitSolver<S> {
             return v.clone();
         }
         let v = self.basis.draw_probs(shoe);
-        self.draw_cache.insert(*shoe, v.clone());
+        self.draw_cache.insert(shoe.clone(), v.clone());
         v
     }
 
@@ -204,7 +204,7 @@ impl<S: Shoe + Copy + Eq + Hash> SplitSolver<S> {
         shoe: S,
         budget: u8,
     ) -> f64 {
-        let key = (current, first, pending, splits, shoe, budget);
+        let key = (current, first, pending, splits, shoe.clone(), budget);
         if let Some(&v) = self.memo.get(&key) {
             return v;
         }
@@ -228,7 +228,7 @@ impl<S: Shoe + Copy + Eq + Hash> SplitSolver<S> {
             return draws
                 .into_iter()
                 .map(|(c, p)| {
-                    let (next_shoe, next_budget) = self.draw(shoe, c, budget);
+                    let (next_shoe, next_budget) = self.draw(shoe.clone(), c, budget);
                     let mut hand = current;
                     hand.insert(c);
                     let val = if self.one_card_only {
@@ -244,14 +244,14 @@ impl<S: Shoe + Copy + Eq + Hash> SplitSolver<S> {
 
         // A playable arm of two or more cards: take the best of stand / hit / double / re-split,
         // each evaluated as the total EV of the current arm plus the siblings that follow.
-        let mut best = self.stand_and_rest(current, pending, splits, shoe, budget);
+        let mut best = self.stand_and_rest(current, pending, splits, shoe.clone(), budget);
 
         // Hitting (never on 21).
         if current.best_count() < 21 {
             let hit: f64 = draws
                 .iter()
                 .map(|&(c, p)| {
-                    let (next_shoe, next_budget) = self.draw(shoe, c, budget);
+                    let (next_shoe, next_budget) = self.draw(shoe.clone(), c, budget);
                     let mut hand = current;
                     hand.insert(c);
                     let v = if hand.hard_count() > 21 {
@@ -272,7 +272,7 @@ impl<S: Shoe + Copy + Eq + Hash> SplitSolver<S> {
             let dbl: f64 = draws
                 .iter()
                 .map(|&(c, p)| {
-                    let (next_shoe, next_budget) = self.draw(shoe, c, budget);
+                    let (next_shoe, next_budget) = self.draw(shoe.clone(), c, budget);
                     let mut hand = current;
                     hand.insert(c);
                     let arm = 2.0 * self.stand_payoff(&hand, &next_shoe);
@@ -289,7 +289,7 @@ impl<S: Shoe + Copy + Eq + Hash> SplitSolver<S> {
         // (`advance_arm`); the cards budget threads on unchanged (the re-split draws no new card).
         if first && splits > 0 && current.get_count(&self.split_card) == 2 {
             let seed = CardCol::from_hand(&[self.split_card]);
-            let next = self.advance_arm(shoe, budget);
+            let next = self.advance_arm(shoe.clone(), budget);
             let resplit = self.value(seed, false, pending + 1, splits - 1, next, budget);
             best = best.max(resplit);
         }
@@ -304,7 +304,7 @@ impl<S: Shoe + Copy + Eq + Hash> SplitSolver<S> {
 /// `shoe_minus_hand`): one current seed plus one pending sibling, with the re-split budget set by
 /// `max_split_hands`. Peek conditioning rides along inside the `Basis`, so this is just the entry
 /// point.
-pub(crate) fn split_move_ev<S: Shoe + Copy + Eq + Hash>(
+pub(crate) fn split_move_ev<S: Shoe + Clone + Eq + Hash>(
     pair_hand: &CardCol,
     shoe_minus_hand: &S,
     basis: Basis,
@@ -317,11 +317,15 @@ pub(crate) fn split_move_ev<S: Shoe + Copy + Eq + Hash>(
     // The cross-arm cards budget threaded by the solver (large = exact; `0` = independent).
     let budget = rules.split_cards;
 
-    let mut solver = SplitSolver::new(*shoe_minus_hand, basis, split_card, rules.das, budget);
+    // The split sub-solve runs on the shoe's `for_split` view: identity for finite/infinite shoes
+    // (exact cross-arm depletion preserved), a frozen-tilt view for the count-conditioned shoe so the
+    // arm recursion doesn't recondition the count on every draw (the order-limit on splits).
+    let split_shoe = shoe_minus_hand.for_split();
+    let mut solver = SplitSolver::new(split_shoe.clone(), basis, split_card, rules.das, budget);
     let seed = CardCol::from_hand(&[split_card]);
     // The root arm starts with the full budget (the solver's stored value).
     let budget = solver.budget;
-    solver.value(seed, false, 1, splits_remaining, *shoe_minus_hand, budget)
+    solver.value(seed, false, 1, splits_remaining, split_shoe, budget)
 }
 
 #[cfg(test)]
@@ -338,6 +342,53 @@ mod tests {
     use crate::hand::{HandCategory, Move};
     use crate::simulation::build_evs;
     use crate::test_support::*;
+
+    /// Measurement (run with `--release --ignored --nocapture`): the EV error introduced by freezing
+    /// the count tilt inside the split solver, versus the exact (per-draw reconditioned) split solve,
+    /// for a few pairs at a mid-shoe count. Justifies the freeze-splits order-limit.
+    #[test]
+    #[ignore]
+    fn freeze_split_error() {
+        use crate::count::{CountCondition, CountShoe, CountSystem, Ko, Penetration};
+        use crate::rules::Ruleset;
+        use crate::simulation::Basis;
+        use std::time::Instant;
+
+        let rules = Ruleset::default();
+        let up = Card::Ten;
+        let basis = Basis::new(up, &rules);
+        let n = 1u8;
+        let t = Ko::full_shoe_count(n) / 2;
+
+        for pr in [Card::Pip(8), Card::Ace, Card::Pip(9)] {
+            let pair = CardCol::from_hand(&[pr, pr]);
+            let base =
+                CountShoe::new::<Ko>(n, CountCondition::Eq(t), Penetration::FlatPastPercent(25));
+            let shoe = base.remove_hand(&CardCol::from_hand(&[up, pr, pr]));
+
+            // Mean-field — current production path (`split_move_ev` calls `for_split`, which on a
+            // count shoe returns the count-tilted expected-composition finite deck).
+            let meanfield = split_move_ev(&pair, &shoe, basis, &rules);
+
+            // Finite, no count tilt — exact depletion on the underlying pool, count ignored.
+            let finite = split_move_ev(&pair, &shoe.pool(), basis, &rules);
+
+            // Exact — same solve but on the un-frozen, per-draw-reconditioned count shoe.
+            let splits_remaining = rules.max_split_hands.saturating_sub(2);
+            let mut solver = SplitSolver::new(shoe.clone(), basis, pr, rules.das, rules.split_cards);
+            let seed = CardCol::from_hand(&[pr]);
+            let budget = solver.budget;
+            let start = Instant::now();
+            let exact = solver.value(seed, false, 1, splits_remaining, shoe.clone(), budget);
+            let dt = start.elapsed();
+
+            eprintln!(
+                "pair {pr:?} vs T: exact {exact:.6} | mean-field {meanfield:.6} (d {:.1e}) | finite-no-tilt {finite:.6} (d {:.1e})  [exact {dt:?}]",
+                (meanfield - exact).abs(),
+                (finite - exact).abs()
+            );
+        }
+    }
 
     /// Pair decisions on the peek-conditional path (ten and ace up). Aces always split; nines stand
     /// against a ten or ace (18 is good enough, splitting into two 9s is worse); 8,8 splits vs a ten.

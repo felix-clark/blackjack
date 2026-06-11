@@ -356,6 +356,20 @@ pub trait Shoe: Clone {
     /// probabilities read from [`Shoe::draw_prob`]).
     fn rank_count(&self, rank: &Card) -> Option<u16>;
 
+    /// The shoe the split solver should start from. Defaults to `self` (exact: the finite shoe keeps
+    /// its without-replacement depletion across arms). A shoe whose per-draw distribution is expensive
+    /// to recondition (the count-conditioned shoe) overrides this to return a cheaper *frozen* variant
+    /// — its draw distribution held fixed at this composition — so the split solve runs at
+    /// infinite-deck speed. This is the "freeze the tilt inside splits" order-limit: the main
+    /// hit/stand/double tree and the dealer stay exactly reconditioned, only the split sub-solve (a
+    /// minor, infrequent EV contributor) is frozen.
+    fn for_split(&self) -> Self
+    where
+        Self: Sized,
+    {
+        self.clone()
+    }
+
     /// Lazily enumerate every multiset of cards drawn from this shoe whose hard total (aces low)
     /// equals `hard_total`, each paired with its scan-weight (see [`WeightedPartitions`]). Returns a
     /// [`WeightedPartitions`] [`Iterator`] of `(weight, hand)` pairs.

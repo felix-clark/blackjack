@@ -202,7 +202,7 @@ impl Basis {
 /// it is exact; across sizes the scan-weight is not a coherent distribution (a known deferred
 /// imprecision), so it is only a relative pooling weight in [`summarize_evs`].
 // TODO: Should this be a struct so it can recursively build the table by demand?
-pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash + Sync>(
+pub(crate) fn build_evs<S: Shoe + Clone + Eq + Hash + Sync>(
     mut shoe: S,
     up_card: Card,
     rules: &Ruleset,
@@ -264,7 +264,7 @@ pub(crate) fn build_evs<S: Shoe + Copy + Eq + Hash + Sync>(
 /// arm recursion and reads nothing from the main DP tree), so they fan out cleanly across cores via
 /// [`par_map`]; the [`build_evs`] DP then just looks each pair up. Returns `{pair → split EV}`, empty
 /// when splitting is disabled. A pair is included iff the shoe actually holds two of that rank.
-fn pair_split_evs<S: Shoe + Copy + Eq + Hash + Sync>(
+fn pair_split_evs<S: Shoe + Clone + Eq + Hash + Sync>(
     shoe: &S,
     basis: Basis,
     rules: &Ruleset,
@@ -294,7 +294,7 @@ fn pair_split_evs<S: Shoe + Copy + Eq + Hash + Sync>(
 /// hand and its `(pooling weight, move→EV)` entry, ready to insert. Factored out of [`build_evs`]'s
 /// level loop verbatim — see there for the running commentary on each branch.
 #[allow(clippy::too_many_arguments)]
-fn solve_hand<S: Shoe + Copy + Eq + Hash>(
+fn solve_hand<S: Shoe + Clone + Eq + Hash>(
     weight: f64,
     pl_hand: CardCol,
     shoe: &S,
@@ -565,10 +565,12 @@ mod tests {
     /// two-card-root [`EdgeTerm`]; they are averaged by the up-card's draw probability from the full
     /// shoe. Production code (the TUI) accumulates the per-up-card [`edge_term`]s incrementally from
     /// the chart trees it already computes, so this whole-shoe convenience pass exists only here.
-    fn player_edge<S: Shoe + Copy + Eq + Hash + Sync>(shoe: S, rules: &Ruleset) -> f64 {
+    fn player_edge<S: Shoe + Clone + Eq + Hash + Sync>(shoe: S, rules: &Ruleset) -> f64 {
         shoe.all_draw_probs()
+            .collect::<Vec<_>>()
+            .into_iter()
             .map(|(up, p_up)| {
-                let tree = build_evs(shoe, up, rules);
+                let tree = build_evs(shoe.clone(), up, rules);
                 p_up * edge_term(&tree).value()
             })
             .sum()

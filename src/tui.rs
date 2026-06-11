@@ -8,9 +8,10 @@
 //! the interface never blocks. A monotonic `epoch` tags every batch; results from a superseded epoch
 //! (a rules/deck change happened) are discarded rather than interrupting the worker.
 //!
-//! Counting is not modelled by the solver yet, so there is no count input here — the [`ShoeChoice`]
-//! seam (finite shoe vs infinite deck) is where a count-adjusted draw distribution would eventually
-//! plug in.
+//! A card-counting condition (the `c` modal) conditions the solve on a running count: on a finite
+//! shoe it swaps the plain [`CardCol`] for a [`CountShoe`] (exact count-conditioned main tree and
+//! dealer; mean-field tilt inside splits). The condition is part of the chart cache key, so toggling
+//! counts on/off or changing the running count re-solves (or restores from cache) like a rules change.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -26,11 +27,37 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::card::Card;
+use crate::count::{CountCmp, CountShoe, Ko, Penetration};
 use crate::hand::{HandCategory, Move};
 use crate::reach::{CellInfo, reach_weights, summarize_cells};
 use crate::rules::{BjPayout, PeekRule, PeekSurrender, Ruleset};
 use crate::shoe::{CardCol, InfiniteDeck, Shoe};
 use crate::simulation::{EdgeTerm, build_evs, edge_term};
+
+/// Penetration prior used for count conditioning: a flat distribution over deck depth up to 75%
+/// penetration (casinos never deal the shoe out). See the count-conditioning architecture notes.
+const COUNT_PENETRATION: Penetration = Penetration::FlatPastPercent(25);
+
+/// A card-counting condition the chart is solved under: a counting system (KO for now), the player's
+/// external running count, and how it is compared. `None` of this is applied on the infinite deck (an
+/// infinite deck has no count) or when counting is toggled off.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct CountSetting {
+    /// The player's external running count value being conditioned on.
+    external: i16,
+    /// How the running count is compared to `external` (`==`, `≥`, `≤`).
+    cmp: CountCmp,
+}
+
+impl CountSetting {
+    fn cmp_label(self) -> &'static str {
+        match self.cmp {
+            CountCmp::Eq => "==",
+            CountCmp::Ge => ">=",
+            CountCmp::Le => "<=",
+        }
+    }
+}
 
 /// Dealer up-cards in chart-column order (2..9, T, A).
 const UP_CARDS: [Card; 10] = [
@@ -82,10 +109,19 @@ impl ShoeChoice {
     /// Solve one up-card's full EV tree on this shoe, collapsing it to the per-category strategy
     /// summary the chart renders and the two-card-root [`EdgeTerm`] the footer's overall edge sums.
     /// Both are read off the same tree, so the edge costs no extra solve. Runs on a worker thread.
-    fn solve(self, up_card: Card, rules: &Ruleset) -> Column {
+    /// `count` conditions the solve on a card-counting running count; it only applies to a finite shoe
+    /// (an infinite deck has no count) and is ignored when `None`.
+    fn solve(self, up_card: Card, rules: &Ruleset, count: Option<CountSetting>) -> Column {
         match self {
             ShoeChoice::Infinite => solve_on(InfiniteDeck {}, up_card, rules),
-            ShoeChoice::Decks(n) => solve_on(CardCol::from_decks(n), up_card, rules),
+            ShoeChoice::Decks(n) => match count {
+                Some(c) => solve_on(
+                    CountShoe::from_external::<Ko>(n, c.external, c.cmp, COUNT_PENETRATION),
+                    up_card,
+                    rules,
+                ),
+                None => solve_on(CardCol::from_decks(n), up_card, rules),
+            },
         }
     }
 }
@@ -97,9 +133,9 @@ impl ShoeChoice {
 /// Hit/Stand EVs of hands that can take it), and carries its composition-dependence flag and
 /// per-composition breakdown. `p_up` is the up-card's draw probability from the *full* shoe (before
 /// `build_evs` removes it).
-fn solve_on<S: Shoe + Copy + Eq + Hash + Sync>(shoe: S, up_card: Card, rules: &Ruleset) -> Column {
-    let tree = build_evs(shoe, up_card, rules);
-    let weights = reach_weights(shoe, up_card, rules, &tree, true);
+fn solve_on<S: Shoe + Clone + Eq + Hash + Sync>(shoe: S, up_card: Card, rules: &Ruleset) -> Column {
+    let tree = build_evs(shoe.clone(), up_card, rules);
+    let weights = reach_weights(shoe.clone(), up_card, rules, &tree, true);
     Column {
         summary: summarize_cells(&tree, &weights),
         p_up: shoe.draw_prob(&up_card),
@@ -204,7 +240,11 @@ enum Mode {
     Normal,
     Popup,
     Rules,
+    Count,
 }
+
+/// Number of fields in the count modal (enabled, comparison, value).
+const COUNT_FIELDS: usize = 3;
 
 /// The highlighted cell: which pane, which row within it, which up-card column.
 struct Cursor {
@@ -213,18 +253,25 @@ struct Cursor {
     col: usize,
 }
 
+/// The full key a chart batch is solved and cached under: shoe, ruleset, and the effective count
+/// condition (`None` on the infinite deck or when counting is off).
+type ChartKey = (ShoeChoice, Ruleset, Option<CountSetting>);
+
 struct App {
     rules: Ruleset,
     shoe: ShoeChoice,
+    /// Whether a count condition is imposed, and its value/comparison. Only applied on a finite shoe.
+    count_on: bool,
+    count: CountSetting,
     /// Bumped on every recompute; stamped onto worker results so stale ones can be dropped.
     epoch: u64,
-    /// The `(shoe, rules)` the current epoch is being solved for. Captured at recompute time (not read
-    /// from `self` later) so a completed batch is cached under the rules it was actually computed with,
-    /// even if the rules modal has since edited `self.rules` without re-solving.
-    epoch_key: (ShoeChoice, Ruleset),
-    /// Finished chart batches, keyed by `(shoe, rules)`, so flipping back to a prior ruleset is instant
+    /// The [`ChartKey`] the current epoch is being solved for. Captured at recompute time (not read
+    /// from `self` later) so a completed batch is cached under the inputs it was actually computed with,
+    /// even if a modal has since edited `self` without re-solving.
+    epoch_key: ChartKey,
+    /// Finished chart batches, keyed by [`ChartKey`], so flipping back to a prior setting is instant
     /// instead of a re-solve. Populated once all ten columns of an epoch arrive.
-    cache: HashMap<(ShoeChoice, Ruleset), [Column; 10]>,
+    cache: HashMap<ChartKey, [Column; 10]>,
     /// Per up-card column, `None` until that worker finishes (or filled at once from the cache).
     columns: [Option<Column>; 10],
     cursor: Cursor,
@@ -233,6 +280,10 @@ struct App {
     rules_sel: usize,
     /// `(rules, shoe)` captured when the rules modal opened, to detect a change on close.
     rules_snapshot: (Ruleset, ShoeChoice),
+    /// Selected field in the count modal.
+    count_sel: usize,
+    /// `(count_on, count)` captured when the count modal opened, to detect a change on close.
+    count_snapshot: (bool, CountSetting),
     tx: Sender<ColumnResult>,
     rx: Receiver<ColumnResult>,
 }
@@ -240,11 +291,17 @@ struct App {
 impl App {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel();
+        let count = CountSetting {
+            external: 0,
+            cmp: CountCmp::Eq,
+        };
         Self {
             rules: Ruleset::default(),
             shoe: ShoeChoice::Infinite,
+            count_on: false,
+            count,
             epoch: 0,
-            epoch_key: (ShoeChoice::Infinite, Ruleset::default()),
+            epoch_key: (ShoeChoice::Infinite, Ruleset::default(), None),
             cache: HashMap::new(),
             columns: std::array::from_fn(|_| None),
             cursor: Cursor {
@@ -255,8 +312,19 @@ impl App {
             mode: Mode::Normal,
             rules_sel: 0,
             rules_snapshot: (Ruleset::default(), ShoeChoice::Infinite),
+            count_sel: 0,
+            count_snapshot: (false, count),
             tx,
             rx,
+        }
+    }
+
+    /// The count condition actually applied to the solve: `None` on the infinite deck (no count
+    /// exists) or when counting is toggled off, else the current [`CountSetting`].
+    fn effective_count(&self) -> Option<CountSetting> {
+        match self.shoe {
+            ShoeChoice::Decks(_) if self.count_on => Some(self.count),
+            _ => None,
         }
     }
 
@@ -265,7 +333,7 @@ impl App {
     /// blanked. Old in-flight workers keep running but their results are discarded by epoch on arrival.
     fn recompute(&mut self) {
         self.epoch += 1;
-        self.epoch_key = (self.shoe, self.rules);
+        self.epoch_key = (self.shoe, self.rules, self.effective_count());
         // Cache hit: restore all ten columns at once, no workers (so nothing arrives for this epoch).
         if let Some(cached) = self.cache.get(&self.epoch_key) {
             self.columns = std::array::from_fn(|i| Some(cached[i].clone()));
@@ -279,13 +347,14 @@ impl App {
         // cores stay busy instead of one column's splits being a single-core tail. On a box with
         // fewer cores than columns the longest-first spawn order is what gets the big columns going
         // first. Results stream to the chart as each finishes; stale epochs are dropped on arrival.
+        let count = self.effective_count();
         for &col in &SOLVE_ORDER {
             let tx = self.tx.clone();
             let rules = self.rules;
             let shoe = self.shoe;
             let epoch = self.epoch;
             thread::spawn(move || {
-                let column = shoe.solve(UP_CARDS[col], &rules);
+                let column = shoe.solve(UP_CARDS[col], &rules, count);
                 // Receiver gone (app exiting) is fine — just drop the result.
                 let _ = tx.send(ColumnResult { epoch, col, column });
             });
@@ -351,6 +420,7 @@ impl App {
             Mode::Normal => return self.handle_normal(code),
             Mode::Popup => self.handle_popup(code),
             Mode::Rules => self.handle_rules(code),
+            Mode::Count => self.handle_count(code),
         }
         false
     }
@@ -363,6 +433,11 @@ impl App {
                 self.rules_snapshot = (self.rules, self.shoe);
                 self.rules_sel = 0;
                 self.mode = Mode::Rules;
+            }
+            KeyCode::Char('c') => {
+                self.count_snapshot = (self.count_on, self.count);
+                self.count_sel = 0;
+                self.mode = Mode::Count;
             }
             _ => self.move_cursor(code),
         }
@@ -492,6 +567,41 @@ impl App {
         }
     }
 
+    fn handle_count(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char('q') => {
+                if (self.count_on, self.count) != self.count_snapshot {
+                    self.recompute();
+                }
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.count_sel = (self.count_sel + 1) % COUNT_FIELDS;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.count_sel = (self.count_sel + COUNT_FIELDS - 1) % COUNT_FIELDS;
+            }
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Char(' ') => self.edit_count(1),
+            KeyCode::Char('h') | KeyCode::Left => self.edit_count(-1),
+            _ => {}
+        }
+    }
+
+    /// Change the selected count-modal field by `delta`: toggle enabled, cycle the comparison, or
+    /// step the running-count value.
+    fn edit_count(&mut self, delta: i32) {
+        match self.count_sel {
+            0 => self.count_on = !self.count_on,
+            1 => {
+                let order = [CountCmp::Le, CountCmp::Eq, CountCmp::Ge];
+                let i = order.iter().position(|&c| c == self.count.cmp).unwrap_or(1) as i32;
+                self.count.cmp = order[(i + delta).rem_euclid(order.len() as i32) as usize];
+            }
+            2 => self.count.external = (self.count.external as i32 + delta).clamp(-60, 60) as i16,
+            _ => {}
+        }
+    }
+
     // --- rendering ---------------------------------------------------------------------------
 
     fn render(&self, f: &mut Frame) {
@@ -533,6 +643,7 @@ impl App {
         match self.mode {
             Mode::Popup => self.render_popup(f),
             Mode::Rules => self.render_rules(f),
+            Mode::Count => self.render_count(f),
             Mode::Normal => {}
         }
     }
@@ -631,8 +742,14 @@ impl App {
             None => format!("{cat} vs {up} \u{2192} \u{2026}"),
         };
 
+        // Count status: only meaningful on a finite shoe; shown as e.g. "KO RC>=+4" or "off".
+        let count = match self.effective_count() {
+            Some(c) => format!("KO RC{}{:+}", c.cmp_label(), c.external),
+            None if self.count_on => "n/a(\u{221e})".to_string(),
+            None => "off".to_string(),
+        };
         let status = format!(
-            "decks {} | {} | DAS {} | peek {} | BJ {bj} | surr {surr} | split\u{2264}{} | edge {edge}{computing}",
+            "decks {} | {} | DAS {} | peek {} | BJ {bj} | surr {surr} | split\u{2264}{} | count {count} | edge {edge}{computing}",
             self.shoe,
             if r.hs17 { "H17" } else { "S17" },
             yn(r.das),
@@ -640,7 +757,7 @@ impl App {
             r.max_split_hands,
         );
         let keys =
-            "hjkl move \u{00b7} Tab pane \u{00b7} Enter EVs \u{00b7} r rules \u{00b7} q quit";
+            "hjkl move \u{00b7} Enter EVs \u{00b7} r rules \u{00b7} c count \u{00b7} q quit";
 
         let lines = vec![
             Line::from(vec![Span::styled(status, Style::default().fg(Color::Cyan))]),
@@ -767,6 +884,53 @@ impl App {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
             .title(" Ruleset ");
+        f.render_widget(Clear, area);
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_count(&self, f: &mut Frame) {
+        let infinite = matches!(self.shoe, ShoeChoice::Infinite);
+        let fields = [
+            format!("Counting      {}", yn(self.count_on)),
+            "System        KO".to_string(),
+            format!(
+                "Condition     RC {} {}",
+                self.count.cmp_label(),
+                self.count.external
+            ),
+        ];
+        // Field 1 (system) is fixed at KO for now, so selection skips it; show it dimmed.
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, field) in fields.iter().enumerate() {
+            let mut style = if i == self.count_sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            if i == 1 {
+                style = style.fg(Color::DarkGray);
+            }
+            lines.push(Line::from(Span::styled(format!("  {field}  "), style)));
+        }
+        lines.push(Line::from(""));
+        if infinite {
+            lines.push(Line::from(Span::styled(
+                "  (count applies to a finite shoe only)",
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "  jk select \u{00b7} hl change \u{00b7} Esc apply",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let width = 40u16;
+        let height = lines.len() as u16 + 2;
+        let area = centered_rect(width, height, f.area());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Card counting ");
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(lines).block(block), area);
     }
