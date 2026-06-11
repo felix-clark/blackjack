@@ -1,4 +1,5 @@
 pub(crate) mod card;
+pub(crate) mod count;
 pub(crate) mod dealer;
 pub(crate) mod hand;
 mod legacy;
