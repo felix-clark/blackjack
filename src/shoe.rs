@@ -38,6 +38,13 @@ impl CardCol {
         self.counts[card.rank_index()]
     }
 
+    /// Get the count using the index i, rather than the Card. This is used in some other
+    /// algorithms, like the count conditioning, that also utilize the array representation for data
+    /// over card ranks.
+    pub fn get_count_i(&self, i: usize) -> u16 {
+        self.counts[i]
+    }
+
     /// Add one card of the given rank.
     pub fn insert(&mut self, card: Card) {
         self.counts[card.rank_index()] += 1;

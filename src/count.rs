@@ -19,10 +19,9 @@ use crate::{
 // NOTE: If this ends up not needing to be anything more than a mapping, we can ditch the trait
 // formalism and just pass in an arbitrary function Card -> i8 to CountState.
 pub(crate) trait CountSystem {
-    // fn for_decks(n: u8) -> Self;
-
-    /// The initial running rount. Zero for balanced counts, so the default is implemented.
-    fn starting_count(n_decks: u8) -> i16 {
+    /// The initial running count the *player* starts from (the system's IRC). Zero for balanced
+    /// counts, so the default is implemented. Unbalanced systems (e.g. KO) offset by deck count.
+    fn starting_count(_n_decks: u8) -> i16 {
         0
     }
 
@@ -32,6 +31,39 @@ pub(crate) trait CountSystem {
     /// NOTE: We could also implement this as an array of i8s, of length 10, corresponding to the
     /// internal CardCol array. This would probably optimize.
     fn map(card: &Card) -> i16;
+
+    /// Total count value of a full `n`-deck shoe, `F = Σ_r v_r · f_r`. Zero for balanced systems
+    /// (every `+v` rank is matched by a `−v` rank); `+4n` for KO.
+    fn full_shoe_count(n_decks: u8) -> i16 {
+        CardCol::from_decks(n_decks)
+            .iter()
+            .map(|(card, quant)| Self::map(&card) * quant as i16)
+            .sum()
+    }
+
+    /// The system's **pivot constant** `P = starting_count(n) + full_shoe_count(n)`. This is the
+    /// one number the internal⇄external conversion turns on: `external = P − internal`. (KO: `4`;
+    /// any balanced system: `0`.)
+    fn pivot(n_decks: u8) -> i16 {
+        Self::starting_count(n_decks) + Self::full_shoe_count(n_decks)
+    }
+
+    /// Convert the deck's *internal* running count (count value of the cards still in the shoe) to
+    /// the *external* running count the player tallies. Inverse of [`external_to_internal`].
+    ///
+    /// [`external_to_internal`]: CountSystem::external_to_internal
+    fn internal_to_external(n_decks: u8, internal: i16) -> i16 {
+        Self::pivot(n_decks) - internal
+    }
+
+    /// Convert the player's *external* running count to the deck's *internal* count. Inverse of
+    /// [`internal_to_external`]. This is the bridge the solver needs: the DP conditions on the
+    /// internal count, while the player only ever knows the external one.
+    ///
+    /// [`internal_to_external`]: CountSystem::internal_to_external
+    fn external_to_internal(n_decks: u8, external: i16) -> i16 {
+        Self::pivot(n_decks) - external
+    }
 }
 
 /// The unbalanced knock-out system
@@ -69,6 +101,14 @@ pub(crate) struct CountState {
     /// array (`rank_index`). This *is* the whole system; the class grouping, pool sizes, and total
     /// counts are all derived from it together with `deck` via [`count_classes`](Self::count_classes).
     value_of_rank: [i16; N_RANKS],
+    /// Number of decks in the *full* shoe this state was configured for. Note this is not
+    /// recoverable from `deck`, which may be a depleted pool — it is fixed at construction and is
+    /// what the external⇄internal conversion is calibrated to.
+    n_decks: u8,
+    /// The system's pivot constant `P` for `n_decks` (see [`CountSystem::pivot`]). Captured here so
+    /// the conversion does not have to re-derive the IRC, which the bare `value_of_rank` mapping
+    /// discards.
+    pivot: i16,
 }
 
 impl CountState {
@@ -77,18 +117,34 @@ impl CountState {
         CountClasses::from_value_map(self.value_of_rank, &self.deck)
     }
 
-    fn from_deck(deck: CardCol, count_fn: fn(&Card) -> i16) -> Self {
+    /// Configure a state for a `deck` (which may be a depleted pool) drawn from an `n_decks` shoe.
+    /// Generic over the whole `CountSystem`, not just its mapping, so the IRC-derived `pivot` is
+    /// captured here rather than silently dropped.
+    fn from_pool<S: CountSystem>(deck: CardCol, n_decks: u8) -> Self {
         // The system is deck-independent, so materialize it for every rank (not just ranks present
         // in `deck`): a rank that is momentarily absent still has a well-defined count value.
-        let value_of_rank = std::array::from_fn(|r| count_fn(&Card::from_rank_index(r)));
+        let value_of_rank = std::array::from_fn(|r| S::map(&Card::from_rank_index(r)));
         Self {
             deck,
             value_of_rank,
+            n_decks,
+            pivot: S::pivot(n_decks),
         }
     }
 
-    pub fn from_decks(n: u8, count_fn: fn(&Card) -> i16) -> Self {
-        Self::from_deck(CardCol::from_decks(n), count_fn)
+    pub fn from_decks<S: CountSystem>(n: u8) -> Self {
+        Self::from_pool::<S>(CardCol::from_decks(n), n)
+    }
+
+    /// Convert this state's internal running count to the player's external count, and back. These
+    /// are the instance-level conveniences: the shoe size and pivot are already baked in, so the
+    /// caller never re-passes `n_decks` (the affine identity itself lives on [`CountSystem`]).
+    pub(crate) fn internal_to_external(&self, internal: i16) -> i16 {
+        self.pivot - internal
+    }
+
+    pub(crate) fn external_to_internal(&self, external: i16) -> i16 {
+        self.pivot - external
     }
 
     /// All draw probabilities given a running count (eventually an arbitrary function over (k_j)).
@@ -117,7 +173,7 @@ impl CountState {
                 // `knums` is indexed by class (same order as `classes.values`/`sizes`), so the class
                 // index is the only mapping needed — no value→index lookup.
                 let j = classes.class_of_rank[r];
-                let m_r = self.deck.get_count(&Card::from_rank_index(r)) as f64;
+                let m_r = self.deck.get_count_i(r) as f64;
                 let m_j = classes.sizes[j] as f64;
                 let k_j = knums[j] as f64;
                 // Weight P(rank r | config) by the (unnormalized) probability of the config itself.
@@ -183,7 +239,7 @@ impl CountState {
                     if m_j == 0 {
                         continue;
                     }
-                    let m_r = self.deck.get_count(&Card::from_rank_index(r)) as f64;
+                    let m_r = self.deck.get_count_i(r) as f64;
                     let t_j = dp.data[base + 1 + j]; // T_j[s][n] = Σ_configs k_j · ∏ C
                     acc[r] += cell_w * (t_j / n as f64) * (m_r / m_j as f64);
                 }
@@ -299,7 +355,7 @@ impl CountClasses {
 
         let mut sizes = vec![0u16; distinct.len()];
         for r in 0..N_RANKS {
-            sizes[class_of_rank[r]] += deck.get_count(&Card::from_rank_index(r));
+            sizes[class_of_rank[r]] += deck.get_count_i(r);
         }
 
         Self {
@@ -428,25 +484,64 @@ fn choose(n: u16, k: u16) -> f64 {
 mod tests {
     use super::*;
 
+    /// KO's pivot is `+4` regardless of deck count, so `external = 4 − internal`. A full,
+    /// undealt shoe sits at internal `+4n` (its `full_shoe_count`) and external `starting_count`.
     #[test]
-    fn ko_placeholder() {
-        let state_deck = CountState::from_decks(2, Ko::map);
-        // NOTE: These are not the player's count; they are intenal counts for the deck. To finish,
-        // we'll need conversion functions, and in the simulation we'll also need to account for
-        // up-cards.
-        let draw_probs_0: Vec<(Card, f64)> = state_deck.all_draw_probs_given_c(0).collect();
-        let draw_probs_m4: Vec<(Card, f64)> = state_deck.all_draw_probs_given_c(-4).collect();
-        let draw_probs_4: Vec<(Card, f64)> = state_deck.all_draw_probs_given_c(4).collect();
-        dbg!(draw_probs_0);
-        dbg!(draw_probs_m4);
-        dbg!(draw_probs_4);
-        todo!()
+    fn ko_pivot_and_conversion() {
+        for n in [1u8, 2, 6, 8] {
+            assert_eq!(Ko::full_shoe_count(n), 4 * n as i16);
+            assert_eq!(Ko::starting_count(n), 4 - 4 * n as i16);
+            assert_eq!(Ko::pivot(n), 4, "KO pivot is +4 for every shoe size");
+
+            // The undealt shoe: internal count = full_shoe_count, external = IRC.
+            let internal_full = Ko::full_shoe_count(n);
+            assert_eq!(
+                Ko::internal_to_external(n, internal_full),
+                Ko::starting_count(n)
+            );
+
+            // Round-trip across a sweep of running counts, both static and instance APIs.
+            let state = CountState::from_decks::<Ko>(n);
+            assert_eq!(
+                state.running_count(),
+                internal_full,
+                "fresh shoe internal count"
+            );
+            for internal in -20i16..=20 {
+                let external = Ko::internal_to_external(n, internal);
+                assert_eq!(external, 4 - internal);
+                assert_eq!(Ko::external_to_internal(n, external), internal);
+                assert_eq!(state.internal_to_external(internal), external);
+                assert_eq!(state.external_to_internal(external), internal);
+            }
+        }
+    }
+
+    /// Balanced systems pivot at zero: `external = −internal`, independent of deck count.
+    #[test]
+    fn balanced_system_pivots_at_zero() {
+        struct HiLo;
+        impl CountSystem for HiLo {
+            fn map(card: &Card) -> i16 {
+                match card {
+                    Card::Ace | Card::Ten => -1,
+                    Card::Pip(r) if *r <= 6 => 1,
+                    Card::Pip(_) => 0, // 7, 8, 9
+                }
+            }
+        }
+        for n in [1u8, 6, 8] {
+            assert_eq!(HiLo::full_shoe_count(n), 0);
+            assert_eq!(HiLo::pivot(n), 0);
+            assert_eq!(HiLo::internal_to_external(n, 7), -7);
+            assert_eq!(HiLo::external_to_internal(n, -7), 7);
+        }
     }
 
     /// The DP draw distribution must match the eager enumeration reference bit-for-bit (up to FP).
     #[test]
     fn dp_matches_enumeration() {
-        let state = CountState::from_decks(1, Ko::map);
+        let state = CountState::from_decks::<Ko>(1);
         for c in [-2i16, 0, 2, 4] {
             let oracle: Vec<f64> = state.all_draw_probs_given_c(c).map(|(_, p)| p).collect();
             let dp = state.draw_probs_given_count(c);
