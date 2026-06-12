@@ -12,6 +12,9 @@
 //! shoe it swaps the plain [`CardCol`] for a [`CountShoe`] (exact count-conditioned main tree and
 //! dealer; mean-field tilt inside splits). The condition is part of the chart cache key, so toggling
 //! counts on/off or changing the running count re-solves (or restores from cache) like a rules change.
+//! Under a count, the EV popup also shows **count-index thresholds** — the running counts at which the
+//! recommended move flips — by sweeping a band of counts around the current one ([`solve_count_band`],
+//! sharing one deconvolution across the band) on a background thread while the popup is open.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -141,6 +144,77 @@ fn solve_on<S: Shoe + Clone + Eq + Hash + Sync>(shoe: S, up_card: Card, rules: &
         p_up: shoe.draw_prob(&up_card),
         edge: edge_term(&tree),
     }
+}
+
+/// How far either side of the player's current running count the count-index sweep reaches. The whole
+/// `2·RADIUS+1`-wide band is solved together, sharing one deconvolution across the layers (see
+/// [`CountShoe::band`]), so widening it costs only the cheap per-layer arithmetic — but each extra
+/// layer still re-runs the (mean-field) splits, so it is kept modest. Thresholds beyond the window are
+/// reported as open-ended.
+const INDEX_RADIUS: i16 = 6;
+
+/// One up-card's optimal move per chart category across a swept band of external running counts — the
+/// raw material for the popup's count-index thresholds. `externals` is ascending; `headline[i]` is the
+/// column's per-category recommended move at running count `externals[i]`. Solved under exact-count
+/// (`==`) conditioning, the natural "what should I do when the count is exactly this" basis for an
+/// index, independent of the chart's own count comparison.
+#[derive(Clone)]
+struct CountBand {
+    externals: Vec<i16>,
+    headline: Vec<HashMap<HandCategory, Move>>,
+}
+
+/// What a solved [`CountBand`] is cached/keyed under: the up-card, shoe, ruleset, and the band's
+/// center (the player's current external count). Indices are exact-count based, so the chart's count
+/// *comparison* is deliberately not part of the key.
+type IndexKey = (Card, ShoeChoice, Ruleset, i16);
+
+/// A finished count-index band, tagged with the key it was computed for so a stale one is ignored.
+struct IndexResult {
+    key: IndexKey,
+    band: CountBand,
+}
+
+/// Solve one up-card's column across the external-count window `center ± INDEX_RADIUS`, sharing the
+/// deconvolution across the whole band ([`CountShoe::band`]): the first layer warms the shared
+/// draw-distribution cache, the rest read it. Returns each layer's per-category headline move.
+fn solve_count_band(n: u8, center: i16, up_card: Card, rules: &Ruleset) -> CountBand {
+    let mut externals: Vec<i16> = ((center - INDEX_RADIUS)..=(center + INDEX_RADIUS))
+        .map(|e| e.clamp(-60, 60))
+        .collect();
+    externals.dedup(); // clamping at the ±60 edges can collide; the range is ascending so dups adjoin.
+    let shoes = CountShoe::band::<Ko>(n, &externals, CountCmp::Eq, COUNT_PENETRATION);
+    let headline = shoes
+        .iter()
+        .map(|shoe| {
+            solve_on(shoe.clone(), up_card, rules)
+                .summary
+                .iter()
+                .map(|(&cat, ci)| (cat, ci.headline))
+                .collect()
+        })
+        .collect();
+    CountBand {
+        externals,
+        headline,
+    }
+}
+
+/// The count-index runs for `cat` read off a solved band: consecutive `(move, lo, hi)` inclusive
+/// running-count ranges over which that move is optimal, in ascending count order. A single run means
+/// the move never changes across the window (no index to show); multiple runs are the flip points.
+fn category_indices(band: &CountBand, cat: HandCategory) -> Vec<(Move, i16, i16)> {
+    let mut runs: Vec<(Move, i16, i16)> = Vec::new();
+    for (i, &ext) in band.externals.iter().enumerate() {
+        let Some(&mv) = band.headline[i].get(&cat) else {
+            continue;
+        };
+        match runs.last_mut() {
+            Some((m, _lo, hi)) if *m == mv => *hi = ext,
+            _ => runs.push((mv, ext, ext)),
+        }
+    }
+    runs
 }
 
 /// Deck options the rules modal cycles through.
@@ -286,11 +360,19 @@ struct App {
     count_snapshot: (bool, CountSetting),
     tx: Sender<ColumnResult>,
     rx: Receiver<ColumnResult>,
+    /// Solved count-index bands, keyed by [`IndexKey`], so revisiting a popup cell is instant.
+    index_cache: HashMap<IndexKey, CountBand>,
+    /// The band currently being solved in the background (one at a time), so a popup that is open over
+    /// a count-conditioned cell doesn't respawn the same sweep every tick.
+    index_pending: Option<IndexKey>,
+    index_tx: Sender<IndexResult>,
+    index_rx: Receiver<IndexResult>,
 }
 
 impl App {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel();
+        let (index_tx, index_rx) = mpsc::channel();
         let count = CountSetting {
             external: 0,
             cmp: CountCmp::Eq,
@@ -316,6 +398,10 @@ impl App {
             count_snapshot: (false, count),
             tx,
             rx,
+            index_cache: HashMap::new(),
+            index_pending: None,
+            index_tx,
+            index_rx,
         }
     }
 
@@ -334,6 +420,9 @@ impl App {
     fn recompute(&mut self) {
         self.epoch += 1;
         self.epoch_key = (self.shoe, self.rules, self.effective_count());
+        // Count-index bands are keyed by the old shoe/rules, so they are stale now. A band still in
+        // flight will land and be cached under its (now irrelevant) key and simply never be read.
+        self.index_cache.clear();
         // Cache hit: restore all ten columns at once, no workers (so nothing arrives for this epoch).
         if let Some(cached) = self.cache.get(&self.epoch_key) {
             self.columns = std::array::from_fn(|i| Some(cached[i].clone()));
@@ -374,6 +463,54 @@ impl App {
             let batch = std::array::from_fn(|i| self.columns[i].clone().unwrap());
             self.cache.insert(self.epoch_key, batch);
         }
+    }
+
+    /// The [`IndexKey`] for the popup's current selection, or `None` when count indices don't apply
+    /// (counting off, or an infinite deck, which has no count). The band centers on the player's
+    /// current external count.
+    fn index_key(&self) -> Option<IndexKey> {
+        match self.shoe {
+            ShoeChoice::Decks(_) if self.count_on => {
+                let (_, up) = self.selection();
+                Some((up, self.shoe, self.rules, self.count.external))
+            }
+            _ => None,
+        }
+    }
+
+    /// While a popup is open over a count-conditioned cell, ensure its column's count-index band is
+    /// solving (or already solved). One sweep runs at a time in the background; the popup renders
+    /// "computing…" until it lands. A no-op when indices don't apply or the band is already cached/in
+    /// flight for this exact selection.
+    fn ensure_index(&mut self) {
+        let Some(key) = self.index_key() else { return };
+        if self.index_cache.contains_key(&key) || self.index_pending.as_ref() == Some(&key) {
+            return;
+        }
+        let ShoeChoice::Decks(n) = key.1 else { return };
+        self.index_pending = Some(key);
+        let tx = self.index_tx.clone();
+        let (up, _, rules, center) = key;
+        thread::spawn(move || {
+            let band = solve_count_band(n, center, up, &rules);
+            let _ = tx.send(IndexResult { key, band });
+        });
+    }
+
+    /// Drain any finished count-index bands into the cache, clearing the in-flight marker when the one
+    /// being awaited arrives.
+    fn drain_index_results(&mut self) {
+        while let Ok(res) = self.index_rx.try_recv() {
+            if self.index_pending.as_ref() == Some(&res.key) {
+                self.index_pending = None;
+            }
+            self.index_cache.insert(res.key, res.band);
+        }
+    }
+
+    /// The solved count-index band for the popup's current selection, if it has finished.
+    fn selected_index_band(&self) -> Option<&CountBand> {
+        self.index_cache.get(&self.index_key()?)
     }
 
     fn active_pane(&self) -> Pane {
@@ -833,6 +970,45 @@ impl App {
                 }
             }
         }
+        // Count-index thresholds: how the recommended move shifts with the running count. Only shown
+        // when a count is imposed; the band solves in the background (see `ensure_index`).
+        if self.index_key().is_some() {
+            lines.push(Line::from(Span::styled(
+                format!(" {:─^w$}", " count index (exact RC) ", w = width as usize - 3),
+                Style::default().fg(Color::DarkGray),
+            )));
+            match self.selected_index_band() {
+                None => lines.push(Line::from(Span::styled(
+                    "  computing\u{2026}",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                Some(band) => {
+                    let runs = category_indices(band, cat);
+                    let wmin = band.externals.first().copied().unwrap_or(0);
+                    let wmax = band.externals.last().copied().unwrap_or(0);
+                    if runs.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            "  (no count-consistent hand in window)",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    for (mv, lo, hi) in runs {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("  {mv}  "),
+                                Style::default()
+                                    .fg(move_color(mv))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                fmt_rc_range(lo, hi, wmin, wmax),
+                                Style::default().fg(Color::Gray),
+                            ),
+                        ]));
+                    }
+                }
+            }
+        }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  hjkl move \u{00b7} Esc close",
@@ -938,6 +1114,11 @@ impl App {
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         loop {
             self.drain_results();
+            self.drain_index_results();
+            // Only solve count-index bands while a popup is actually open over a counted cell.
+            if self.mode == Mode::Popup {
+                self.ensure_index();
+            }
             terminal.draw(|f| self.render(f))?;
             // Poll with a timeout so the chart keeps filling in as workers finish, even with no input.
             if event::poll(Duration::from_millis(100))?
@@ -981,6 +1162,19 @@ fn compact_hand_label(hand: &CardCol) -> String {
         }
     }
     parts.concat()
+}
+
+/// A count-index run's running-count range as a counter-friendly threshold, given the swept window
+/// `[wmin, wmax]`. A run that reaches a window edge is shown open-ended (`≤`/`≥`) — any actual flip
+/// lies outside the window — so e.g. `S  RC ≥ +2` reads "stand once the running count hits +2".
+fn fmt_rc_range(lo: i16, hi: i16, wmin: i16, wmax: i16) -> String {
+    match (lo <= wmin, hi >= wmax) {
+        (true, true) => "any RC".to_string(),
+        (true, false) => format!("RC \u{2264} {hi:+}"),
+        (false, true) => format!("RC \u{2265} {lo:+}"),
+        (false, false) if lo == hi => format!("RC = {lo:+}"),
+        (false, false) => format!("RC {lo:+}..{hi:+}"),
+    }
 }
 
 /// Greedily fit hand labels into `budget` columns, space-separated. Returns the joined string and the
@@ -1058,4 +1252,34 @@ pub fn run() -> std::io::Result<()> {
     let result = app.event_loop(&mut terminal);
     ratatui::restore();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end count-index smoke test on the full TUI band path (`solve_count_band` →
+    /// `category_indices`). Pins the qualitative KO deviation for the canonical 16 vs Ten: the band's
+    /// externals come back ascending, and the recommended move flips *with the count in the right
+    /// direction* — Hit at the bottom of the window (deck rich in low cards, hitting stiff 16 is safe),
+    /// giving way to a non-Hit (surrender/stand) as the count climbs and the deck richens in tens.
+    /// `#[ignore]` because a full count-conditioned column band is seconds of work (the heavy count
+    /// tests all are). Run with `--release --ignored`.
+    #[test]
+    #[ignore]
+    fn count_index_16_vs_ten_flips_with_count() {
+        let band = solve_count_band(1, 0, Card::Ten, &Ruleset::default());
+        assert!(band.externals.windows(2).all(|w| w[0] < w[1]));
+        let runs = category_indices(&band, HandCategory::Hard(16));
+        assert!(
+            runs.len() >= 2,
+            "expected a count deviation for 16 vs T, got {runs:?}"
+        );
+        assert_eq!(runs.first().unwrap().0, Move::Hit, "low count should Hit");
+        assert_ne!(
+            runs.last().unwrap().0,
+            Move::Hit,
+            "high count should deviate off Hit"
+        );
+    }
 }

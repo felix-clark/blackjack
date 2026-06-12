@@ -191,10 +191,27 @@ fn dealer_dist<S: Shoe>(
         if prob == 0.0 {
             continue;
         }
-        // Branch on drawing `card`: clone the shoe and deplete it (a no-op for the infinite deck).
-        let mut sub_shoe = shoe.clone();
-        sub_shoe.draw(&card);
-        let sub = dealer_dist(hand.with_card(rank), &sub_shoe, hs17, memo);
+        let child = hand.with_card(rank);
+        // Resolve the child's outcome distribution, building (and depleting) the sub-shoe *only* when
+        // we actually have to recurse into it. A terminal child needs no shoe at all, and a child
+        // already in the memo is returned straight from it — so cloning the shoe and calling
+        // `draw` (a count-conditioned shoe's `draw` re-runs the expensive draw-distribution DP) for
+        // those is pure waste. Reordering the terminal/memo checks ahead of the sub-shoe build cuts
+        // the shoe depletions on a count shoe from ~one per (parent, rank) edge down to one per
+        // distinct expanded dealer hand. Values are unchanged: the same per-rank `prob * sub` terms in
+        // the same order.
+        let sub = if !child.must_hit(hs17) {
+            let mut term = [0.0; N_DEALER_OUTCOMES];
+            term[dealer_outcome_index(&child.terminal_outcome())] = 1.0;
+            term
+        } else if let Some(&cached) = memo.get(&child) {
+            cached
+        } else {
+            // Branch on drawing `card`: clone the shoe and deplete it (a no-op for the infinite deck).
+            let mut sub_shoe = shoe.clone();
+            sub_shoe.draw(&card);
+            dealer_dist(child, &sub_shoe, hs17, memo)
+        };
         for (acc, p) in dist.iter_mut().zip(sub) {
             *acc += prob * p;
         }
