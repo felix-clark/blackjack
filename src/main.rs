@@ -1,6 +1,7 @@
 pub(crate) mod card;
 pub(crate) mod count;
 pub(crate) mod dealer;
+pub(crate) mod diskcache;
 pub(crate) mod hand;
 mod legacy;
 pub(crate) mod reach;

@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fmt::{Debug, Display};
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, Serialize, Deserialize)]
 pub enum Card {
     Ace,
     /// a.k.a. Numeral cards, 2-9
@@ -10,7 +12,7 @@ pub enum Card {
 }
 
 impl Display for Card {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Card::Pip(n) => write!(f, "{}", n),
             Card::Ten => write!(f, "T"),
@@ -19,7 +21,7 @@ impl Display for Card {
     }
 }
 impl Debug for Card {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         <Self as Display>::fmt(self, f)
     }
 }

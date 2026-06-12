@@ -2,11 +2,13 @@
 //! parametrise the solver. Pure data — no compute lives here. CLAUDE.md anticipates these becoming
 //! first-class and threaded through the dealer/payoff logic in place of hardcoded defaults.
 
+use serde::{Deserialize, Serialize};
+
 /// The dealer's hole-card peek and the player's surrender option, as a *single* axis because they are
 /// not independent: *late* surrender is defined as surrendering after a clean peek, so it cannot exist
 /// in a no-peek game. Bundling them lets the type system enforce that — the invalid (no-peek, late)
 /// combination is simply unrepresentable, so the solver needs no runtime check to reject it.
-#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum PeekRule {
     /// The dealer peeks at the hole card before the player acts, so a dealer natural takes only the
     /// original bet (doubled and split bets are returned). Surrender, if offered, may be early or late.
@@ -18,7 +20,7 @@ pub(crate) enum PeekRule {
 }
 
 /// When (if ever) the player may forfeit half the bet in a peek game.
-#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum PeekSurrender {
     /// Surrender is not offered.
     None,
@@ -64,7 +66,7 @@ impl PeekRule {
 /// rather than an `f64` because only a tiny set of discrete payouts is ever used: this keeps the value
 /// `Eq + Hash` so the enclosing [`Ruleset`] can *derive* those (and key a cache) instead of hand-rolling
 /// bit-comparison around a float, and lets call sites match on the rule instead of fuzzy `==` on a float.
-#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum BjPayout {
     /// 3:2 — the good, near-universal payout.
     ThreeToTwo,
@@ -92,7 +94,7 @@ impl BjPayout {
 }
 
 /// The stipulation of miscellaneous rules other than the number of decks (?).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct Ruleset {
     /// Whether the dealer hits soft 17
     pub(crate) hs17: bool,

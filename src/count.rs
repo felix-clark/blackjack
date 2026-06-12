@@ -11,19 +11,29 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     card::Card,
     shoe::{CardCol, N_RANKS, Shoe},
 };
 
-/// Shared memo from a pool (and its count condition) to the count-conditioned next-card distribution,
-/// so the expensive [`CountW::draw_dist`] DP runs at most once per distinct `(pool, condition)`. Every
-/// [`CountShoe`] cloned within one solve shares the same `Arc`, so a pool first reached deep in one
-/// dealer recursion is free when any other line of play (a different player hand, a different peek
-/// hole, a re-reached dealer node) lands on the same remaining pool. Keyed on `(pool, condition)`
-/// rather than pool alone for robustness, though the condition is itself a function of the pool given a
-/// fixed starting count (every removed card shifts the threshold by its value).
-type DistCache = Arc<Mutex<HashMap<(CardCol, CountCondition), [f64; N_RANKS]>>>;
+/// Shared memo from a pool's **count-class composition** (and its count condition) to the per-rank
+/// *value-scale* broadcast — the class-level half of the count-conditioned draw distribution (see
+/// [`CountW::value_scales`]). The expensive deconvolution + `(s,n)`-sum depends on the pool *only*
+/// through its class composition `(M_class)`, never the within-class rank breakdown; the breakdown
+/// re-enters only as the cheap `m_r` multiplier when [`CountW::dist_from_scales`] reconstructs the
+/// distribution. So keying on class composition collapses every pool that is class-identical but
+/// rank-distinct (e.g. a dealer line that drew a 5 vs. a 6 — both KO +1) onto one deconvolution, on
+/// top of the exact-pool dedup it replaces. Every [`CountShoe`] cloned within one solve shares the
+/// same `Arc`. The condition is itself a function of the class composition given a fixed starting count
+/// (every removed card shifts the threshold by its value), but it is kept in the key for robustness
+/// across bands/solves.
+///
+/// The class composition is encoded as `[u16; N_RANKS]` with each rank holding its *whole class's*
+/// pool count (`Σ_{r': v_{r'}=v_r} M_{r'}`, see [`CountW::class_counts`]) — a value identical across
+/// class-equivalent pools and distinct otherwise, so it is a faithful class-composition key.
+type DistCache = Arc<Mutex<HashMap<([u16; N_RANKS], CountCondition), [f64; N_RANKS]>>>;
 
 // NOTE: If this ends up not needing to be anything more than a mapping, we can ditch the trait
 // formalism and just pass in an arbitrary function Card -> i8 to CountState.
@@ -162,7 +172,7 @@ impl Penetration {
 /// How the player's running count is compared against the entered value (the TUI's count condition).
 /// Expressed in the player's *external* running count; the inequality inverts when converted to the
 /// deck's internal count (`external ≥ C ⟺ internal ≤ pivot − C`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub(crate) enum CountCmp {
     /// Running count exactly equals the entered value.
     Eq,
@@ -176,11 +186,7 @@ pub(crate) enum CountCmp {
 pub(crate) struct Ko {}
 
 impl CountSystem for Ko {
-    // /// Construct this system for the given number of decks
-    // fn for_decks(n: u8) -> Self {
-    //     todo!()
-    // }
-
+    /// The initial running count for this system
     fn starting_count(n_decks: u8) -> i16 {
         4 - 4 * n_decks as i16
     }
@@ -211,7 +217,18 @@ impl CountSystem for Ko {
 /// `dist` are pure functions of those (and `f64`/`Vec` aren't `Eq`/`Hash` anyway).
 #[derive(Clone)]
 pub(crate) struct CountShoe {
-    /// The owned incremental weight table for the current pool; depleted in place on `draw`.
+    /// The current unseen pool (full shoe minus every card drawn so far), maintained cheaply on every
+    /// `draw` by a single-rank decrement. This — not [`dp`](Self::dp)'s deck — is the shoe's *true*
+    /// pool: it is the source of `m_r` and the class-composition cache key, and what `Eq`/`Hash` and the
+    /// `Shoe` queries (`contains_hand`/`rank_count`/`all_draw_probs`) read. The expensive `CountW` table
+    /// is only synced down to it lazily, on a draw-distribution cache miss (see [`sync_table`]).
+    ///
+    /// [`sync_table`]: Self::sync_table
+    pool: CardCol,
+    /// The count-weight table. Its own `deck` is the pool the table was last deconvolved to — an
+    /// *ancestor* of [`pool`](Self::pool) under lazy syncing (they coincide right after a sync or at
+    /// construction). Cloning is cheap (`Arc`-shared `w`); the table is materialized to the current pool
+    /// only when [`sync_table`](Self::sync_table) runs on a cache miss.
     dp: CountW,
     cond: CountCondition,
     pen: Penetration,
@@ -248,7 +265,14 @@ pub(crate) struct CountShoe {
 
 impl PartialEq for CountShoe {
     fn eq(&self, other: &Self) -> bool {
-        self.dp.deck == other.dp.deck
+        // The current `pool` (not the lazily-lagging table deck) is the defining composition. In
+        // mean-field mode the working composition lives in `dp.deck`, so compare that instead.
+        let (a, b) = if self.mean_field {
+            (&self.dp.deck, &other.dp.deck)
+        } else {
+            (&self.pool, &other.pool)
+        };
+        a == b
             && self.dp.value_of_rank == other.dp.value_of_rank
             && self.cond == other.cond
             && self.pen == other.pen
@@ -259,7 +283,12 @@ impl PartialEq for CountShoe {
 impl Eq for CountShoe {}
 impl std::hash::Hash for CountShoe {
     fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
-        self.dp.deck.hash(h);
+        let deck = if self.mean_field {
+            &self.dp.deck
+        } else {
+            &self.pool
+        };
+        deck.hash(h);
         self.dp.value_of_rank.hash(h);
         self.cond.hash(h);
         self.pen.hash(h);
@@ -305,7 +334,11 @@ impl CountShoe {
         cmp: CountCmp,
         pen: Penetration,
     ) -> Self {
-        Self::new::<S>(n_decks, cond_from_external::<S>(n_decks, external, cmp), pen)
+        Self::new::<S>(
+            n_decks,
+            cond_from_external::<S>(n_decks, external, cmp),
+            pen,
+        )
     }
 
     /// A **band** of shoes, one per external running count in `externals`, that share a single
@@ -333,6 +366,7 @@ impl CountShoe {
             .enumerate()
             .map(|(band_idx, &cond)| {
                 let mut shoe = Self {
+                    pool: dp.deck,
                     dp: dp.clone(),
                     cond,
                     pen,
@@ -356,6 +390,7 @@ impl CountShoe {
         dist: [f64; N_RANKS],
     ) -> Self {
         Self {
+            pool: dp.deck,
             dp,
             cond,
             pen,
@@ -375,7 +410,9 @@ impl CountShoe {
     /// and finite depletion at finite-deck speed (the `CountW` table is left unused). `dp.deck` is
     /// repurposed as that scaled mean-field composition.
     fn mean_field_view(&self) -> Self {
-        let n = self.dp.deck.len() as u16;
+        // The current pool size — `pool`, not the lazily-lagging table deck — is what `self.dist` was
+        // conditioned on and what the tilted composition must represent.
+        let n = self.pool.len() as u16;
         let (comp, scale) = expected_composition(&self.dist, n);
         let mut next = self.clone();
         // In mean-field mode the `CountW` weight table is never read — draws come straight off the
@@ -385,7 +422,7 @@ impl CountShoe {
         // decks that retention blew memory into the GBs and got the process SIGKILLed; the table is
         // ~300 KB there and thousands of distinct compositions are reached per split, times the caches
         // and the concurrent up-card columns.
-        next.dp.w = Vec::new();
+        next.dp.w = Arc::new(Vec::new());
         next.dp.deck = comp;
         next.mean_field = true;
         next.mf_scale = scale;
@@ -407,15 +444,21 @@ impl CountShoe {
     /// `freeze_split_error` measurement to A/B the split approximations, hence `#[cfg(test)]`.
     #[cfg(test)]
     pub(crate) fn pool(&self) -> CardCol {
-        self.dp.deck
+        self.pool
     }
 
     /// Deplete the pool by one card *without* recomputing the cached distribution — used to batch a
-    /// whole-hand removal before a single recompute. The condition shifts by the card's value (so the
-    /// running-count constraint follows the card down the tree) and the penetration prior ages.
+    /// whole-hand removal before a single recompute. Only the *current pool* (and the count condition /
+    /// penetration prior) are updated here — both `O(1)`; the expensive `CountW` table is left
+    /// untouched and synced lazily later (see [`sync_table`]). The condition shifts by the card's value
+    /// (so the running-count constraint follows the card down the tree) and the penetration prior ages.
+    ///
+    /// [`sync_table`]: Self::sync_table
     fn deplete(&mut self, card: &Card) {
         let v = self.dp.value_of_rank[card.rank_index()];
-        self.dp.remove_card(card);
+        // One card off the current pool (per-rank saturating subtraction). NOT `remove_rank`, which
+        // clears the whole rank.
+        self.pool = self.pool - CardCol::from_hand(&[*card]);
         self.cond = self.cond.shifted(v);
         // Band members shift in lockstep, so `cond == band_conds[band_idx]` is preserved as the
         // running-count constraint follows the card down the tree.
@@ -425,30 +468,59 @@ impl CountShoe {
         self.pen = self.pen.after_draw();
     }
 
-    /// Rebuild the cached count-conditioned draw distribution for the current pool/condition,
-    /// consulting the shared `(pool, condition)` memo first so the [`CountW::draw_dist`] DP runs at
-    /// most once per distinct pool across the whole solve (see [`DistCache`]).
+    /// Bring the lazily-deferred `CountW` table down to the current [`pool`](Self::pool). `deplete`
+    /// advances the pool cheaply on each draw but leaves the table at an ancestor pool; this
+    /// deconvolves the difference (the cards drawn since the last sync) so the table matches the current
+    /// pool. Called only on a draw-distribution cache *miss*, where the table is actually needed — so a
+    /// shoe (and the clones sharing its `Arc`-table) that only ever hits the class-composition cache
+    /// never pays the deconvolution at all. The first `remove_card` here copies the shared table
+    /// on-write (`Arc::make_mut`); the rest mutate it in place.
+    fn sync_table(&mut self) {
+        let removed = self.dp.deck - self.pool;
+        for (card, n) in removed.iter() {
+            for _ in 0..n {
+                self.dp.remove_card(&card);
+            }
+        }
+        debug_assert_eq!(self.dp.deck, self.pool, "table not synced to current pool");
+    }
+
+    /// Rebuild the cached count-conditioned draw distribution for the current pool/condition. The
+    /// shared memo (see [`DistCache`]) caches the class-level [`CountW::value_scales`] keyed on the
+    /// *current pool*'s class composition, so the expensive deconvolution runs at most once per distinct
+    /// class composition across the whole solve; the cheap rank-level `m_r` fold-in
+    /// ([`CountW::dist_from_scales_with`]) is redone per pool. On a cache **miss** the lazily-deferred
+    /// table is first [`sync_table`](Self::sync_table)'d down to the current pool; on a **hit** the table
+    /// is never touched.
     fn recompute(&mut self) {
-        let key = (self.dp.deck, self.cond);
-        if let Some(&dist) = self.dist_cache.lock().unwrap().get(&key) {
-            self.dist = dist;
+        let class_counts = self.dp.class_counts_of(&self.pool);
+        let key = (class_counts, self.cond);
+        if let Some(&scales) = self.dist_cache.lock().unwrap().get(&key) {
+            self.dist = self.dp.dist_from_scales_with(&self.pool, &scales);
             return;
         }
+        // Miss: the deconvolution genuinely needs the table at the current pool.
+        self.sync_table();
         if self.band_conds.len() <= 1 {
-            let dist = self.dp.draw_dist(self.cond, self.pen);
-            self.dist_cache.lock().unwrap().insert(key, dist);
-            self.dist = dist;
+            let scales = self.dp.value_scales(self.cond, self.pen);
+            self.dist_cache.lock().unwrap().insert(key, scales);
+            self.dist = self.dp.dist_from_scales_with(&self.pool, &scales);
             return;
         }
-        // Banded: one deconvolution serves the whole band. Fill every member's distribution for this
-        // pool so sibling solves sharing `dist_cache` hit it instead of re-deconvolving (the band is
-        // filled atomically — all present or none — so the early cache check above is a sound guard).
-        let dists = self.dp.draw_dist_band(&self.band_conds, self.pen);
-        let mut cache = self.dist_cache.lock().unwrap();
-        for (c, d) in self.band_conds.iter().zip(dists.iter()) {
-            cache.insert((self.dp.deck, *c), *d);
+        // Banded: one deconvolution serves the whole band. Fill every member's value scales for this
+        // class composition so sibling solves sharing `dist_cache` hit them instead of re-deconvolving
+        // (the band is filled atomically — all present or none — so the early cache check above is a
+        // sound guard).
+        let scales = self.dp.value_scales_band(&self.band_conds, self.pen);
+        {
+            let mut cache = self.dist_cache.lock().unwrap();
+            for (c, sc) in self.band_conds.iter().zip(scales.iter()) {
+                cache.insert((class_counts, *c), *sc);
+            }
         }
-        self.dist = dists[self.band_idx];
+        self.dist = self
+            .dp
+            .dist_from_scales_with(&self.pool, &scales[self.band_idx]);
     }
 }
 
@@ -483,8 +555,8 @@ fn expected_composition(dist: &[f64; N_RANKS], n: u16) -> (CardCol, u16) {
         remainder -= 1;
     }
     let mut col = CardCol::new();
-    for r in 0..N_RANKS {
-        col.add_n(Card::from_rank_index(r), counts[r]);
+    for (r, &count) in counts.iter().enumerate() {
+        col.add_n(Card::from_rank_index(r), count);
     }
     (col, scale)
 }
@@ -514,12 +586,13 @@ impl Shoe for CountShoe {
     }
 
     fn all_draw_probs(&self) -> impl Iterator<Item = (Card, f64)> {
-        // In both modes: yield only ranks present in `dp.deck` (matching `CardCol::all_draw_probs`) —
-        // a depleted rank would otherwise make the player Hit DP look up an un-enumerable child. In
-        // mean-field mode the weights are the finite composition; otherwise the count-tilted `dist`.
+        // In both modes: yield only ranks present in the working composition (matching
+        // `CardCol::all_draw_probs`) — a depleted rank would otherwise make the player Hit DP look up an
+        // un-enumerable child. In mean-field mode that composition (and the weights) is the tilted
+        // `dp.deck`; otherwise it is the current `pool`, with the count-tilted `dist` for weights.
         let mean_field = self.mean_field;
         let dist = self.dist;
-        let deck = self.dp.deck;
+        let deck = if mean_field { self.dp.deck } else { self.pool };
         let total = deck.len() as f64;
         (0..N_RANKS)
             .filter(move |&i| deck.get_count_i(i) > 0)
@@ -553,14 +626,20 @@ impl Shoe for CountShoe {
         if self.mean_field {
             return self.scaled(hand).is_submultiset(&self.dp.deck);
         }
-        hand.is_submultiset(&self.dp.deck)
+        hand.is_submultiset(&self.pool)
     }
 
     /// The enumerator's per-rank supply is the pool count. The hypergeometric scan-weight is not the
     /// count-conditioned joint and is treated as a loose pooling weight (see `simulation.rs`); the
-    /// count-correct probabilities come from [`draw_prob`](Self::draw_prob)/[`all_draw_probs`].
+    /// count-correct probabilities come from [`draw_prob`](Self::draw_prob)/[`all_draw_probs`]. The
+    /// supply is the current `pool` (the mean-field split view reads its tilted `dp.deck` instead).
     fn rank_count(&self, rank: &Card) -> Option<u16> {
-        Some(self.dp.deck.get_count(rank))
+        let deck = if self.mean_field {
+            &self.dp.deck
+        } else {
+            &self.pool
+        };
+        Some(deck.get_count(rank))
     }
 
     fn for_split(&self) -> Self {
@@ -602,7 +681,13 @@ struct CountW {
     n_max: u16,
     n_span: usize,
     /// flat `[s][n]` table of normalized probabilities; `p[s][n]` lives at `(s − s_min) * n_span + n`.
-    w: Vec<f64>,
+    ///
+    /// `Arc`-wrapped so cloning a [`CountShoe`] (every solver clone / `remove_hand`) is a refcount bump
+    /// rather than a ~300 KB deep copy. The table is only *mutated* lazily — when a draw-distribution
+    /// cache miss forces [`CountShoe::sync_table`] to deconvolve it down to the current pool — and the
+    /// mutation copies-on-write via `Arc::make_mut`, so the deep copy happens at most once per shoe that
+    /// actually has to deconvolve, never per clone.
+    w: Arc<Vec<f64>>,
 }
 
 impl CountW {
@@ -636,12 +721,11 @@ impl CountW {
             s_max,
             n_max,
             n_span,
-            w,
+            w: Arc::new(w),
         };
         // Fold cards in one at a time, tracking the growing sub-pool size.
         let mut size: u16 = 0;
-        for r in 0..N_RANKS {
-            let v = value_of_rank[r];
+        for (r, &v) in value_of_rank.iter().enumerate() {
             for _ in 0..deck.get_count_i(r) {
                 size += 1;
                 me.fold_in_card(v, size);
@@ -670,7 +754,9 @@ impl CountW {
                 let prev = self.at(s - v, n - 1);
                 let val = here * keep + prev * take;
                 if val != 0.0 || here != 0.0 {
-                    self.w[(s - self.s_min) as usize * self.n_span + n as usize] = val;
+                    // Unique during `build` (the only caller), so `make_mut` never actually clones.
+                    Arc::make_mut(&mut self.w)
+                        [(s - self.s_min) as usize * self.n_span + n as usize] = val;
                 }
             }
         }
@@ -748,31 +834,39 @@ impl CountW {
             .sum();
         let s_prime = pool_count - v;
 
+        // Copy-on-write the table once for the whole removal: if `w` is `Arc`-shared with sibling
+        // shoes, `make_mut` clones it here (the deferred deep copy that lazy syncing pays only on a
+        // cache miss); thereafter it is unique and the loops mutate in place. `n_span`/`s_min` are read
+        // into locals first so `w` can hold the sole borrow of `self.w`.
+        let n_span = self.n_span;
+        let s_min = self.s_min;
+        let w = Arc::make_mut(&mut self.w);
+
         // Lower half via the recurrence, in place (sweep n upward).
         for n in 0..=half {
             let denom = (self.n_max - n) as f64;
             let keep = big_n / denom;
             let take = n as f64 / denom;
-            for s in self.s_min..=self.s_max {
-                let idx = (s - self.s_min) as usize * self.n_span + n as usize;
-                let sub = if n == 0 || s - v < self.s_min || s - v > self.s_max {
+            for s in s_min..=self.s_max {
+                let idx = (s - s_min) as usize * n_span + n as usize;
+                let sub = if n == 0 || s - v < s_min || s - v > self.s_max {
                     0.0
                 } else {
-                    self.w[(s - v - self.s_min) as usize * self.n_span + (n - 1) as usize]
+                    w[(s - v - s_min) as usize * n_span + (n - 1) as usize]
                 };
-                self.w[idx] = self.w[idx] * keep - sub * take;
+                w[idx] = w[idx] * keep - sub * take;
             }
         }
         // Upper half by complement reflection off the now-finalized lower rows.
         for n in (half + 1)..=m {
-            for s in self.s_min..=self.s_max {
+            for s in s_min..=self.s_max {
                 let mirror_s = s_prime - s;
-                let mirror = if mirror_s < self.s_min || mirror_s > self.s_max {
+                let mirror = if mirror_s < s_min || mirror_s > self.s_max {
                     0.0
                 } else {
-                    self.w[(mirror_s - self.s_min) as usize * self.n_span + (m - n) as usize]
+                    w[(mirror_s - s_min) as usize * n_span + (m - n) as usize]
                 };
-                self.w[(s - self.s_min) as usize * self.n_span + n as usize] = mirror;
+                w[(s - s_min) as usize * n_span + n as usize] = mirror;
             }
         }
 
@@ -780,29 +874,55 @@ impl CountW {
         self.n_max -= 1;
     }
 
-    /// Next-card draw distribution conditioned on `cond` over the running count, under penetration
-    /// prior `pen`. For each distinct present value `v` it forms `p_v`, the normalized count table of
-    /// the pool with one `v`-card removed ([`deconv`](Self::deconv)), and accumulates
+    /// The pool's **count-class composition**, encoded per rank: `class_counts_of(pool)[r]` is the total
+    /// count in `pool` of *every* rank sharing rank `r`'s count value (`Σ_{r': v_{r'}=v_r} M_{r'}`). This
+    /// is the [`DistCache`] key — identical across pools that are class-equivalent but rank-distinct
+    /// (the very pools whose [`value_scales`](Self::value_scales) agree), and distinct otherwise — so
+    /// caching on it collapses the redundant deconvolutions those pools would each otherwise pay.
     ///
-    /// ```text
-    ///   acc[r] = M_r · Σ_{s: cond}  Σ_{n=1..=N}  pen(n) · p_v[s − v][n − 1]
-    /// ```
-    ///
-    /// then normalizes `acc` to sum 1. This is the raw `Σ pen(n)/C(N,n)/n · M_r · H_v[s−v][n−1]` of the
-    /// old DP with the `1/(C(N,n)·n)` folded into `p_v` (via `C(N−1,n−1)/C(N,n) = n/N`, the common
-    /// `1/N` cancelling in the normalization) — same value, computed entirely on `O(1)` probabilities.
-    fn draw_dist(&self, cond: CountCondition, pen: Penetration) -> [f64; N_RANKS] {
-        let big_n = self.n_max;
+    /// The key is read off the shoe's *current* pool — which, under lazy table syncing, runs ahead of
+    /// the table's (deferred) deck — so the pool is passed explicitly; only `value_of_rank` (the fixed
+    /// count system) comes from the table.
+    fn class_counts_of(&self, pool: &CardCol) -> [u16; N_RANKS] {
+        std::array::from_fn(|r| {
+            let v = self.value_of_rank[r];
+            (0..N_RANKS)
+                .filter(|&r2| self.value_of_rank[r2] == v)
+                .map(|r2| pool.get_count_i(r2))
+                .sum()
+        })
+    }
 
-        let mut acc = [0.0; N_RANKS];
+    /// The **class-level half** of the count-conditioned draw distribution: per rank `r`, the value
+    /// scale `scale_{v_r} = Σ_{s: cond} Σ_{n=1..=N} pen(n) · p_v[s − v][n − 1]`, where `p_v` is the
+    /// normalized count table of the pool with one `v`-card removed ([`deconv`](Self::deconv)).
+    ///
+    /// This is the expensive part (one deconvolution + `(s,n)`-sum per distinct present value), and it
+    /// depends on the pool **only through its class composition** — `deconv`, `s_min/s_max`, `n_max`,
+    /// the table, the `cond` filter and the `pen` weight are all functions of the per-class sizes, never
+    /// the within-class rank breakdown. So it is shared across class-equivalent pools (keyed by
+    /// [`class_counts_of`](Self::class_counts_of)). The scale is broadcast to *every* rank of a present class,
+    /// not just the ranks currently in the pool, so the result is a pure function of the class
+    /// composition (a momentarily-absent rank must not change it). [`dist_from_scales`] folds in the
+    /// rank-level `m_r` to recover the distribution.
+    ///
+    /// [`dist_from_scales`]: Self::dist_from_scales
+    fn value_scales(&self, cond: CountCondition, pen: Penetration) -> [f64; N_RANKS] {
+        let big_n = self.n_max;
+        let mut out = [0.0; N_RANKS];
         let mut seen_values: Vec<i16> = Vec::new();
         let mut scale_of_value: Vec<f64> = Vec::new();
-        for r in 0..N_RANKS {
-            let m_r = self.deck.get_count_i(r);
-            if m_r == 0 {
+        for (r, &v) in self.value_of_rank.iter().enumerate() {
+            // Only a *present* class can be deconvolved (it needs ≥1 card of value `v`) and only a
+            // present class is ever drawn; an absent class keeps scale 0 (all its ranks have `m_r = 0`,
+            // so they contribute nothing once `m_r` is folded in). Broadcasting to every rank of a
+            // present class — even ranks momentarily absent from this pool — is what keeps the result a
+            // pure function of the class composition, so class-equivalent pools share a cache entry.
+            let class_present =
+                (0..N_RANKS).any(|r2| self.value_of_rank[r2] == v && self.deck.get_count_i(r2) > 0);
+            if !class_present {
                 continue;
             }
-            let v = self.value_of_rank[r];
             let scale = if let Some(pos) = seen_values.iter().position(|&u| u == v) {
                 scale_of_value[pos]
             } else {
@@ -831,41 +951,75 @@ impl CountW {
                 scale_of_value.push(s_v);
                 s_v
             };
-            acc[r] = m_r as f64 * scale;
+            out[r] = scale;
         }
+        out
+    }
+
+    /// Fold the rank-level multiplicities `m_r` into a value-scale broadcast ([`value_scales`]) and
+    /// normalize, recovering the count-conditioned next-card distribution: `acc[r] = m_r · scale_{v_r}`,
+    /// renormalized to sum 1. This is the raw `Σ pen(n)/C(N,n)/n · M_r · H_v[s−v][n−1]` of the old DP
+    /// with the `1/(C(N,n)·n)` folded into `p_v` (via `C(N−1,n−1)/C(N,n) = n/N`, the common `1/N`
+    /// cancelling in the normalization) — same value, computed entirely on `O(1)` probabilities.
+    ///
+    /// A finite, positive total is the reachable case. If the condition is unreachable for this pool
+    /// (no admissible config) the total is 0 and the all-zero distribution is returned as-is — callers
+    /// treat a zero draw distribution as "this line of play has no count-consistent mass".
+    ///
+    /// [`value_scales`]: Self::value_scales
+    fn dist_from_scales(&self, scales: &[f64; N_RANKS]) -> [f64; N_RANKS] {
+        self.dist_from_scales_with(&self.deck, scales)
+    }
+
+    /// [`dist_from_scales`](Self::dist_from_scales) folding in the `m_r` of an arbitrary `pool`. The
+    /// reconstruction is read off the shoe's *current* pool (which, under lazy syncing, may run ahead of
+    /// the table's deck), so the multiplicities are taken from `pool`; the `scales` are class-level and
+    /// independent of which pool within the class composition they came from.
+    fn dist_from_scales_with(&self, pool: &CardCol, scales: &[f64; N_RANKS]) -> [f64; N_RANKS] {
+        let mut acc: [f64; N_RANKS] =
+            std::array::from_fn(|r| pool.get_count_i(r) as f64 * scales[r]);
         let total: f64 = acc.iter().sum();
-        // A finite, positive total is the reachable case. If the condition is unreachable for this
-        // pool (no admissible config) the total is 0 and the all-zero distribution is returned as-is —
-        // callers treat a zero draw distribution as "this line of play has no count-consistent mass".
         if total > 0.0 && total.is_finite() {
             acc.iter_mut().for_each(|p| *p /= total);
         }
         acc
     }
 
-    /// [`draw_dist`] for a whole **band** of conditions at once, sharing the expensive work.
+    /// Next-card draw distribution conditioned on `cond` over the running count, under penetration
+    /// prior `pen`. The class-level [`value_scales`](Self::value_scales) (cached across class-equivalent
+    /// pools) folded together with the rank-level `m_r` by [`dist_from_scales`](Self::dist_from_scales);
+    /// kept as a single entry point for the oracle cross-checks.
+    fn draw_dist(&self, cond: CountCondition, pen: Penetration) -> [f64; N_RANKS] {
+        self.dist_from_scales(&self.value_scales(cond, pen))
+    }
+
+    /// [`value_scales`] for a whole **band** of conditions at once, sharing the expensive work.
     ///
-    /// The condition only enters [`draw_dist`] through the `cond.accepts(s)` filter on the running
-    /// count `s`; the `O(cells)` deconvolution `p_v` and the `n`-sum over the penetration prior are
-    /// both condition-*independent*. So for a band of conditions over the *same* pool we deconvolve
-    /// each present value once and the per-`s` `n`-sum once, then distribute that mass to whichever
-    /// band members admit `s`. The result equals calling [`draw_dist`] per condition (same terms, only
-    /// the `n`-sum regrouped per-`s` so float summation order differs in the last bits), at a fraction
-    /// of the cost — this is what lets the solver sweep a count band (the chart's count-index
-    /// thresholds) while paying the dominant deconvolution only once. Returns one normalized
-    /// distribution per `cond`, in order.
-    fn draw_dist_band(&self, conds: &[CountCondition], pen: Penetration) -> Vec<[f64; N_RANKS]> {
+    /// The condition only enters through the `cond.accepts(s)` filter on the running count `s`; the
+    /// `O(cells)` deconvolution `p_v` and the `n`-sum over the penetration prior are both
+    /// condition-*independent*. So for a band of conditions over the *same* pool we deconvolve each
+    /// present value once and the per-`s` `n`-sum once, then distribute that mass to whichever band
+    /// members admit `s`. Returns one value-scale broadcast per `cond`, in order — equal to calling
+    /// [`value_scales`] per condition (same terms, only the `n`-sum regrouped per-`s` so float
+    /// summation order differs in the last bits), at a fraction of the cost. This is what lets the
+    /// solver sweep a count band (the chart's count-index thresholds) while paying the dominant
+    /// deconvolution only once.
+    ///
+    /// [`value_scales`]: Self::value_scales
+    fn value_scales_band(&self, conds: &[CountCondition], pen: Penetration) -> Vec<[f64; N_RANKS]> {
         let big_n = self.n_max;
-        let mut accs = vec![[0.0; N_RANKS]; conds.len()];
+        let mut outs = vec![[0.0; N_RANKS]; conds.len()];
         let mut seen_values: Vec<i16> = Vec::new();
         // Per distinct present value, the `s_v` scale for each band member (parallel to `conds`).
         let mut scales_of_value: Vec<Vec<f64>> = Vec::new();
         for r in 0..N_RANKS {
-            let m_r = self.deck.get_count_i(r);
-            if m_r == 0 {
+            let v = self.value_of_rank[r];
+            // Present-class guard + broadcast to every rank of the class — see `value_scales`.
+            let class_present =
+                (0..N_RANKS).any(|r2| self.value_of_rank[r2] == v && self.deck.get_count_i(r2) > 0);
+            if !class_present {
                 continue;
             }
-            let v = self.value_of_rank[r];
             let pos = if let Some(pos) = seen_values.iter().position(|&u| u == v) {
                 pos
             } else {
@@ -884,8 +1038,7 @@ impl CountW {
                         if w_n == 0.0 {
                             continue;
                         }
-                        let pval =
-                            p_v[(sh - self.s_min) as usize * self.n_span + (n - 1) as usize];
+                        let pval = p_v[(sh - self.s_min) as usize * self.n_span + (n - 1) as usize];
                         if pval != 0.0 {
                             nsum += w_n * pval;
                         }
@@ -902,17 +1055,26 @@ impl CountW {
                 scales_of_value.push(sv);
                 scales_of_value.len() - 1
             };
-            for (ci, acc) in accs.iter_mut().enumerate() {
-                acc[r] = m_r as f64 * scales_of_value[pos][ci];
+            for (ci, out) in outs.iter_mut().enumerate() {
+                out[r] = scales_of_value[pos][ci];
             }
         }
-        for acc in accs.iter_mut() {
-            let total: f64 = acc.iter().sum();
-            if total > 0.0 && total.is_finite() {
-                acc.iter_mut().for_each(|p| *p /= total);
-            }
-        }
-        accs
+        outs
+    }
+
+    /// [`draw_dist`] for a whole band of conditions at once — [`value_scales_band`] with the rank-level
+    /// `m_r` folded in and each member normalized. Returns one distribution per `cond`, in order.
+    /// Production reconstructs distributions straight from [`value_scales_band`] (in `recompute`); this
+    /// is retained only as the band/per-cond cross-check oracle, hence `#[cfg(test)]`.
+    ///
+    /// [`draw_dist`]: Self::draw_dist
+    /// [`value_scales_band`]: Self::value_scales_band
+    #[cfg(test)]
+    fn draw_dist_band(&self, conds: &[CountCondition], pen: Penetration) -> Vec<[f64; N_RANKS]> {
+        self.value_scales_band(conds, pen)
+            .iter()
+            .map(|sc| self.dist_from_scales(sc))
+            .collect()
     }
 }
 
@@ -959,7 +1121,11 @@ mod tests {
                 );
                 let start = Instant::now();
                 let tree = build_evs(shoe, up, &rules);
-                eprintln!("n={n} up={up:?}: {:?}  tree={}", start.elapsed(), tree.len());
+                eprintln!(
+                    "n={n} up={up:?}: {:?}  tree={}",
+                    start.elapsed(),
+                    tree.len()
+                );
             }
         }
     }
@@ -1156,10 +1322,9 @@ mod tests {
                 //     hypergeometric mean the expected fraction that are rank r is M_r / M_j (exact for
                 //     a single draw, by linearity of expectation).
                 // These sum to 1 over r within each config: Σ_j (k_j/n)(M_j/M_j) = Σ_j k_j/n = 1.
-                for r in 0..N_RANKS {
+                for (r, &j) in classes.class_of_rank.iter().enumerate() {
                     // `knums` is indexed by class (same order as `classes.values`/`sizes`), so the class
                     // index is the only mapping needed — no value→index lookup.
-                    let j = classes.class_of_rank[r];
                     let m_r = self.deck.get_count_i(r) as f64;
                     let m_j = classes.sizes[j] as f64;
                     let k_j = knums[j] as f64;
@@ -1204,7 +1369,7 @@ mod tests {
             // for every `s`. (`choose(big_n, 0) = 1`; index 0 is unused since the `n` loop starts at 1.)
             let inv_cn: Vec<f64> = (0..=dp.n_max).map(|n| 1.0 / choose(big_n, n)).collect();
 
-            let mut acc = [0.0; N_RANKS];
+            let mut rank_probs = [0.0; N_RANKS];
             for s in dp.s_min..=dp.s_max {
                 for n in 1..=dp.n_max {
                     if !accept(s, n) {
@@ -1220,7 +1385,7 @@ mod tests {
                     }
                     // p(n) · 1/C(N, n); the 1/n of the draw probability is applied per rank below.
                     let cell_w = w_n * inv_cn[n as usize];
-                    for r in 0..N_RANKS {
+                    for (r, rank_prob_r) in rank_probs.iter_mut().enumerate() {
                         let j = classes.class_of_rank[r];
                         let m_j = classes.sizes[j];
                         if m_j == 0 {
@@ -1228,7 +1393,8 @@ mod tests {
                         }
                         let m_r = self.deck.get_count_i(r) as f64;
                         let t_j = dp.data[base + 1 + j]; // T_j[s][n] = Σ_configs k_j · ∏ C
-                        acc[r] += cell_w * (t_j / n as f64) * (m_r / m_j as f64);
+                        // acc[r] += cell_w * (t_j / n as f64) * (m_r / m_j as f64);
+                        *rank_prob_r += cell_w * (t_j / n as f64) * (m_r / m_j as f64);
                     }
                 }
             }
@@ -1236,11 +1402,11 @@ mod tests {
             // Each cell's contribution already forms a sub-distribution over ranks, so normalizing just
             // divides out the total accepted mass (and guards FP drift). Stays all-zero if the condition
             // is unreachable, rather than producing NaNs.
-            let total: f64 = acc.iter().sum();
+            let total: f64 = rank_probs.iter().sum();
             if total > 0.0 {
-                acc.iter_mut().for_each(|p| *p /= total);
+                rank_probs.iter_mut().for_each(|p| *p /= total);
             }
-            acc
+            rank_probs
         }
 
         /// Draw distribution conditioned on the internal running count equalling `c`, under a flat prior
@@ -1656,6 +1822,57 @@ mod tests {
                 if stand > hit { "STAND" } else { "HIT" }
             );
         }
+    }
+
+    /// The count-conditioned player edge must move the *right* way: a higher KO running count
+    /// (player-favourable, low cards gone, deck ten/ace rich) must *raise* the edge. This pins the
+    /// fix for the inverted-edge bug — the two-card root occurrence weight that the edge integrates
+    /// over was the untilted hypergeometric scan-weight (count-favoured naturals/20s under-weighted),
+    /// so the edge fell as the count rose. Routing the seed weight through `Shoe::hand_prob` (the
+    /// count-tilted occurrence probability) restores the monotonicity.
+    ///
+    /// `#[ignore]`d in routine runs: a no-split edge pass over all ten up-cards at three counts on a
+    /// 1-deck count shoe (~30s). The cheap `count_w_*`/conversion unit tests run by default; this is
+    /// the heavier end-to-end guard, run on demand with `--ignored`.
+    #[test]
+    #[ignore]
+    fn count_edge_rises_with_running_count() {
+        use crate::rules::Ruleset;
+        use crate::simulation::{build_evs, edge_term};
+
+        // No split keeps the pass fast; the edge sign/monotonicity is a hit/stand/double property.
+        let rules = Ruleset {
+            max_split_hands: 1,
+            ..Ruleset::default()
+        };
+        let edge_at = |ext: i16| -> f64 {
+            let shoe = CountShoe::from_external::<Ko>(
+                1,
+                ext,
+                CountCmp::Eq,
+                Penetration::FlatPastPercent(25),
+            );
+            shoe.all_draw_probs()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(up, p_up)| p_up * edge_term(&build_evs(shoe.clone(), up, &rules)).value())
+                .sum()
+        };
+        let low = edge_at(-10);
+        let mid = edge_at(0);
+        let high = edge_at(10);
+        // Monotone increasing in the player's running count.
+        assert!(
+            low < mid && mid < high,
+            "edge must rise with running count: RC-10 {low:+.4}, RC0 {mid:+.4}, RC+10 {high:+.4}"
+        );
+        // A strongly favourable count is a genuine player advantage (the Monte-Carlo true-mixture
+        // mean over the matching subset population lands near +0.06; the sign is the load-bearing
+        // claim here, not the magnitude).
+        assert!(
+            high > 0.0,
+            "a strongly positive count must give the player an edge, got {high:+.4}"
+        );
     }
 
     /// The DP draw distribution must match the eager enumeration reference bit-for-bit (up to FP).

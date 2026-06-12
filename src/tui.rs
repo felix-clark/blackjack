@@ -12,11 +12,14 @@
 //! shoe it swaps the plain [`CardCol`] for a [`CountShoe`] (exact count-conditioned main tree and
 //! dealer; mean-field tilt inside splits). The condition is part of the chart cache key, so toggling
 //! counts on/off or changing the running count re-solves (or restores from cache) like a rules change.
-//! Under a count, the EV popup also shows **count-index thresholds** — the running counts at which the
-//! recommended move flips — by sweeping a band of counts around the current one ([`solve_count_band`],
-//! sharing one deconvolution across the band) on a background thread while the popup is open.
+//! On a finite shoe the chart also shows **count-index thresholds** — the running counts at which the
+//! recommended move flips. These are a count-*independent* property of each cell (the player's count
+//! only says where they sit on the ladder), so they are computed once per `(up-card, shoe, ruleset)`
+//! over the whole reachable count axis ([`ColumnEval`]/[`coalesce_runs`], monotone root-finding sharing
+//! one deconvolution across the band), background-filled for every cell, marked with `°` on the chart,
+//! and detailed in the popup.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -29,8 +32,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use serde::{Deserialize, Serialize};
+
 use crate::card::Card;
-use crate::count::{CountCmp, CountShoe, Ko, Penetration};
+use crate::count::{CountCmp, CountShoe, CountSystem, Ko, Penetration};
+use crate::diskcache;
 use crate::hand::{HandCategory, Move};
 use crate::reach::{CellInfo, reach_weights, summarize_cells};
 use crate::rules::{BjPayout, PeekRule, PeekSurrender, Ruleset};
@@ -44,7 +50,7 @@ const COUNT_PENETRATION: Penetration = Penetration::FlatPastPercent(25);
 /// A card-counting condition the chart is solved under: a counting system (KO for now), the player's
 /// external running count, and how it is compared. `None` of this is applied on the infinite deck (an
 /// infinite deck has no count) or when counting is toggled off.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct CountSetting {
     /// The player's external running count value being conditioned on.
     external: i16,
@@ -93,7 +99,7 @@ const MOVE_ORDER: [Move; 5] = [
 
 /// The shoe the chart is solved against: an infinite (non-depleting) deck or a finite `n`-deck shoe.
 /// This is the seam a future card-counting input would adjust.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum ShoeChoice {
     Infinite,
     Decks(u8),
@@ -115,7 +121,14 @@ impl ShoeChoice {
     /// `count` conditions the solve on a card-counting running count; it only applies to a finite shoe
     /// (an infinite deck has no count) and is ignored when `None`.
     fn solve(self, up_card: Card, rules: &Ruleset, count: Option<CountSetting>) -> Column {
-        match self {
+        // Disk cache: a solved column is fully determined by (up-card, shoe, ruleset, count condition),
+        // so persist it — a revisited configuration loads instantly instead of re-solving (splits and
+        // all). Best-effort; a miss/error just recomputes.
+        let key = (up_card, self, *rules, count);
+        if let Some(col) = diskcache::load::<_, Column>("column", &key) {
+            return col;
+        }
+        let column = match self {
             ShoeChoice::Infinite => solve_on(InfiniteDeck {}, up_card, rules),
             ShoeChoice::Decks(n) => match count {
                 Some(c) => solve_on(
@@ -125,7 +138,9 @@ impl ShoeChoice {
                 ),
                 None => solve_on(CardCol::from_decks(n), up_card, rules),
             },
-        }
+        };
+        diskcache::store("column", &key, &column);
+        column
     }
 }
 
@@ -146,75 +161,359 @@ fn solve_on<S: Shoe + Clone + Eq + Hash + Sync>(shoe: S, up_card: Card, rules: &
     }
 }
 
-/// How far either side of the player's current running count the count-index sweep reaches. The whole
-/// `2·RADIUS+1`-wide band is solved together, sharing one deconvolution across the layers (see
-/// [`CountShoe::band`]), so widening it costs only the cheap per-layer arithmetic — but each extra
-/// layer still re-runs the (mean-field) splits, so it is kept modest. Thresholds beyond the window are
-/// reported as open-ended.
-const INDEX_RADIUS: i16 = 6;
+/// Half-width of the external-running-count window the count index is computed over, centered on the
+/// system pivot (KO: `+4`). The window is count-*independent* — it does not depend on the player's
+/// current count — and is wide enough to contain the realistic deviation flips (which cluster near the
+/// pivot). Flips beyond it are reported open-ended (`≤`/`≥`). Root-finding keeps the *number of solves*
+/// small regardless of width (it bisects to the flip rather than sweeping), so a generous window is
+/// cheap; the whole band still shares one deconvolution (see [`CountShoe::band`]).
+const INDEX_HALF_WIDTH: i16 = 20;
 
-/// One up-card's optimal move per chart category across a swept band of external running counts — the
-/// raw material for the popup's count-index thresholds. `externals` is ascending; `headline[i]` is the
-/// column's per-category recommended move at running count `externals[i]`. Solved under exact-count
-/// (`==`) conditioning, the natural "what should I do when the count is exactly this" basis for an
-/// index, independent of the chart's own count comparison.
-#[derive(Clone)]
-struct CountBand {
-    externals: Vec<i16>,
-    headline: Vec<HashMap<HandCategory, Move>>,
+/// Max count-index columns solved concurrently in the background. Each is much heavier than a chart
+/// column (a handful of count-conditioned solves, splits and all), so this is kept well below the ten
+/// chart workers to avoid swamping the cores the in-column split parallelism already wants.
+const INDEX_FILL_CONCURRENCY: usize = 3;
+
+/// Chart `°` markers are only drawn for cells whose play actually shifts within a *notable* running
+/// count: roughly `|RC| ≤` this. A flip that only triggers at an extreme count (splitting tens vs 2 at
+/// RC ≈ +18, say) is suppressed on the chart — it is vanishingly rare in real play and acting on it
+/// would be conspicuous — but the full ladder is still shown in the popup. Stand-in for a future live
+/// "marker sensitivity" control; the popup is always exhaustive regardless.
+const INDEX_MARKER_MAX_RC: i16 = 4;
+
+/// Whether a move is only available as the opening action on a two-card hand (so it disappears once the
+/// hand has been hit). These are exactly the headline moves a [`CategoryIndex`] gives a *fallback*
+/// Hit/Stand ladder for: "surrender below RC −1" is incomplete without "…and once you can't surrender,
+/// stand at RC ≥ …".
+fn is_start_only(mv: Move) -> bool {
+    matches!(mv, Move::Double | Move::Split | Move::Surrender)
 }
 
-/// What a solved [`CountBand`] is cached/keyed under: the up-card, shoe, ruleset, and the band's
-/// center (the player's current external count). Indices are exact-count based, so the chart's count
-/// *comparison* is deliberately not part of the key.
-type IndexKey = (Card, ShoeChoice, Ruleset, i16);
-
-/// A finished count-index band, tagged with the key it was computed for so a stale one is ignored.
-struct IndexResult {
-    key: IndexKey,
-    band: CountBand,
+/// Whether an ascending `(move, lo, hi)` run list has a play change whose *flip point* — the running
+/// count at which the later move takes over, i.e. the `lo` of each run after the first — falls inside
+/// the inclusive window `[-max_abs_rc, max_abs_rc]`. Used by the chart marker to ignore flips that only
+/// happen at extreme counts.
+///
+/// This keys on the boundary, not on which moves are *visible* in the window: a Hit→Stand index at
+/// RC −4 fires even though its Hit leg lives entirely at RC ≤ −5 (outside the window). Counting
+/// distinct in-window moves missed exactly that case — one leg of an in-window flip can sit just
+/// outside it.
+fn flips_within(runs: &[(Move, i16, i16)], max_abs_rc: i16) -> bool {
+    runs.iter()
+        .skip(1)
+        .any(|&(_, lo, _)| lo.abs() <= max_abs_rc)
 }
 
-/// Solve one up-card's column across the external-count window `center ± INDEX_RADIUS`, sharing the
-/// deconvolution across the whole band ([`CountShoe::band`]): the first layer warms the shared
-/// draw-distribution cache, the rest read it. Returns each layer's per-category headline move.
-fn solve_count_band(n: u8, center: i16, up_card: Card, rules: &Ruleset) -> CountBand {
-    let mut externals: Vec<i16> = ((center - INDEX_RADIUS)..=(center + INDEX_RADIUS))
-        .map(|e| e.clamp(-60, 60))
-        .collect();
-    externals.dedup(); // clamping at the ±60 edges can collide; the range is ascending so dups adjoin.
-    let shoes = CountShoe::band::<Ko>(n, &externals, CountCmp::Eq, COUNT_PENETRATION);
-    let headline = shoes
-        .iter()
-        .map(|shoe| {
-            solve_on(shoe.clone(), up_card, rules)
-                .summary
-                .iter()
-                .map(|(&cat, ci)| (cat, ci.headline))
-                .collect()
-        })
-        .collect();
-    CountBand {
-        externals,
-        headline,
+/// One chart category's count-dependent move ladder over the index window, in ascending running-count
+/// order. `primary` is the headline move's `(move, lo, hi)` inclusive-RC runs (a single run ⇒ the move
+/// never changes ⇒ no count dependence). `fallback` is the Hit-vs-Stand ladder that applies once a
+/// start-only headline move is unavailable (a hand that has already been hit); it is populated only
+/// when `primary` actually contains a start-only move.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct CategoryIndex {
+    primary: Vec<(Move, i16, i16)>,
+    fallback: Vec<(Move, i16, i16)>,
+}
+
+impl CategoryIndex {
+    /// The cell's right play genuinely shifts with the running count within a *notable* window
+    /// `|RC| ≤ max_abs_rc` — what the chart `°` marker keys on: either the headline flips or there is a
+    /// Hit/Stand flip behind a start-only headline move, somewhere in the window. A ladder that is
+    /// constant across the window (its only flips are at extreme, practically-unreachable counts) is
+    /// treated as not count-dependent *for display*; the popup still renders the whole ladder.
+    fn count_dependent_within(&self, max_abs_rc: i16) -> bool {
+        flips_within(&self.primary, max_abs_rc) || flips_within(&self.fallback, max_abs_rc)
+    }
+
+    /// The distinct start-only moves the primary ladder recommends somewhere (so the popup can label the
+    /// fallback "if can't surrender" etc.).
+    fn start_only_moves(&self) -> Vec<Move> {
+        let mut out: Vec<Move> = Vec::new();
+        for &(mv, _, _) in &self.primary {
+            if is_start_only(mv) && !out.contains(&mv) {
+                out.push(mv);
+            }
+        }
+        out
     }
 }
 
-/// The count-index runs for `cat` read off a solved band: consecutive `(move, lo, hi)` inclusive
-/// running-count ranges over which that move is optimal, in ascending count order. A single run means
-/// the move never changes across the window (no index to show); multiple runs are the flip points.
-fn category_indices(band: &CountBand, cat: HandCategory) -> Vec<(Move, i16, i16)> {
-    let mut runs: Vec<(Move, i16, i16)> = Vec::new();
-    for (i, &ext) in band.externals.iter().enumerate() {
-        let Some(&mv) = band.headline[i].get(&cat) else {
+/// One up-card column's full count-index report: each chart category's [`CategoryIndex`] over the
+/// shared usable window `[lo, hi]` (the positive-mass external-count range). Count-*independent* — the
+/// player's current count only picks where they sit on the ladder — so it is cached per
+/// `(up-card, shoe, ruleset)` and overlaid on the base chart. Filled incrementally: Hard/Soft (no split
+/// solves) arrive first with `complete = false`, then Pairs complete it, so `cats` may be partial.
+#[derive(Clone, Serialize, Deserialize)]
+struct IndexReport {
+    lo: i16,
+    hi: i16,
+    cats: HashMap<HandCategory, CategoryIndex>,
+    complete: bool,
+}
+
+/// What an [`IndexReport`] is cached/keyed under. Deliberately *without* the player's count (the report
+/// is count-independent) and without the chart's count comparison (the index is always exact-count
+/// based).
+type IndexKey = (Card, ShoeChoice, Ruleset);
+
+/// A finished (or partial) count-index report, tagged with the index epoch it was computed under so a
+/// stale one (the shoe or ruleset changed) is dropped on arrival.
+struct IndexResult {
+    epoch: u64,
+    key: IndexKey,
+    report: IndexReport,
+}
+
+/// Build the `(move, lo, hi)` runs of `move_fn` over the integer running-count window `[lo, hi]` using
+/// monotone root-finding: seed a few points, then bisect every adjacent pair whose move differs down to
+/// integer adjacency, pinning each flip exactly. The per-move EV differences are monotone in the count,
+/// so a flipped pair brackets a single crossing (the recursion still splits both halves, so an
+/// intermediate move is handled too); same-move endpoints are taken as constant between them. Far
+/// cheaper than sweeping every count — `O(log width)` evaluations per flip — which is the point, since
+/// each evaluation is a full count-conditioned solve. The first/last runs are stretched to the window
+/// edges so [`fmt_rc_range`] reads them as open-ended.
+fn coalesce_runs(
+    lo: i16,
+    hi: i16,
+    mut move_fn: impl FnMut(i16) -> Option<Move>,
+) -> Vec<(Move, i16, i16)> {
+    let mut samples: BTreeMap<i16, Move> = BTreeMap::new();
+    for s in seed_points(lo, hi) {
+        if let Some(mv) = move_fn(s) {
+            samples.insert(s, mv);
+        }
+    }
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let mut stack: Vec<(i16, i16)> = samples
+        .keys()
+        .copied()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .collect();
+    while let Some((a, b)) = stack.pop() {
+        if b - a <= 1 || samples[&a] == samples[&b] {
             continue;
-        };
+        }
+        let m = a + (b - a) / 2;
+        if let std::collections::btree_map::Entry::Vacant(e) = samples.entry(m) {
+            match move_fn(m) {
+                Some(mv) => {
+                    e.insert(mv);
+                }
+                None => continue,
+            }
+        }
+        stack.push((a, m));
+        stack.push((m, b));
+    }
+    let mut runs: Vec<(Move, i16, i16)> = Vec::new();
+    for (&ext, &mv) in &samples {
         match runs.last_mut() {
-            Some((m, _lo, hi)) if *m == mv => *hi = ext,
+            Some((m, _lo, h)) if *m == mv => *h = ext,
             _ => runs.push((mv, ext, ext)),
         }
     }
+    if let Some(first) = runs.first_mut() {
+        first.1 = lo;
+    }
+    if let Some(last) = runs.last_mut() {
+        last.2 = hi;
+    }
     runs
+}
+
+/// Initial running counts to evaluate before bisection: the two ends plus a few interior anchors. More
+/// than the bare ends so a hidden interior segment (a non-monotone argmax flip) has to dodge several
+/// anchored points to be missed; cheap because every category and ladder shares the evaluations.
+fn seed_points(lo: i16, hi: i16) -> Vec<i16> {
+    if hi <= lo {
+        return vec![lo];
+    }
+    let span = hi - lo;
+    if span <= 4 {
+        return (lo..=hi).collect();
+    }
+    let mut v: Vec<i16> = (0..=4).map(|k| lo + (span * k) / 4).collect();
+    v.dedup();
+    v
+}
+
+/// Which move ladder a [`coalesce_runs`] pass reads off each solved column.
+#[derive(Clone, Copy)]
+enum Ladder {
+    /// The cell's headline move (argmax over every legal two-card move).
+    Primary,
+    /// Hit vs Stand only — the fallback once a start-only move is off the table.
+    HitStand,
+}
+
+/// A column's count-index evaluator: the windowed band of count-conditioned shoes (one per integer
+/// external count, all sharing one deconvolution — see [`CountShoe::band`]) plus a memo of the per-count
+/// solved [`Column`]s. Each count is solved (the expensive [`solve_on`]) at most once and only when the
+/// root-finder reaches for it; all categories and both the primary and fallback ladders share the memo.
+struct ColumnEval {
+    up: Card,
+    rules: Ruleset,
+    /// Usable (positive-mass) external counts, ascending; aligned with `shoes`.
+    externals: Vec<i16>,
+    shoes: Vec<CountShoe>,
+    memo: HashMap<i16, Column>,
+}
+
+impl ColumnEval {
+    /// Build the band over the pivot-centered window and drop the counts whose exact condition has no
+    /// mass (unreachable under the penetration prior — a zero draw distribution would make `solve_on`
+    /// meaningless). The reachable set is contiguous. `None` if nothing in the window is reachable.
+    fn new(n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
+        let pivot = Ko::pivot(n);
+        let window: Vec<i16> = (pivot - INDEX_HALF_WIDTH..=pivot + INDEX_HALF_WIDTH).collect();
+        let shoes = CountShoe::band::<Ko>(n, &window, CountCmp::Eq, COUNT_PENETRATION);
+        let mut externals = Vec::new();
+        let mut usable = Vec::new();
+        for (&e, shoe) in window.iter().zip(shoes) {
+            // A reachable exact-count shoe's draw distribution sums to 1; an unreachable one is all-zero.
+            let mass: f64 = shoe.all_draw_probs().map(|(_, p)| p).sum();
+            if mass > 0.5 {
+                externals.push(e);
+                usable.push(shoe);
+            }
+        }
+        if externals.is_empty() {
+            return None;
+        }
+        Some(Self {
+            up,
+            rules: *rules,
+            externals,
+            shoes: usable,
+            memo: HashMap::new(),
+        })
+    }
+
+    fn lo(&self) -> i16 {
+        self.externals[0]
+    }
+
+    fn hi(&self) -> i16 {
+        self.externals[self.externals.len() - 1]
+    }
+
+    /// Solve (memoized) the column at external count `ext`. `ext` must be a usable count.
+    fn column(&mut self, ext: i16) -> &Column {
+        if !self.memo.contains_key(&ext) {
+            let idx = self.externals.iter().position(|&e| e == ext).unwrap();
+            let col = solve_on(self.shoes[idx].clone(), self.up, &self.rules);
+            self.memo.insert(ext, col);
+        }
+        &self.memo[&ext]
+    }
+
+    /// The move `ladder` recommends for `cat` at external count `ext`, or `None` if the category is
+    /// absent (e.g. no Hit/Stand EVs to compare for the fallback).
+    fn move_at(&mut self, ext: i16, cat: HandCategory, ladder: Ladder) -> Option<Move> {
+        let ci = self.column(ext).summary.get(&cat)?;
+        match ladder {
+            Ladder::Primary => Some(ci.headline),
+            Ladder::HitStand => {
+                let h = ci.move_evs.get(&Move::Hit).copied();
+                let s = ci.move_evs.get(&Move::Stand).copied();
+                match (h, s) {
+                    (Some(h), Some(s)) => Some(if h >= s { Move::Hit } else { Move::Stand }),
+                    (Some(_), None) => Some(Move::Hit),
+                    (None, Some(_)) => Some(Move::Stand),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
+
+    fn runs(&mut self, cat: HandCategory, ladder: Ladder) -> Vec<(Move, i16, i16)> {
+        let (lo, hi) = (self.lo(), self.hi());
+        coalesce_runs(lo, hi, |ext| self.move_at(ext, cat, ladder))
+    }
+
+    /// The full count-index ladder for one category: the headline runs, plus the Hit/Stand fallback
+    /// runs whenever the headline ever recommends a start-only move.
+    fn category_index(&mut self, cat: HandCategory) -> CategoryIndex {
+        let primary = self.runs(cat, Ladder::Primary);
+        let fallback = if primary.iter().any(|&(m, _, _)| is_start_only(m)) {
+            self.runs(cat, Ladder::HitStand)
+        } else {
+            Vec::new()
+        };
+        CategoryIndex { primary, fallback }
+    }
+}
+
+/// The chart's categories split into the cheap (Hard/Soft — no split solves) and the expensive (Pairs)
+/// halves, so a background index worker can stream the cheap markers first.
+fn index_categories() -> (Vec<HandCategory>, Vec<HandCategory>) {
+    let mut light = Vec::new();
+    let mut pairs = Vec::new();
+    for pane in PANES {
+        for (cat, _) in pane.rows() {
+            match cat {
+                HandCategory::Pair(_) => pairs.push(cat),
+                _ => light.push(cat),
+            }
+        }
+    }
+    (light, pairs)
+}
+
+/// Compute one up-card column's count-index report and stream it: the Hard/Soft markers first (a
+/// partial report), then the Pairs, completing it. Tagged with `epoch` so a stale basis is dropped.
+fn compute_index_report(
+    n: u8,
+    key: IndexKey,
+    rules: &Ruleset,
+    epoch: u64,
+    tx: &Sender<IndexResult>,
+) {
+    // Disk cache hit: a count-index report is fully determined by its key, so a persisted complete one
+    // is reused wholesale — skipping the whole root-finder and its many count-conditioned solves (the
+    // dominant cost of the background fill).
+    if let Some(report) = diskcache::load::<_, IndexReport>("index", &key)
+        && report.complete
+    {
+        let _ = tx.send(IndexResult { epoch, key, report });
+        return;
+    }
+    let up = key.0;
+    let Some(mut eval) = ColumnEval::new(n, up, rules) else {
+        return;
+    };
+    let (light, pairs) = index_categories();
+    let mut report = IndexReport {
+        lo: eval.lo(),
+        hi: eval.hi(),
+        cats: HashMap::new(),
+        complete: false,
+    };
+    for cat in light {
+        let ci = eval.category_index(cat);
+        report.cats.insert(cat, ci);
+    }
+    if tx
+        .send(IndexResult {
+            epoch,
+            key,
+            report: report.clone(),
+        })
+        .is_err()
+    {
+        return; // receiver gone (app exiting)
+    }
+    for cat in pairs {
+        let ci = eval.category_index(cat);
+        report.cats.insert(cat, ci);
+    }
+    report.complete = true;
+    diskcache::store("index", &key, &report);
+    let _ = tx.send(IndexResult { epoch, key, report });
 }
 
 /// Deck options the rules modal cycles through.
@@ -238,7 +537,7 @@ type ColumnSummary = HashMap<HandCategory, CellInfo>;
 
 /// Everything a finished up-card column carries: the chart summary, the up-card's draw probability,
 /// and its two-card-root edge contribution. Cached whole per `(shoe, ruleset)`.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Column {
     /// Per-category [`CellInfo`], consolidated by the game-time reaching weight (see [`solve_on`]).
     summary: ColumnSummary,
@@ -360,11 +659,16 @@ struct App {
     count_snapshot: (bool, CountSetting),
     tx: Sender<ColumnResult>,
     rx: Receiver<ColumnResult>,
-    /// Solved count-index bands, keyed by [`IndexKey`], so revisiting a popup cell is instant.
-    index_cache: HashMap<IndexKey, CountBand>,
-    /// The band currently being solved in the background (one at a time), so a popup that is open over
-    /// a count-conditioned cell doesn't respawn the same sweep every tick.
-    index_pending: Option<IndexKey>,
+    /// Solved count-index reports, keyed by [`IndexKey`] (count-independent), so they survive count
+    /// changes and are reused across the chart marker and the popup.
+    index_cache: HashMap<IndexKey, IndexReport>,
+    /// Columns whose index report is being solved in the background, so the scheduler doesn't respawn a
+    /// column already in flight. Cleared per key when its *complete* report lands.
+    index_pending: HashSet<IndexKey>,
+    /// The `(shoe, rules)` the cached index reports are for; a change invalidates them (counts don't).
+    index_basis: Option<(ShoeChoice, Ruleset)>,
+    /// Bumped when `index_basis` changes, stamped on background reports so stale ones are dropped.
+    index_epoch: u64,
     index_tx: Sender<IndexResult>,
     index_rx: Receiver<IndexResult>,
 }
@@ -399,7 +703,9 @@ impl App {
             tx,
             rx,
             index_cache: HashMap::new(),
-            index_pending: None,
+            index_pending: HashSet::new(),
+            index_basis: None,
+            index_epoch: 0,
             index_tx,
             index_rx,
         }
@@ -420,9 +726,15 @@ impl App {
     fn recompute(&mut self) {
         self.epoch += 1;
         self.epoch_key = (self.shoe, self.rules, self.effective_count());
-        // Count-index bands are keyed by the old shoe/rules, so they are stale now. A band still in
-        // flight will land and be cached under its (now irrelevant) key and simply never be read.
-        self.index_cache.clear();
+        // Count-index reports are count-*independent*, so only a shoe/rules change invalidates them
+        // (a count tweak keeps them). Bumping `index_epoch` drops any in-flight worker for the old basis.
+        let basis = (self.shoe, self.rules);
+        if self.index_basis != Some(basis) {
+            self.index_basis = Some(basis);
+            self.index_epoch += 1;
+            self.index_cache.clear();
+            self.index_pending.clear();
+        }
         // Cache hit: restore all ten columns at once, no workers (so nothing arrives for this epoch).
         if let Some(cached) = self.cache.get(&self.epoch_key) {
             self.columns = std::array::from_fn(|i| Some(cached[i].clone()));
@@ -465,52 +777,73 @@ impl App {
         }
     }
 
-    /// The [`IndexKey`] for the popup's current selection, or `None` when count indices don't apply
-    /// (counting off, or an infinite deck, which has no count). The band centers on the player's
-    /// current external count.
-    fn index_key(&self) -> Option<IndexKey> {
+    /// The [`IndexKey`] for an up-card on the current basis, or `None` on the infinite deck (which has
+    /// no count, so no index). Independent of the player's count and of whether counting is toggled on —
+    /// the index is shown on the base chart either way.
+    fn index_key(&self, up: Card) -> Option<IndexKey> {
         match self.shoe {
-            ShoeChoice::Decks(_) if self.count_on => {
-                let (_, up) = self.selection();
-                Some((up, self.shoe, self.rules, self.count.external))
-            }
-            _ => None,
+            ShoeChoice::Decks(_) => Some((up, self.shoe, self.rules)),
+            ShoeChoice::Infinite => None,
         }
     }
 
-    /// While a popup is open over a count-conditioned cell, ensure its column's count-index band is
-    /// solving (or already solved). One sweep runs at a time in the background; the popup renders
-    /// "computing…" until it lands. A no-op when indices don't apply or the band is already cached/in
-    /// flight for this exact selection.
-    fn ensure_index(&mut self) {
-        let Some(key) = self.index_key() else { return };
-        if self.index_cache.contains_key(&key) || self.index_pending.as_ref() == Some(&key) {
+    /// Background-fill the count-index reports for every up-card, up to [`INDEX_FILL_CONCURRENCY`] at a
+    /// time. Deferred until the base chart finishes so the markers fill in *after* the chart is up
+    /// rather than competing with it. Skips columns already complete or in flight; a worker streams its
+    /// Hard/Soft markers first, then completes with Pairs (see [`compute_index_report`]).
+    fn schedule_index_fill(&mut self) {
+        let ShoeChoice::Decks(n) = self.shoe else {
+            return;
+        };
+        if !self.columns.iter().all(Option::is_some) {
             return;
         }
-        let ShoeChoice::Decks(n) = key.1 else { return };
-        self.index_pending = Some(key);
-        let tx = self.index_tx.clone();
-        let (up, _, rules, center) = key;
-        thread::spawn(move || {
-            let band = solve_count_band(n, center, up, &rules);
-            let _ = tx.send(IndexResult { key, band });
-        });
-    }
-
-    /// Drain any finished count-index bands into the cache, clearing the in-flight marker when the one
-    /// being awaited arrives.
-    fn drain_index_results(&mut self) {
-        while let Ok(res) = self.index_rx.try_recv() {
-            if self.index_pending.as_ref() == Some(&res.key) {
-                self.index_pending = None;
+        for &col in &SOLVE_ORDER {
+            if self.index_pending.len() >= INDEX_FILL_CONCURRENCY {
+                break;
             }
-            self.index_cache.insert(res.key, res.band);
+            let up = UP_CARDS[col];
+            let key = (up, self.shoe, self.rules);
+            let done = self.index_cache.get(&key).is_some_and(|r| r.complete);
+            if done || self.index_pending.contains(&key) {
+                continue;
+            }
+            self.index_pending.insert(key);
+            let tx = self.index_tx.clone();
+            let rules = self.rules;
+            let epoch = self.index_epoch;
+            thread::spawn(move || compute_index_report(n, key, &rules, epoch, &tx));
         }
     }
 
-    /// The solved count-index band for the popup's current selection, if it has finished.
-    fn selected_index_band(&self) -> Option<&CountBand> {
-        self.index_cache.get(&self.index_key()?)
+    /// Drain finished (or partial) count-index reports into the cache, dropping any from a superseded
+    /// basis and clearing the in-flight marker once a column's *complete* report lands.
+    fn drain_index_results(&mut self) {
+        while let Ok(res) = self.index_rx.try_recv() {
+            if res.epoch != self.index_epoch {
+                continue;
+            }
+            if res.report.complete {
+                self.index_pending.remove(&res.key);
+            }
+            self.index_cache.insert(res.key, res.report);
+        }
+    }
+
+    /// The count-index report for the popup's current selection, if its column has been solved.
+    fn selected_index_report(&self) -> Option<&IndexReport> {
+        let (_, up) = self.selection();
+        self.index_cache.get(&self.index_key(up)?)
+    }
+
+    /// Whether `cat` vs `up` is a count-dependent cell whose report has already been computed and whose
+    /// flips fall within the notable [`INDEX_MARKER_MAX_RC`] window — the cue for the chart's `°` marker.
+    /// (Extreme-count-only flips are suppressed here but still shown in the popup.)
+    fn index_dependent(&self, cat: HandCategory, up: Card) -> bool {
+        self.index_key(up)
+            .and_then(|key| self.index_cache.get(&key))
+            .and_then(|report| report.cats.get(&cat))
+            .is_some_and(|ci| ci.count_dependent_within(INDEX_MARKER_MAX_RC))
     }
 
     fn active_pane(&self) -> Pane {
@@ -818,18 +1151,23 @@ impl App {
         for (r, (cat, label)) in pane.rows().into_iter().enumerate() {
             let mut spans: Vec<Span> =
                 vec![Span::raw(format!("{label:>width$} ", width = LBL - 1))];
-            for c in 0..UP_CARDS.len() {
-                let (text, mut style) = match &self.columns[c] {
+            for (i_c, &upcard) in UP_CARDS.iter().enumerate() {
+                let (text, mut style) = match &self.columns[i_c] {
                     None => ("\u{00b7}".to_string(), Style::default().fg(Color::DarkGray)),
                     Some(col) => match col.summary.get(&cat) {
                         Some(cell) => {
-                            // The headline move, asterisked when the right play genuinely varies by
-                            // composition. The letter sits in the middle column either way (a bare
-                            // letter centers to " H "); the leading space on the starred form keeps
-                            // it there and lets the `*` merely append: " H*".
+                            // The headline move, with a one-char suffix in the 3-wide cell: `*` when the
+                            // play varies by composition at this count (takes priority — a composition-
+                            // dependent cell has two near-tied EVs, so it is essentially always count-
+                            // dependent too, and `*` is the stronger signal), else `°` when the play flips
+                            // with the running count in the notable window. The popup carries both. The
+                            // leading space keeps the letter centered (" H*" / " H°"); a bare letter
+                            // centers to " H " on its own.
                             let mv = cell.headline;
                             let text = if cell.composition_dependent {
                                 format!(" {mv}*")
+                            } else if self.index_dependent(cat, upcard) {
+                                format!(" {mv}\u{00b0}")
                             } else {
                                 format!("{mv}")
                             };
@@ -838,7 +1176,7 @@ impl App {
                         None => (" ".to_string(), Style::default()),
                     },
                 };
-                if active && r == self.cursor.row && c == self.cursor.col {
+                if active && r == self.cursor.row && i_c == self.cursor.col {
                     style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 }
                 spans.push(Span::styled(format!("{text:^3}"), style));
@@ -893,8 +1231,7 @@ impl App {
             yn(r.peek.peeks()),
             r.max_split_hands,
         );
-        let keys =
-            "hjkl move \u{00b7} Enter EVs \u{00b7} r rules \u{00b7} c count \u{00b7} q quit";
+        let keys = "hjkl move \u{00b7} Enter EVs \u{00b7} r rules \u{00b7} c count \u{00b7} q quit";
 
         let lines = vec![
             Line::from(vec![Span::styled(status, Style::default().fg(Color::Cyan))]),
@@ -938,11 +1275,7 @@ impl App {
                 // game-time probability. Only worth showing when more than one move wins somewhere.
                 if cell.breakdown.len() > 1 {
                     lines.push(Line::from(Span::styled(
-                        format!(
-                            " {:─^w$}",
-                            " by hand (game-time order) ",
-                            w = width as usize - 3
-                        ),
+                        format!(" {:─^w$}", " by hand ", w = width as usize - 3),
                         Style::default().fg(Color::DarkGray),
                     )));
                     // Budget: inner width minus the "  X  " move-letter prefix.
@@ -970,43 +1303,54 @@ impl App {
                 }
             }
         }
-        // Count-index thresholds: how the recommended move shifts with the running count. Only shown
-        // when a count is imposed; the band solves in the background (see `ensure_index`).
-        if self.index_key().is_some() {
+        // Count-index thresholds: the running counts at which the recommended play flips. A
+        // count-*independent* property of the cell, shown on any finite shoe (with or without a count
+        // imposed); background-filled (see `schedule_index_fill`). Layered: the headline ladder first,
+        // then — once the headline is a start-only move (surrender/double/split) — the Hit/Stand
+        // fallback for a hand that has already been hit and so can no longer take it.
+        if self.index_key(up).is_some() {
             lines.push(Line::from(Span::styled(
-                format!(" {:─^w$}", " count index (exact RC) ", w = width as usize - 3),
+                format!(
+                    " {:─^w$}",
+                    " count index (exact RC) ",
+                    w = width as usize - 3
+                ),
                 Style::default().fg(Color::DarkGray),
             )));
-            match self.selected_index_band() {
+            // The player's current running count, so their active run can be highlighted.
+            let here = self.count_on.then_some(self.count.external);
+            match self.selected_index_report() {
                 None => lines.push(Line::from(Span::styled(
                     "  computing\u{2026}",
                     Style::default().fg(Color::DarkGray),
                 ))),
-                Some(band) => {
-                    let runs = category_indices(band, cat);
-                    let wmin = band.externals.first().copied().unwrap_or(0);
-                    let wmax = band.externals.last().copied().unwrap_or(0);
-                    if runs.is_empty() {
-                        lines.push(Line::from(Span::styled(
-                            "  (no count-consistent hand in window)",
-                            Style::default().fg(Color::DarkGray),
-                        )));
+                Some(report) => match report.cats.get(&cat) {
+                    None => lines.push(Line::from(Span::styled(
+                        "  computing\u{2026}",
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                    Some(ci) => {
+                        let (wmin, wmax) = (report.lo, report.hi);
+                        for &(mv, lo, hi) in &ci.primary {
+                            lines.push(rc_run_line(mv, lo, hi, wmin, wmax, here, 2));
+                        }
+                        if !ci.fallback.is_empty() {
+                            let label = match ci.start_only_moves().as_slice() {
+                                [only] => {
+                                    format!("  if can't {}:", move_name(*only).to_lowercase())
+                                }
+                                _ => "  if start move unavailable:".to_string(),
+                            };
+                            lines.push(Line::from(Span::styled(
+                                label,
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                            for &(mv, lo, hi) in &ci.fallback {
+                                lines.push(rc_run_line(mv, lo, hi, wmin, wmax, here, 4));
+                            }
+                        }
                     }
-                    for (mv, lo, hi) in runs {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("  {mv}  "),
-                                Style::default()
-                                    .fg(move_color(mv))
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                fmt_rc_range(lo, hi, wmin, wmax),
-                                Style::default().fg(Color::Gray),
-                            ),
-                        ]));
-                    }
-                }
+                },
             }
         }
         lines.push(Line::from(""));
@@ -1053,7 +1397,7 @@ impl App {
             Style::default().fg(Color::DarkGray),
         )));
 
-        let width = 34u16;
+        let width = 34;
         let height = lines.len() as u16 + 2;
         let area = centered_rect(width, height, f.area());
         let block = Block::default()
@@ -1100,7 +1444,7 @@ impl App {
             Style::default().fg(Color::DarkGray),
         )));
 
-        let width = 40u16;
+        let width = 40;
         let height = lines.len() as u16 + 2;
         let area = centered_rect(width, height, f.area());
         let block = Block::default()
@@ -1115,10 +1459,8 @@ impl App {
         loop {
             self.drain_results();
             self.drain_index_results();
-            // Only solve count-index bands while a popup is actually open over a counted cell.
-            if self.mode == Mode::Popup {
-                self.ensure_index();
-            }
+            // Background-fill every cell's count index once the base chart is up (finite shoe only).
+            self.schedule_index_fill();
             terminal.draw(|f| self.render(f))?;
             // Poll with a timeout so the chart keeps filling in as workers finish, even with no input.
             if event::poll(Duration::from_millis(100))?
@@ -1162,6 +1504,40 @@ fn compact_hand_label(hand: &CardCol) -> String {
         }
     }
     parts.concat()
+}
+
+/// One count-index run rendered as a popup line: the move letter (indented `indent` columns) and its
+/// running-count range. The run the player currently sits on (`here`, their external count, set only
+/// when a count is imposed) is bolded and flagged with a `›`.
+fn rc_run_line(
+    mv: Move,
+    lo: i16,
+    hi: i16,
+    wmin: i16,
+    wmax: i16,
+    here: Option<i16>,
+    indent: usize,
+) -> Line<'static> {
+    let active = here.is_some_and(|e| lo <= e && e <= hi);
+    let emph = if active {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
+    };
+    let marker = if active { "\u{203a}" } else { " " };
+    let pad = " ".repeat(indent.saturating_sub(1));
+    Line::from(vec![
+        Span::styled(
+            format!("{pad}{marker}{mv}  "),
+            Style::default().fg(move_color(mv)).add_modifier(emph),
+        ),
+        Span::styled(
+            fmt_rc_range(lo, hi, wmin, wmax),
+            Style::default()
+                .fg(if active { Color::White } else { Color::Gray })
+                .add_modifier(emph),
+        ),
+    ])
 }
 
 /// A count-index run's running-count range as a counter-friendly threshold, given the swept window
@@ -1258,28 +1634,105 @@ pub fn run() -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// End-to-end count-index smoke test on the full TUI band path (`solve_count_band` →
-    /// `category_indices`). Pins the qualitative KO deviation for the canonical 16 vs Ten: the band's
-    /// externals come back ascending, and the recommended move flips *with the count in the right
-    /// direction* — Hit at the bottom of the window (deck rich in low cards, hitting stiff 16 is safe),
-    /// giving way to a non-Hit (surrender/stand) as the count climbs and the deck richens in tens.
-    /// `#[ignore]` because a full count-conditioned column band is seconds of work (the heavy count
-    /// tests all are). Run with `--release --ignored`.
+    /// The root-finder on a synthetic monotone curve: Hit below 0, Stand at/above, over `[-20, 20]`.
+    /// It must return exactly two runs with the flip pinned to the integer boundary (Hit ends at −1,
+    /// Stand starts at 0), and stretch the ends to the window edges. Fast (no solving), so not ignored.
+    #[test]
+    fn coalesce_runs_finds_exact_flip() {
+        let runs = coalesce_runs(-20, 20, |rc| {
+            Some(if rc < 0 { Move::Hit } else { Move::Stand })
+        });
+        assert_eq!(runs, vec![(Move::Hit, -20, -1), (Move::Stand, 0, 20)]);
+    }
+
+    /// A constant move over the window collapses to a single run (no count dependence).
+    #[test]
+    fn coalesce_runs_constant_is_single_run() {
+        let runs = coalesce_runs(-20, 20, |_| Some(Move::Stand));
+        assert_eq!(runs, vec![(Move::Stand, -20, 20)]);
+    }
+
+    /// The root-finder pins two flips of a three-segment ladder (Hit / Stand / Hit) to their exact
+    /// integer boundaries — the interior segment is found despite both ends being Hit, thanks to the
+    /// interior seed anchors.
+    #[test]
+    fn coalesce_runs_three_segments() {
+        let runs = coalesce_runs(-20, 20, |rc| {
+            Some(if (-5..5).contains(&rc) {
+                Move::Stand
+            } else {
+                Move::Hit
+            })
+        });
+        assert_eq!(
+            runs,
+            vec![
+                (Move::Hit, -20, -6),
+                (Move::Stand, -5, 4),
+                (Move::Hit, 5, 20),
+            ]
+        );
+    }
+
+    /// End-to-end count-index regression on the full count-conditioned solve. Pins the canonical KO
+    /// deviation for 16 vs Ten (single deck): the primary ladder flips *with the count in the right
+    /// direction* — Hit at low counts (deck rich in low cards, hitting stiff 16 is safe) giving way to a
+    /// non-Hit (surrender/stand) as the count climbs and the deck richens in tens — and, since the
+    /// non-Hit headline is surrender (a start-only move), a Hit/Stand fallback ladder is built behind
+    /// it. `#[ignore]` because a count-conditioned column is seconds of work; run `--release --ignored`.
     #[test]
     #[ignore]
     fn count_index_16_vs_ten_flips_with_count() {
-        let band = solve_count_band(1, 0, Card::Ten, &Ruleset::default());
-        assert!(band.externals.windows(2).all(|w| w[0] < w[1]));
-        let runs = category_indices(&band, HandCategory::Hard(16));
+        let mut eval = ColumnEval::new(1, Card::Ten, &Ruleset::default()).expect("usable window");
+        let ci = eval.category_index(HandCategory::Hard(16));
         assert!(
-            runs.len() >= 2,
-            "expected a count deviation for 16 vs T, got {runs:?}"
+            ci.primary.len() >= 2,
+            "expected a count deviation for 16 vs T, got {:?}",
+            ci.primary
         );
-        assert_eq!(runs.first().unwrap().0, Move::Hit, "low count should Hit");
+        assert_eq!(
+            ci.primary.first().unwrap().0,
+            Move::Hit,
+            "low count should Hit"
+        );
         assert_ne!(
-            runs.last().unwrap().0,
+            ci.primary.last().unwrap().0,
             Move::Hit,
             "high count should deviate off Hit"
+        );
+        if ci.primary.iter().any(|&(m, _, _)| is_start_only(m)) {
+            assert!(
+                !ci.fallback.is_empty(),
+                "a start-only headline move needs a Hit/Stand fallback ladder"
+            );
+        }
+    }
+
+    /// The bug this redesign fixes: at Hard 12 vs 3 (4 decks) the play flips Hit→Stand near RC −3, but
+    /// the old window (centered on the player's +4 count) reported "stand at any RC", contradicting the
+    /// no-count base table (Hit). The count-independent report must show both runs with the boundary in
+    /// the right place. `#[ignore]` (count-conditioned solve); run `--release --ignored`.
+    #[test]
+    #[ignore]
+    fn count_index_12_vs_3_flips_near_neg3() {
+        let mut eval =
+            ColumnEval::new(4, Card::Pip(3), &Ruleset::default()).expect("usable window");
+        let ci = eval.category_index(HandCategory::Hard(12));
+        assert!(
+            ci.primary.len() >= 2,
+            "expected a Hit→Stand flip for 12 vs 3, got {:?}",
+            ci.primary
+        );
+        assert_eq!(ci.primary.first().unwrap().0, Move::Hit, "low count Hits");
+        assert_eq!(
+            ci.primary.last().unwrap().0,
+            Move::Stand,
+            "high count Stands"
+        );
+        let boundary = ci.primary.first().unwrap().2; // last RC at which Hit is still best
+        assert!(
+            (-7..=0).contains(&boundary),
+            "Hit→Stand boundary should sit near RC −3, got Hit up to {boundary}"
         );
     }
 }

@@ -4,7 +4,10 @@
 //! EV engine lives in [`crate::simulation`]; this is the abstract layer the charts are built over.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fmt::Display;
+
+use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
 use crate::shoe::CardCol;
@@ -18,7 +21,7 @@ pub(crate) enum HandState {
 }
 
 impl Display for HandState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HandState::Bust => write!(f, "Bust"),
             HandState::Soft(n) => write!(f, "S{}", n),
@@ -50,7 +53,7 @@ impl From<&CardCol> for HandState {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum Move {
     Hit,
     Stand,
@@ -74,7 +77,7 @@ pub(crate) fn best_move(move_ev: &HashMap<Move, f64>) -> Move {
 // and DoubleStand (to double if allowed, but Hit/Stand otherwise).
 
 impl Display for Move {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Move::Hit => write!(f, "H"),
             Move::Stand => write!(f, "S"),
@@ -92,7 +95,7 @@ impl Display for Move {
 /// pooled into the corresponding total. `A,A` is `Pair(Ace)` and `T,T` is `Pair(Ten)` — neither
 /// falls through to `Soft`/`Hard`/`Natural`. Hard and soft categories still pool every composition
 /// (and size) of that total, which is where composition-dependent strategy is averaged out.
-#[derive(PartialEq, Eq, Debug, Hash, PartialOrd, Ord, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Hash, PartialOrd, Ord, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum HandCategory {
     Hard(u8),
     Soft(u8),
@@ -101,7 +104,7 @@ pub(crate) enum HandCategory {
 }
 
 impl Display for HandCategory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HandCategory::Hard(n) => write!(f, "H{}", n),
             HandCategory::Soft(n) => write!(f, "S{}", n),

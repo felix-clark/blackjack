@@ -34,6 +34,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::card::Card;
 use crate::hand::{HandCategory, Move, best_move, categorize, pair_rank};
 use crate::rules::Ruleset;
@@ -283,7 +285,7 @@ const PREF_MARGIN: f64 = 1e-6;
 /// compared only against the `Hit`/`Stand` EVs of the hands that can actually take it. This fixes the
 /// apples-to-oranges argmax where an all-sizes `Hit` EV (dragged down by multi-card hands that can't
 /// surrender) was compared against a two-card-only `Surrender` EV.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct CellInfo {
     /// Per-move EVs over the decision population, reach-weighted. Internally consistent with
     /// `headline` (its argmax *is* `headline`), so the popup's per-move list and the starred move agree.

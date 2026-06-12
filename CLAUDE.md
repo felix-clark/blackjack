@@ -11,7 +11,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Format: `cargo fmt`
 - Tests: `cargo test` (regression `#[test]`s pin verified EVs/strategy cells in `src/simulation.rs` and `src/split.rs`; some compute functions also self-check with `assert!`)
 
-This is edition 2024 Rust. The **only external dependency is `ratatui`** (the TUI), and it is confined to `src/tui.rs`; the solver engine and all other modules remain standard-library-only.
+This is edition 2024 Rust. External dependencies are kept deliberately few: `ratatui` (the TUI, confined to `src/tui.rs`), and `serde` + `bincode` (used only by `src/diskcache.rs` for on-disk persistence; the cached types `derive` the serde traits, but the solver engine itself stays standard-library-only in spirit). `itertools` is also present. The solver engine and all non-TUI/non-cache modules remain standard-library-only.
+
+**Disk cache invalidation — read before changing the solver math.** `src/diskcache.rs` persists solved `Column`s and `IndexReport`s to `$XDG_CACHE_HOME/blackjack/v{SCHEMA_VERSION}/` keyed by `(up-card, shoe, ruleset[, count])`. The key captures the *inputs* (including the full `Ruleset`, split precision and all) but **not** the solver algorithm itself: if you change anything that alters computed EVs/strategy without changing those input types — a bug fix, a precision change, a payoff tweak — a stale cached value will be served silently. **Bump `SCHEMA_VERSION` in `src/diskcache.rs` whenever a cached type's layout *or* the EV computation changes** (it lives in the path, so a bump transparently orphans every older file). When validating the solver itself, set `BLACKJACK_NO_CACHE` to force clean re-solves.
 
 ## Architecture
 

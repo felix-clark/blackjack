@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::card::Card;
 use std::{
     fmt::{Debug, Display},
@@ -14,7 +16,7 @@ pub const N_RANKS: usize = 10;
 /// equality and hashing are exact and cheap (an absent rank is simply a `0`, with none of the
 /// "explicit zero vs. missing key" ambiguity a `HashMap`-backed multiset has), and the whole thing
 /// is `Copy`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CardCol {
     counts: [u16; N_RANKS],
 }
@@ -355,6 +357,47 @@ pub trait Shoe: Clone {
     /// hypergeometric (drawing without replacement), `None` → multinomial (with replacement, drawing
     /// probabilities read from [`Shoe::draw_prob`]).
     fn rank_count(&self, rank: &Card) -> Option<u16>;
+
+    /// The **coherent occurrence probability** of drawing exactly `hand` (as a multiset, in any
+    /// order) as the next cards off this shoe. This — *not* the [`weighted_partitions`] scan-weight —
+    /// is the distribution to integrate EVs against (the player edge, the reach-weight seed, any
+    /// per-hand pooling). The two agree for a finite or infinite shoe, but **diverge for a
+    /// count-conditioned shoe**: there the scan-weight is the *untilted* hypergeometric (it is derived
+    /// from [`rank_count`], the raw pool supply, which only bounds the enumeration), whereas this
+    /// carries the count tilt because it is built from [`draw_prob`]/[`remove_hand`], which are
+    /// count-conditioned. Using the scan-weight as an occurrence probability silently under-weights
+    /// count-favoured hands (e.g. naturals in a ten-rich shoe) and inverts the count-conditioned edge
+    /// — keep occurrence weighting on this method so that mistake cannot recur.
+    ///
+    /// The default expands the first card by the law of total probability —
+    /// `P(hand) = Σ_c draw_prob(c)·P(hand∖c | c removed)` — which is exact for every shoe and reduces
+    /// to the closed-form hypergeometric/multinomial on the simple shoes. It recurses over the hand,
+    /// so it is meant for the small (typically two-card) roots the integrators actually weight, not
+    /// deep hands.
+    ///
+    /// [`weighted_partitions`]: Shoe::weighted_partitions
+    /// [`rank_count`]: Shoe::rank_count
+    /// [`draw_prob`]: Shoe::draw_prob
+    /// [`remove_hand`]: Shoe::remove_hand
+    fn hand_prob(&self, hand: &CardCol) -> f64
+    where
+        Self: Sized,
+    {
+        if hand.is_empty() {
+            return 1.0;
+        }
+        let mut p = 0.0;
+        for (card, _n) in hand.iter() {
+            let p_c = self.draw_prob(&card);
+            if p_c == 0.0 {
+                continue;
+            }
+            let one = CardCol::from_hand(&[card]);
+            let rest = *hand - one;
+            p += p_c * self.remove_hand(&one).hand_prob(&rest);
+        }
+        p
+    }
 
     /// The shoe the split solver should start from. Defaults to `self` (exact: the finite shoe keeps
     /// its without-replacement depletion across arms). A shoe whose per-draw distribution is expensive

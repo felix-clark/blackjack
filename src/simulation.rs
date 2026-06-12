@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use serde::{Deserialize, Serialize};
+
 use crate::card::Card;
 use crate::dealer::{DealerOutcome, dealer_outcome_probs};
 use crate::hand::{HandCategory, HandState, Move, categorize};
@@ -331,7 +333,11 @@ fn solve_hand<S: Shoe + Clone + Eq + Hash>(
             })
             .sum::<f64>();
         let ev_map = HashMap::from_iter([(Move::Stand, nat_ev)]);
-        return (pl_hand, (weight, ev_map));
+        // Unconditional occurrence probability (the natural resolves at the peek, so it keeps its
+        // full weight — no `1 - P_bj` reduction). Via `hand_prob` so a count-tilted shoe weights its
+        // (frequent, ten/ace-rich) naturals correctly rather than by the untilted scan-weight; this
+        // is the dominant favourable mass in a high-count shoe. Finite/infinite shoes are unchanged.
+        return (pl_hand, (shoe.hand_prob(&pl_hand), ev_map));
     }
 
     // Dealer outcome distribution against this hand, conditioned on a clean peek when the
@@ -420,12 +426,23 @@ fn solve_hand<S: Shoe + Clone + Eq + Hash>(
             evs.push((Move::Split, split_ev));
         }
     }
-    // On the conditional basis the pooling weight becomes the conditional occurrence
-    // probability P(hold hand | no dealer natural) ∝ scan-weight · (1 - P_bj).
-    let stored_weight = if conditional {
-        weight * (1.0 - dealer_natural_prob(up_card, &shoe_minus_hand))
+    // The hand's game-time occurrence probability. The partition scan-weight (`weight`) is the
+    // *untilted* hypergeometric for a count-conditioned shoe, so a two-card root — the only weight
+    // that escapes to the edge/reach integrators — takes its occurrence probability from
+    // `Shoe::hand_prob` instead, which carries the count tilt. (For finite/infinite shoes the two
+    // coincide, so this is a no-op there.) Deeper hands keep the scan-weight pooling measure: they
+    // feed only the combinatorial `summarize_evs` baseline, never the count-conditioned live path.
+    let occurrence_weight = if pl_hand.len() == 2 {
+        shoe.hand_prob(&pl_hand)
     } else {
         weight
+    };
+    // On the conditional basis the pooling weight becomes the conditional occurrence
+    // probability P(hold hand | no dealer natural) ∝ occurrence-weight · (1 - P_bj).
+    let stored_weight = if conditional {
+        occurrence_weight * (1.0 - dealer_natural_prob(up_card, &shoe_minus_hand))
+    } else {
+        occurrence_weight
     };
     let ev_map = HashMap::from_iter(evs);
     (pl_hand, (stored_weight, ev_map))
@@ -509,7 +526,7 @@ pub(crate) fn summarize_evs(
 /// falls short of it on the peek basis by exactly the dealer-natural loss mass (each such hand a flat
 /// −1). So the honest unconditional value of this up-card is `weighted_ev − (1 − weight)`: the
 /// `−P_bj + (1 − P_bj)·V` two-card-root identity from [`build_evs`], summed over starting hands.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct EdgeTerm {
     pub(crate) weighted_ev: f64,
     pub(crate) weight: f64,
@@ -524,9 +541,14 @@ impl EdgeTerm {
 }
 
 /// Accumulate one up-card's two-card-root edge contribution from its EV tree. Only starting
-/// (two-card) hands count: within a fixed hand size the scan-weights are an exact occurrence
-/// distribution (summing to 1 off-peek), so this sidesteps the cross-size weighting imprecision that
-/// [`summarize_evs`] carries. A natural's lone `Stand` EV is its `max`, so naturals fold in correctly.
+/// (two-card) hands count: their stored weight is the hand's true occurrence probability
+/// ([`Shoe::hand_prob`], folded with the peek's `1 − P_bj`), an exact distribution summing to 1
+/// off-peek — so this sidesteps the cross-size weighting imprecision that [`summarize_evs`] carries.
+/// Crucially that occurrence weight carries the count tilt (the partition scan-weight would not), so
+/// the edge stays correct under a count-conditioned shoe. A natural's lone `Stand` EV is its `max`,
+/// so naturals fold in correctly.
+///
+/// [`Shoe::hand_prob`]: crate::shoe::Shoe::hand_prob
 pub(crate) fn edge_term(ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>) -> EdgeTerm {
     let mut weighted_ev = 0.0;
     let mut weight = 0.0;

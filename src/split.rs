@@ -126,7 +126,11 @@ impl<S: Shoe + Clone + Eq + Hash> SplitSolver<S> {
     /// independent fallback). The budget itself is not spent here — only card *draws* spend it (see
     /// [`SplitSolver::draw`]); an arm boundary draws no card.
     fn advance_arm(&self, shoe: S, budget: u8) -> S {
-        if budget == 0 { self.shoe0.clone() } else { shoe }
+        if budget == 0 {
+            self.shoe0.clone()
+        } else {
+            shoe
+        }
     }
 
     /// Draw card `c`, depleting the shoe (within-arm depletion is always exact) and spending one unit
@@ -375,7 +379,8 @@ mod tests {
 
             // Exact — same solve but on the un-frozen, per-draw-reconditioned count shoe.
             let splits_remaining = rules.max_split_hands.saturating_sub(2);
-            let mut solver = SplitSolver::new(shoe.clone(), basis, pr, rules.das, rules.split_cards);
+            let mut solver =
+                SplitSolver::new(shoe.clone(), basis, pr, rules.das, rules.split_cards);
             let seed = CardCol::from_hand(&[pr]);
             let budget = solver.budget;
             let start = Instant::now();
