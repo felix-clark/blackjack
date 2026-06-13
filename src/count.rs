@@ -383,6 +383,48 @@ impl CountShoe {
             .collect()
     }
 
+    /// The occurrence distribution over **external** running counts for a full `n_decks` shoe under
+    /// penetration prior `pen`: each `(c, P(c))` is how often a player who has counted down to the
+    /// penetration point holds external running count `c`, summing to 1 and ascending in `c`. It is the
+    /// marginal of the [`CountW`] count table over the prior's pool-size support (no count *condition* —
+    /// this is the prior over which count you land on, not a conditional draw distribution). The
+    /// count-index window is bounded by this: counts in its tails are practically never reached, so
+    /// solving them is wasted (see [`super::tui`]'s index sweep). Cheap — one `CountW` build, no solving.
+    pub(crate) fn external_count_distribution<S: CountSystem>(
+        n_decks: u8,
+        pen: Penetration,
+    ) -> Vec<(i16, f64)> {
+        let value_of_rank = std::array::from_fn(|r| S::map(&Card::from_rank_index(r)));
+        let dp = CountW::build(value_of_rank, CardCol::from_decks(n_decks));
+        let pivot = S::pivot(n_decks);
+        let big_n = dp.n_max;
+        // Marginalize the count table over the (flat) penetration prior on pool size `n`.
+        let mut acc: Vec<f64> = vec![0.0; (dp.s_max - dp.s_min + 1) as usize];
+        let mut total = 0.0;
+        for n in 0..=big_n {
+            let w = pen.weight(n, big_n);
+            if w == 0.0 {
+                continue;
+            }
+            for s in dp.s_min..=dp.s_max {
+                let p = dp.at(s, n);
+                if p != 0.0 {
+                    acc[(s - dp.s_min) as usize] += w * p;
+                    total += w * p;
+                }
+            }
+        }
+        // Convert internal count `s` to external `c = pivot − s`, normalize, drop zeros, sort ascending.
+        let mut out: Vec<(i16, f64)> = Vec::new();
+        for (i, &v) in acc.iter().enumerate() {
+            if v > 0.0 {
+                out.push((pivot - (dp.s_min + i as i16), v / total));
+            }
+        }
+        out.sort_by_key(|&(c, _)| c);
+        out
+    }
+
     fn from_parts(
         dp: CountW,
         cond: CountCondition,

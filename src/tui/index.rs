@@ -22,13 +22,59 @@ use super::PANES;
 use super::column::{COUNT_GROUPS, ColumnSummary, ReachMap, Tree, merge_count_frames};
 use super::config::{COUNT_PENETRATION, ShoeChoice};
 
-/// Half-width of the external-running-count window the count index is computed over, centered on the
-/// system pivot (KO: `+4`). The window is count-*independent* — it does not depend on the player's
-/// current count — and is wide enough to contain the realistic deviation flips (which cluster near the
-/// pivot). Flips beyond it are reported open-ended (`≤`/`≥`). Root-finding keeps the *number of solves*
-/// small regardless of width (it bisects to the flip rather than sweeping), so a generous window is
-/// cheap; the whole band still shares one deconvolution (see [`CountShoe::band`]).
-const INDEX_HALF_WIDTH: i16 = 20;
+/// One solved frame: the `build_evs` EV tree and its game-time reach weights — the unit the count-index
+/// WoO merge reads off (one per band count). Persisted per [`FrameKey`] so a warm relaunch skips the
+/// re-solve, which is the dominant cost of a cold fill; in memory it is memoized only *within* a column
+/// (the band counts a column's WoO merges share), since distinct up-cards never share a frame.
+type Frame = (Tree, ReachMap);
+
+/// What a persisted frame is keyed under: up-card, deck count, and exact external running count. The
+/// band's comparison is always `Eq` and its penetration prior a fixed constant
+/// ([`COUNT_PENETRATION`]), so neither is in the key; the ruleset is.
+type FrameKey = (Card, u8, i16, Ruleset);
+
+/// Disk namespace for persisted frames (distinct from the chart's `"column"` cache).
+const FRAME_KIND: &str = "frame";
+
+/// How much occurrence probability the count-index window may drop off **each** tail. The window is the
+/// central span of the running-count occurrence distribution
+/// ([`CountShoe::external_count_distribution`]) that keeps all but this much mass per side — i.e. we
+/// solve every count a player realistically holds and report the rare extremes open-ended (`≤`/`≥`).
+/// Counts past it occur under this fraction of the time; their flips are theoretical, not the genuine
+/// suggested-play deviations the index is for (for an exact EV at an extreme count, set the count
+/// constraint to it directly).
+///
+/// This is the *whole* tuning knob: a dimensionless probability, not a hand-derived width. Widening or
+/// narrowing the window is just a change here — the per-deck `[lo, hi]` recompute themselves off the
+/// live distribution, no magic numbers to re-derive. It is also **system-agnostic**: the same threshold
+/// carries to any [`CountSystem`](crate::count::CountSystem). The one KO-specific assumption — that the
+/// player's *actionable* count is the external *running* count (so the occurrence axis is the running
+/// count, independent of penetration depth) — lives in [`ColumnEval`], which sweeps that axis. A
+/// *true-count* system (HiLo, once added) acts on running ÷ decks-remaining, so its occurrence axis is
+/// the true count (a function of pool size too); generalizing means giving the occurrence distribution
+/// that axis, after which this threshold and the trimming in [`occurrence_window`] apply unchanged.
+const INDEX_TAIL_MASS: f64 = 0.01;
+
+/// The inclusive external-count window `[lo, hi]` covering the central mass of occurrence distribution
+/// `dist` (ascending `(count, P(count))` pairs), dropping at most `tail_each` probability off each end.
+/// The trim is purely on probability mass, so it is independent of the count scale or system — only the
+/// `dist` passed in is system-specific. A count is dropped from a tail only while the running total of
+/// dropped mass stays within budget; the first count that would exceed it becomes the edge (kept).
+fn occurrence_window(dist: &[(i16, f64)], tail_each: f64) -> (i16, i16) {
+    let mut lo = 0;
+    let mut dropped = 0.0;
+    while lo + 1 < dist.len() && dropped + dist[lo].1 <= tail_each {
+        dropped += dist[lo].1;
+        lo += 1;
+    }
+    let mut hi = dist.len() - 1;
+    let mut dropped = 0.0;
+    while hi > lo && dropped + dist[hi].1 <= tail_each {
+        dropped += dist[hi].1;
+        hi -= 1;
+    }
+    (dist[lo].0, dist[hi].0)
+}
 
 /// Max count-index columns solved concurrently in the background. Each is much heavier than a chart
 /// column (a handful of count-conditioned solves, splits and all), so this is kept well below the ten
@@ -217,29 +263,42 @@ enum Ladder {
 /// Move lookups follow the Wizard-of-Odds count convention (the running count *includes* the cell's hand
 /// and the up-card — see [`merge_count_frames`]). The move at index-count `ext` is therefore read off a
 /// merged column whose hands each come from the band shoe at `ext - map(U) - map(hand)`; those per-band
-/// solves (`build_evs` + reach) are memoized in `frames`, so each band count is solved at most once and
-/// shared across every index-count whose window reaches it. `summaries` memoizes the merged per-`ext`
-/// summary so all categories and both ladders reuse it.
+/// solves (`build_evs` + reach) are memoized in `frames` (disk-backed — see [`ensure_frame`]), so each
+/// band count is solved at most once and shared across every index-count whose window reaches it.
+/// `summaries` memoizes the merged per-`ext` summary so all categories and both ladders reuse it.
 struct ColumnEval {
+    n: u8,
     up: Card,
     rules: Ruleset,
     /// Usable (positive-mass) external counts, ascending; aligned with `shoes`.
     externals: Vec<i16>,
     shoes: Vec<CountShoe>,
-    /// Per band external count: the all-shift solve there (`build_evs` tree + reach weights). The
-    /// per-frame inputs the WoO merge reads.
-    frames: HashMap<i16, (Tree, ReachMap)>,
+    /// Per band external count: the (memoized) all-shift solve there (`build_evs` tree + reach weights).
+    /// The per-frame inputs the WoO merge reads. Filled on demand by [`ensure_frame`], disk-first.
+    frames: HashMap<i16, Frame>,
     /// Per index-count `ext`: the merged WoO chart summary read by the ladders.
     summaries: HashMap<i16, ColumnSummary>,
 }
 
 impl ColumnEval {
-    /// Build the band over the pivot-centered window and drop the counts whose exact condition has no
-    /// mass (unreachable under the penetration prior — a zero draw distribution would make the solve
-    /// meaningless). The reachable set is contiguous. `None` if nothing in the window is reachable.
+    /// Build the band over the occurrence-bounded window: the central span of the running-count
+    /// occurrence distribution that keeps all but [`INDEX_TAIL_MASS`] of the mass per tail (so we solve
+    /// every count realistically held and leave the rare extremes open-ended), clamped to always cover
+    /// the marker range so no displayable flip can hide outside it. `None` if nothing is reachable.
     fn new(n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
-        let pivot = Ko::pivot(n);
-        let window: Vec<i16> = (pivot - INDEX_HALF_WIDTH..=pivot + INDEX_HALF_WIDTH).collect();
+        let dist = CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION);
+        let (mut lo, mut hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
+        // Never trim inside the marker range — a flip the chart would draw must be inside the window.
+        lo = lo.min(-INDEX_MARKER_MAX_RC);
+        hi = hi.max(INDEX_MARKER_MAX_RC);
+        Self::build(n, up, rules, lo, hi)
+    }
+
+    /// Build over an explicit inclusive external-count window `[lo, hi]`, dropping the counts whose exact
+    /// condition has no mass (unreachable under the penetration prior — a zero draw distribution would
+    /// make the solve meaningless). The reachable set is contiguous. `None` if nothing is reachable.
+    fn build(n: u8, up: Card, rules: &Ruleset, lo: i16, hi: i16) -> Option<Self> {
+        let window: Vec<i16> = (lo..=hi).collect();
         let shoes = CountShoe::band::<Ko>(n, &window, CountCmp::Eq, COUNT_PENETRATION);
         let mut externals = Vec::new();
         let mut usable = Vec::new();
@@ -255,6 +314,7 @@ impl ColumnEval {
             return None;
         }
         Some(Self {
+            n,
             up,
             rules: *rules,
             externals,
@@ -262,6 +322,14 @@ impl ColumnEval {
             frames: HashMap::new(),
             summaries: HashMap::new(),
         })
+    }
+
+    /// As [`new`](Self::new) but over a fixed pivot-centered half-width window, so a measurement can
+    /// sweep the window size independent of the occurrence bound. Test-only.
+    #[cfg(test)]
+    fn new_windowed(n: u8, up: Card, rules: &Ruleset, half_width: i16) -> Option<Self> {
+        let pivot = Ko::pivot(n);
+        Self::build(n, up, rules, pivot - half_width, pivot + half_width)
     }
 
     fn lo(&self) -> i16 {
@@ -272,17 +340,26 @@ impl ColumnEval {
         self.externals[self.externals.len() - 1]
     }
 
-    /// Solve (memoized) the all-shift `build_evs` tree and reach weights on the band shoe at external
-    /// count `c`, clamping `c` into the usable (contiguous) window so a frame lookup near a window edge
-    /// still lands on a solved count. Returns the clamped key actually used.
+    /// Ensure the all-shift `build_evs` tree and reach weights for the band shoe at external count `c`
+    /// are present in the in-column memo, clamping `c` into the usable (contiguous) window so a frame
+    /// lookup near a window edge still lands on a solved count. Disk-first: a persisted frame is loaded
+    /// (skipping the dominant re-solve cost); a miss solves on the band shoe — preserving the band's
+    /// shared deconvolution — and persists the result at frame granularity. Returns the clamped key.
     fn ensure_frame(&mut self, c: i16) -> i16 {
         let c = c.clamp(self.lo(), self.hi());
         if !self.frames.contains_key(&c) {
-            let idx = self.externals.iter().position(|&e| e == c).unwrap();
-            let shoe = self.shoes[idx].clone();
-            let tree = build_evs(shoe.clone(), self.up, &self.rules);
-            let reach = reach_weights(shoe, self.up, &self.rules, &tree, true);
-            self.frames.insert(c, (tree, reach));
+            let (up, n, rules) = (self.up, self.n, self.rules);
+            let key: FrameKey = (up, n, c, rules);
+            let frame = diskcache::load::<_, Frame>(FRAME_KIND, &key).unwrap_or_else(|| {
+                let idx = self.externals.iter().position(|&e| e == c).unwrap();
+                let shoe = self.shoes[idx].clone();
+                let tree = build_evs(shoe.clone(), up, &rules);
+                let reach = reach_weights(shoe, up, &rules, &tree, true);
+                let frame = (tree, reach);
+                diskcache::store(FRAME_KIND, &key, &frame);
+                frame
+            });
+            self.frames.insert(c, frame);
         }
         c
     }
@@ -299,10 +376,9 @@ impl ColumnEval {
                 self.ensure_frame(ext - mu - k);
             }
             let frame_key = |k: i16| (ext - mu - k).clamp(lo, hi);
-            let (mt, mr) = merge_count_frames(
-                |k| &self.frames[&frame_key(k)].0,
-                |k| &self.frames[&frame_key(k)].1,
-            );
+            // `ensure_frame` above guarantees each band frame is present.
+            let frame = |k: i16| &self.frames[&frame_key(k)];
+            let (mt, mr) = merge_count_frames(|k| &frame(k).0, |k| &frame(k).1);
             let summary = summarize_cells(&mt, &mr);
             self.summaries.insert(ext, summary);
         }
@@ -518,5 +594,110 @@ mod tests {
             (-7..=0).contains(&boundary),
             "Hit→Stand boundary should sit near RC −3, got Hit up to {boundary}"
         );
+    }
+
+    /// PROTOTYPE MEASUREMENT (not an assertion): for each deck count, print the external running-count
+    /// occurrence distribution's full reachable span and the [`occurrence_window`] at a few tail
+    /// thresholds — i.e. how wide the count-index sweep needs to be to cover all-but-the-practically-
+    /// impossible counts. The width (`hi − lo + 1`) is the per-column frame-solve cost, so this is the
+    /// data that justifies [`INDEX_TAIL_MASS`] by likelihood. The `*` marks the production threshold.
+    /// Fast (no solving — just `CountW` builds).
+    /// Run: `cargo test --release occurrence_window_by_decks -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn occurrence_window_by_decks() {
+        let pivot_note = "(KO pivot is +4 for every deck count)";
+        println!("external running-count occurrence windows, pen={COUNT_PENETRATION:?} {pivot_note}");
+        println!("production threshold INDEX_TAIL_MASS = {INDEX_TAIL_MASS} per tail (marked *)");
+        for n in [1u8, 2, 4, 6, 8] {
+            let dist = CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION);
+            let (flo, fhi) = (dist.first().unwrap().0, dist.last().unwrap().0);
+            let peak = dist.iter().cloned().fold((0i16, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+            println!(
+                "n={n}: full span=[{flo:>3},{fhi:>3}] (width {:>3})  peak c={:>2} P={:.3}",
+                fhi - flo + 1, peak.0, peak.1
+            );
+            for tail in [1e-2, 1e-3, 1e-4] {
+                let (lo, hi) = occurrence_window(&dist, tail);
+                let mark = if tail == INDEX_TAIL_MASS { "*" } else { " " };
+                println!(
+                    "  {mark} drop {tail:>7} each tail -> [{lo:>3},{hi:>3}]  width {:>3}",
+                    hi - lo + 1
+                );
+            }
+        }
+    }
+
+    /// One column's frame-origin breakdown at a given window half-width: how many distinct band-count
+    /// frames (the expensive `build_evs`+reach solves) were touched, how many of those are the
+    /// *seed floor* (forced by the fixed seed grid regardless of any flips — `seed_points` depends only
+    /// on `lo`/`hi`, so it is identical for every category), and how many distinct index-counts (`ext`)
+    /// were sampled. `flip = frames - seed_floor` is the work attributable to actual play deviations.
+    struct ColumnBreakdown {
+        externals: usize,
+        exts_sampled: usize,
+        frames: usize,
+        seed_floor: usize,
+    }
+
+    /// Fill one up-card column (all categories) at `half_width` and report its [`ColumnBreakdown`].
+    fn column_breakdown(n: u8, up: Card, rules: &Ruleset, half_width: i16) -> ColumnBreakdown {
+        let mut eval = ColumnEval::new_windowed(n, up, rules, half_width).expect("usable window");
+        let (light, pairs) = index_categories();
+        for cat in light.into_iter().chain(pairs) {
+            let _ = eval.category_index(cat);
+        }
+        // The seed floor: the band frames the fixed seed grid alone forces, independent of any flip.
+        // Every category seeds the same `seed_points(lo, hi)`; each seed `ext` reads COUNT_GROUPS frames
+        // at `clamp(ext - mu - k)`. Their union is the unavoidable cost of just *probing* the window.
+        let (lo, hi) = (eval.lo(), eval.hi());
+        let mu = Ko::map(&up);
+        let mut floor: std::collections::BTreeSet<i16> = std::collections::BTreeSet::new();
+        for s in seed_points(lo, hi) {
+            for k in COUNT_GROUPS {
+                floor.insert((s - mu - k).clamp(lo, hi));
+            }
+        }
+        ColumnBreakdown {
+            externals: eval.externals.len(),
+            exts_sampled: eval.summaries.len(),
+            frames: eval.frames.len(),
+            seed_floor: floor.len(),
+        }
+    }
+
+    /// PROTOTYPE MEASUREMENT (not an assertion): for each window half-width, fill every up-card column
+    /// and print the per-column frame-solve breakdown plus column-summed totals — the data that decides
+    /// how much a narrower window recovers, and how much of the cost is the seed floor vs. real flip
+    /// brackets. Counts are exact regardless of disk warmth (a disk hit still records the frame), so this
+    /// can run over a warm cache. Run alone:
+    /// `cargo test --release frame_origin_breakdown -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn frame_origin_breakdown() {
+        let rules = Ruleset::default();
+        let n = 1u8;
+        for half_width in [20i16, 10, 6] {
+            let mut tot_frames = 0usize;
+            let mut tot_floor = 0usize;
+            let mut tot_exts = 0usize;
+            println!("=== n={n}  half_width=±{half_width} ===");
+            for &up in &crate::tui::UP_CARDS {
+                let b = column_breakdown(n, up, &rules, half_width);
+                let flip = b.frames.saturating_sub(b.seed_floor);
+                println!(
+                    "  up={up:?}: window={:>3}  exts={:>3}  frames={:>3}  (seed_floor={:>2}  flip={:>2})",
+                    b.externals, b.exts_sampled, b.frames, b.seed_floor, flip
+                );
+                tot_frames += b.frames;
+                tot_floor += b.seed_floor;
+                tot_exts += b.exts_sampled;
+            }
+            println!(
+                "  TOTAL: frames={tot_frames}  exts={tot_exts}  seed_floor={tot_floor}  \
+                 flip={}\n",
+                tot_frames.saturating_sub(tot_floor)
+            );
+        }
     }
 }
