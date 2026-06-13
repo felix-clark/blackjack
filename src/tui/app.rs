@@ -5,8 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
 use std::time::Duration;
+use std::{array, io, thread};
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
@@ -56,6 +56,10 @@ pub(super) struct App {
     /// from `self` later) so a completed batch is cached under the inputs it was actually computed with,
     /// even if a modal has since edited `self` without re-solving.
     epoch_key: ChartKey,
+    /// A simple float cache representing the expectation value from taking an insurance bet when
+    /// the dealer shows an Ace. This is quick to compute but we don't need to re-run it every
+    /// frame.
+    pub(super) insurance_ev: f64,
     /// Finished chart batches, keyed by [`ChartKey`], so flipping back to a prior setting is instant
     /// instead of a re-solve. Populated once all ten columns of an epoch arrive.
     cache: HashMap<ChartKey, [Column; 10]>,
@@ -102,8 +106,9 @@ impl App {
             count,
             epoch: 0,
             epoch_key: (ShoeChoice::Infinite, Ruleset::default(), None),
+            insurance_ev: f64::NAN,
             cache: HashMap::new(),
-            columns: std::array::from_fn(|_| None),
+            columns: array::from_fn(|_| None),
             cursor: Cursor {
                 pane: 0,
                 row: 0,
@@ -149,12 +154,13 @@ impl App {
             self.index_cache.clear();
             self.index_pending.clear();
         }
+        self.insurance_ev = self.shoe.insurance(self.effective_count());
         // Cache hit: restore all ten columns at once, no workers (so nothing arrives for this epoch).
         if let Some(cached) = self.cache.get(&self.epoch_key) {
-            self.columns = std::array::from_fn(|i| Some(cached[i].clone()));
+            self.columns = array::from_fn(|i| Some(cached[i].clone()));
             return;
         }
-        self.columns = std::array::from_fn(|_| None);
+        self.columns = array::from_fn(|_| None);
         // Spawn the ten columns concurrently, longest-first (the low up-cards and the Ace are the
         // slow ones — the dealer draws more, and the Ace peek-conditions). The heavy work *inside*
         // each column is the pair-split solves, which `build_evs` already fans across cores; running
@@ -186,7 +192,7 @@ impl App {
             }
         }
         if self.columns.iter().all(Option::is_some) && !self.cache.contains_key(&self.epoch_key) {
-            let batch = std::array::from_fn(|i| self.columns[i].clone().unwrap());
+            let batch = array::from_fn(|i| self.columns[i].clone().unwrap());
             self.cache.insert(self.epoch_key, batch);
         }
     }
@@ -296,10 +302,7 @@ impl App {
         }
     }
 
-    pub(super) fn event_loop(
-        &mut self,
-        terminal: &mut ratatui::DefaultTerminal,
-    ) -> std::io::Result<()> {
+    pub(super) fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
         loop {
             self.drain_results();
             self.drain_index_results();

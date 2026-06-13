@@ -5,12 +5,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
-use crate::count::{CountCmp, CountShoe, Ko, Penetration};
+use crate::count::{CountCmp, CountShoe, CountSystem, Ko, Penetration};
 use crate::diskcache;
 use crate::rules::Ruleset;
-use crate::shoe::{CardCol, InfiniteDeck};
+use crate::shoe::{CardCol, InfiniteDeck, Shoe};
+use crate::simulation::insurance_ev;
 
-use super::column::{Column, solve_on};
+use super::column::{Column, solve_counted, solve_on};
 
 /// Penetration prior used for count conditioning: a flat distribution over deck depth up to 75%
 /// penetration (casinos never deal the shoe out). See the count-conditioning architecture notes.
@@ -78,17 +79,46 @@ impl ShoeChoice {
         let column = match self {
             ShoeChoice::Infinite => solve_on(InfiniteDeck {}, up_card, rules),
             ShoeChoice::Decks(n) => match count {
-                Some(c) => solve_on(
-                    CountShoe::from_external::<Ko>(n, c.external, c.cmp, COUNT_PENETRATION),
-                    up_card,
-                    rules,
-                ),
+                Some(c) => solve_counted(n, c.external, c.cmp, up_card, rules),
                 None => solve_on(CardCol::from_decks(n), up_card, rules),
             },
         };
         diskcache::store("column", &key, &column);
         column
     }
+
+    /// Return the insurance expectation value for the current count state. This is a 2:1 bet that
+    /// the dealer has a natural, and is essentially independent of the player's hand outside of the
+    /// count implications.
+    /// `ShoeChoice` is a UI *selection*, so its one job here is to dispatch to the concrete shoe the
+    /// player faces; the actual EV is [`insurance_ev`] (in the solver, beside `dealer_natural_prob`).
+    /// The branch is irreducible — the three arms are distinct concrete `Shoe` types and `Shoe` is not
+    /// object-safe — but each arm is now just a constructor, with the draw-then-evaluate shared.
+    pub(super) fn insurance(self, count: Option<CountSetting>) -> f64 {
+        let up = Card::Ace;
+        match (self, count) {
+            // The entered count includes the dealer's up-card (the player has seen the Ace and counted
+            // it before deciding insurance — the Wizard-of-Odds convention). So we anchor the count at
+            // the *pre-up-card* value `external - map(Ace)`; `insurance_after_up`'s all-shift `draw`
+            // then shifts it back by `map(Ace)`, landing the hole-card distribution at exactly
+            // `external` with the Ace removed. Without this offset the hole card would be conditioned on
+            // `external + map(Ace)` instead.
+            (ShoeChoice::Decks(n), Some(c)) => insurance_after_up(
+                CountShoe::from_external::<Ko>(n, c.external - Ko::map(&up), c.cmp, COUNT_PENETRATION),
+                up,
+            ),
+            (ShoeChoice::Decks(n), None) => insurance_after_up(CardCol::from_decks(n), up),
+            (ShoeChoice::Infinite, _) => insurance_after_up(InfiniteDeck {}, up),
+        }
+    }
+}
+
+/// Remove the up-card from `shoe` (a no-op on the infinite deck; multiset subtraction on a finite or
+/// count shoe), then evaluate insurance against the resulting hole-card distribution. The seam that
+/// lets [`ShoeChoice::insurance`]'s arms stay one-constructor-each.
+fn insurance_after_up<S: Shoe>(mut shoe: S, up: Card) -> f64 {
+    shoe.draw(&up);
+    insurance_ev(up, &shoe)
 }
 
 /// Deck options the rules modal cycles through.

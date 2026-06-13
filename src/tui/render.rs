@@ -24,7 +24,7 @@ impl App {
     pub(super) fn render(&self, f: &mut Frame) {
         let outer = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(2)])
+            .constraints([Constraint::Min(0), Constraint::Length(3)])
             .split(f.area());
 
         // Lay the panes side by side when there's room for all three (each needs PANE_WIDTH); fall
@@ -164,24 +164,35 @@ impl App {
             None => format!("{cat} vs {up} \u{2192} \u{2026}"),
         };
 
-        // Count status: only meaningful on a finite shoe; shown as e.g. "KO RC>=+4" or "off".
-        let count = match self.effective_count() {
-            Some(c) => format!("KO RC{}{:+}", c.cmp_label(), c.external),
-            None if self.count_on => "n/a(\u{221e})".to_string(),
-            None => "off".to_string(),
-        };
-        let status = format!(
-            "decks {} | {} | DAS {} | peek {} | BJ {bj} | surr {surr} | split\u{2264}{} | count {count} | edge {edge}{computing}",
+        // Row 1: the constant ruleset — everything that's fixed regardless of the running count.
+        let rules = format!(
+            "decks {} | {} | DAS {} | peek {} | BJ {bj} | surr {surr} | split\u{2264}{}",
             self.shoe,
             if r.hs17 { "H17" } else { "S17" },
             yn(r.das),
             yn(r.peek.peeks()),
             r.max_split_hands,
         );
+
+        // Row 2: everything that moves with the count — the counting system and its current
+        // parameterization, the resulting edge, and the insurance EV. Count is only meaningful on a
+        // finite shoe; shown as e.g. "KO RC>=+4" or "off".
+        let count = match self.effective_count() {
+            Some(c) => format!("KO RC{}{:+}", c.cmp_label(), c.external),
+            None if self.count_on => "n/a(\u{221e})".to_string(),
+            None => "off".to_string(),
+        };
+        let insurance = format!("{:+.3}", self.insurance_ev);
+        let counted = format!("count {count} | edge {edge}{computing} | insurance {insurance}",);
+
         let keys = "hjkl move \u{00b7} Enter EVs \u{00b7} r rules \u{00b7} c count \u{00b7} q quit";
 
         let lines = vec![
-            Line::from(vec![Span::styled(status, Style::default().fg(Color::Cyan))]),
+            Line::from(vec![Span::styled(rules, Style::default().fg(Color::Cyan))]),
+            Line::from(vec![Span::styled(
+                counted,
+                Style::default().fg(Color::Cyan),
+            )]),
             Line::from(vec![
                 Span::styled(format!("{sel}    "), Style::default().fg(Color::White)),
                 Span::styled(keys, Style::default().fg(Color::DarkGray)),

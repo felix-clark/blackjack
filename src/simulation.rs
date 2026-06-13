@@ -48,12 +48,20 @@ pub(crate) fn resolve_ev(
 /// Probability the dealer's down card completes a natural, given the up card and the cards left in
 /// `shoe`. Exact because a natural is the only two-card 21: it needs the single rank that pairs with
 /// the up card to make ace+ten, and nothing else can.
-fn dealer_natural_prob(up_card: Card, shoe: &impl Shoe) -> f64 {
+pub(crate) fn dealer_natural_prob(up_card: Card, shoe: &impl Shoe) -> f64 {
     match up_card {
         Card::Ace => shoe.draw_prob(&Card::Ten),
         Card::Ten => shoe.draw_prob(&Card::Ace),
         _ => 0.0,
     }
+}
+
+/// EV of taking insurance: a 2:1 side bet that the dealer's hole card completes a natural. `shoe` must
+/// be the shoe *with the up-card already removed*, so [`dealer_natural_prob`] reads the hole-card
+/// distribution the player faces. Win pays `+2` with probability `P_bj`, lose `-1` otherwise:
+/// `2·P_bj − (1 − P_bj) = 3·P_bj − 1`.
+pub(crate) fn insurance_ev(up_card: Card, shoe_after_up: &impl Shoe) -> f64 {
+    3.0 * dealer_natural_prob(up_card, shoe_after_up) - 1.0
 }
 
 /// The rank that completes a dealer natural with `up_card` (Ten under an Ace, Ace under a Ten), or
@@ -205,9 +213,30 @@ impl Basis {
 /// imprecision), so it is only a relative pooling weight in [`summarize_evs`].
 // TODO: Should this be a struct so it can recursively build the table by demand?
 pub(crate) fn build_evs<S: Shoe + Clone + Eq + Hash + Sync>(
+    shoe: S,
+    up_card: Card,
+    rules: &Ruleset,
+) -> HashMap<CardCol, (f64, HashMap<Move, f64>)> {
+    // The split solves dominate runtime by far (e.g. on a 6-deck shoe the whole non-split DP is
+    // ~0.6s while the pair splits sum to ~34s) and each is independent of the DP tree, so they are
+    // computed up front across all cores; the DP below just looks the result up. This is the engine's
+    // parallelism — what lets a single column use more than one core (one split runs per pair, so the
+    // per-level DP loop could never parallelise it). See [`pair_split_evs_for`].
+    let split_evs = pair_split_evs(&shoe, up_card, rules);
+    build_evs_with_splits(shoe, up_card, rules, &split_evs)
+}
+
+/// The [`build_evs`] dynamic program given *precomputed* split EVs — the cheap (~2%) half of the
+/// solve, factored out so a caller can supply splits solved elsewhere. The count-frame solve uses
+/// this: it solves each pair's split once (in the frame matching the pair's own count value, via
+/// [`pair_split_evs_for`]) and then runs this DP per frame, instead of re-solving every split in
+/// every frame. `split_evs` need only cover the pairs whose `Move::Split` this tree will actually be
+/// read for; a pair absent from the map simply offers no `Split` move.
+pub(crate) fn build_evs_with_splits<S: Shoe + Clone + Eq + Hash>(
     mut shoe: S,
     up_card: Card,
     rules: &Ruleset,
+    split_evs: &HashMap<CardCol, f64>,
 ) -> HashMap<CardCol, (f64, HashMap<Move, f64>)> {
     // Remove the up card from the deck (a no-op for the infinite deck).
     shoe.draw(&up_card);
@@ -222,16 +251,6 @@ pub(crate) fn build_evs<S: Shoe + Clone + Eq + Hash + Sync>(
     // Peek conditioning only bites when the dealer actually peeks *and* the up-card can make a
     // natural; otherwise the conditional and unconditional bases coincide.
     let conditional = basis.conditional;
-
-    // The split solves dominate runtime by far (e.g. on a 6-deck shoe the whole non-split DP is
-    // ~0.6s while the pair splits sum to ~34s) and each is independent of the DP tree, so they are
-    // computed up front across all cores; the DP below just looks the result up. This is the engine's
-    // parallelism — what lets a single column use more than one core (one split runs per pair, so the
-    // per-level DP loop could never parallelise it). See [`pair_split_evs`].
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let split_evs = pair_split_evs(&shoe, basis, rules, n_threads);
 
     let mut full_ev_tree = HashMap::<CardCol, (f64, HashMap<Move, f64>)>::new();
 
@@ -252,7 +271,7 @@ pub(crate) fn build_evs<S: Shoe + Clone + Eq + Hash + Sync>(
                 dealer_hand,
                 up_card,
                 conditional,
-                &split_evs,
+                split_evs,
             );
             let ins_res = full_ev_tree.insert(pl_hand, entry);
             assert!(ins_res.is_none());
@@ -261,33 +280,66 @@ pub(crate) fn build_evs<S: Shoe + Clone + Eq + Hash + Sync>(
     full_ev_tree
 }
 
-/// Solve every splittable pair's split EV up front, in parallel — the engine's one expensive,
-/// embarrassingly-parallel phase. Each [`split_move_ev`] is self-contained (it spins up its own
-/// arm recursion and reads nothing from the main DP tree), so they fan out cleanly across cores via
-/// [`par_map`]; the [`build_evs`] DP then just looks each pair up. Returns `{pair → split EV}`, empty
-/// when splitting is disabled. A pair is included iff the shoe actually holds two of that rank.
-fn pair_split_evs<S: Shoe + Clone + Eq + Hash + Sync>(
-    shoe: &S,
-    basis: Basis,
-    rules: &Ruleset,
-    n_threads: usize,
-) -> HashMap<CardCol, f64> {
-    if rules.max_split_hands < 2 {
-        return HashMap::new();
-    }
-    let pairs: Vec<CardCol> = (0..N_RANKS)
+/// The splittable pairs the shoe holds two of, one `(r, r)` per rank — the work items
+/// [`pair_split_evs_for`] fans out over. Call on the shoe *after* the up-card is removed (matching
+/// where the splits are actually played from).
+pub(crate) fn splittable_pairs<S: Shoe>(shoe: &S) -> Vec<CardCol> {
+    (0..N_RANKS)
         .map(|i| {
             let r = Card::from_rank_index(i);
             CardCol::from_hand(&[r, r])
         })
         .filter(|pair| shoe.contains_hand(pair))
-        .collect();
-    par_map(&pairs, n_threads, |&pair| {
-        let shoe_minus_hand = shoe.remove_hand(&pair);
-        (pair, split_move_ev(&pair, &shoe_minus_hand, basis, rules))
+        .collect()
+}
+
+/// Solve `pairs`' split EVs in parallel — the engine's one expensive, embarrassingly-parallel phase.
+/// Each [`split_move_ev`] is self-contained (it spins up its own arm recursion and reads nothing from
+/// the main DP tree), so they fan out cleanly across cores via [`par_map`]. `shoe_for(&pair)` yields
+/// the shoe that pair's arms are played from, *before* the up-card is removed (this function removes
+/// it). That per-pair shoe is the seam the count-frame solve uses: under a count condition each pair
+/// is solved at the frame whose entered running count matches the pair's own count value, so its
+/// split is conditioned on exactly the count the player holds — and each pair is solved once rather
+/// than in every frame. `pairs` must already be filtered to those the shoe holds (see
+/// [`splittable_pairs`]). Returns `{pair → split EV}`, empty when splitting is disabled.
+pub(crate) fn pair_split_evs_for<S: Shoe + Clone + Eq + Hash + Sync>(
+    pairs: &[CardCol],
+    up_card: Card,
+    rules: &Ruleset,
+    shoe_for: impl Fn(&CardCol) -> S + Sync,
+) -> HashMap<CardCol, f64> {
+    if rules.max_split_hands < 2 {
+        return HashMap::new();
+    }
+    let basis = Basis::new(up_card, rules);
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    par_map(pairs, n_threads, |pair| {
+        let mut shoe = shoe_for(pair);
+        shoe.draw(&up_card);
+        let shoe_minus_hand = shoe.remove_hand(pair);
+        (*pair, split_move_ev(pair, &shoe_minus_hand, basis, rules))
     })
     .into_iter()
     .collect()
+}
+
+/// Solve every splittable pair's split EV on one shoe (the uncounted single-solve path). Thin wrapper
+/// over [`pair_split_evs_for`] that filters the pairs the shoe holds and routes them all to that one
+/// shoe. Returns `{pair → split EV}`, empty when splitting is disabled.
+fn pair_split_evs<S: Shoe + Clone + Eq + Hash + Sync>(
+    shoe: &S,
+    up_card: Card,
+    rules: &Ruleset,
+) -> HashMap<CardCol, f64> {
+    if rules.max_split_hands < 2 {
+        return HashMap::new();
+    }
+    let mut after_up = shoe.clone();
+    after_up.draw(&up_card);
+    let pairs = splittable_pairs(&after_up);
+    pair_split_evs_for(&pairs, up_card, rules, |_| shoe.clone())
 }
 
 /// Compute the move→EV map for one concrete player hand against the dealer up-card, reading

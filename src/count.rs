@@ -1719,6 +1719,44 @@ mod tests {
         }
     }
 
+    /// The count-frame fix for insurance, pinned to an exact value via full-deck equivalence.
+    ///
+    /// On a fresh, undealt shoe the running count is the IRC (`starting_count`). The dealer's exposed
+    /// Ace is one card the player *sees and counts*, so the running count they hold at the insurance
+    /// decision — the Wizard-of-Odds convention, where the entered count includes every visible card —
+    /// is `IRC + map(Ace) = IRC - 1`. With one Ace gone the hole card is drawn from the full deck minus
+    /// that Ace, so `P(hole = Ten)` is the exact finite value `16n / (52n - 1)`.
+    ///
+    /// The corrected recipe ([`ShoeChoice::insurance`](crate::tui)) anchors at `entered - map(Ace)`
+    /// before drawing the Ace, so the post-draw distribution lands at the entered count with the Ace
+    /// removed: pinning the pool to the full size (`CardsRemaining`) makes the only admissible config the
+    /// exact full-deck-minus-Ace, reproducing that finite value bit-for-bit. The old (no-offset) recipe
+    /// would instead condition on `entered`, i.e. `IRC - 1`, an internal count no full shoe can have.
+    #[test]
+    fn insurance_count_frame_matches_finite_deck() {
+        use crate::shoe::CardCol;
+        for n in [1u8, 2, 6] {
+            let full = CardCol::from_decks(n).len() as u16;
+            // Running count the player holds once the fresh-shoe Ace is exposed and counted.
+            let entered = Ko::starting_count(n) + Ko::map(&Card::Ace);
+            // Corrected recipe: anchor at the pre-Ace count, then draw the Ace (which shifts it back).
+            let c_in = entered - Ko::map(&Card::Ace);
+            let mut shoe = CountShoe::new::<Ko>(
+                n,
+                cond_from_external::<Ko>(n, c_in, CountCmp::Eq),
+                Penetration::CardsRemaining(full),
+            );
+            shoe.draw(&Card::Ace);
+            let p_ten = shoe.draw_prob(&Card::Ten);
+            let n = n as u32;
+            let expected = (16 * n) as f64 / (52 * n - 1) as f64;
+            assert!(
+                (p_ten - expected).abs() < 1e-9,
+                "n={n}: hole-Ten prob {p_ten} vs exact finite-deck {expected}"
+            );
+        }
+    }
+
     /// `CountW.draw_dist` (the incremental primitive) must reproduce the eager enumeration oracle for
     /// the equality condition, the same bar [`dp_matches_enumeration`] holds the moment-table DP to.
     #[test]

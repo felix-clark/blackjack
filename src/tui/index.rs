@@ -13,11 +13,13 @@ use crate::card::Card;
 use crate::count::{CountCmp, CountShoe, CountSystem, Ko};
 use crate::diskcache;
 use crate::hand::{HandCategory, Move};
+use crate::reach::{reach_weights, summarize_cells};
 use crate::rules::Ruleset;
 use crate::shoe::Shoe;
+use crate::simulation::build_evs;
 
 use super::PANES;
-use super::column::{Column, solve_on};
+use super::column::{COUNT_GROUPS, ColumnSummary, ReachMap, Tree, merge_count_frames};
 use super::config::{COUNT_PENETRATION, ShoeChoice};
 
 /// Half-width of the external-running-count window the count index is computed over, centered on the
@@ -210,21 +212,30 @@ enum Ladder {
 }
 
 /// A column's count-index evaluator: the windowed band of count-conditioned shoes (one per integer
-/// external count, all sharing one deconvolution — see [`CountShoe::band`]) plus a memo of the per-count
-/// solved [`Column`]s. Each count is solved (the expensive [`solve_on`]) at most once and only when the
-/// root-finder reaches for it; all categories and both the primary and fallback ladders share the memo.
+/// external count, all sharing one deconvolution — see [`CountShoe::band`]) plus memos of the work.
+///
+/// Move lookups follow the Wizard-of-Odds count convention (the running count *includes* the cell's hand
+/// and the up-card — see [`merge_count_frames`]). The move at index-count `ext` is therefore read off a
+/// merged column whose hands each come from the band shoe at `ext - map(U) - map(hand)`; those per-band
+/// solves (`build_evs` + reach) are memoized in `frames`, so each band count is solved at most once and
+/// shared across every index-count whose window reaches it. `summaries` memoizes the merged per-`ext`
+/// summary so all categories and both ladders reuse it.
 struct ColumnEval {
     up: Card,
     rules: Ruleset,
     /// Usable (positive-mass) external counts, ascending; aligned with `shoes`.
     externals: Vec<i16>,
     shoes: Vec<CountShoe>,
-    memo: HashMap<i16, Column>,
+    /// Per band external count: the all-shift solve there (`build_evs` tree + reach weights). The
+    /// per-frame inputs the WoO merge reads.
+    frames: HashMap<i16, (Tree, ReachMap)>,
+    /// Per index-count `ext`: the merged WoO chart summary read by the ladders.
+    summaries: HashMap<i16, ColumnSummary>,
 }
 
 impl ColumnEval {
     /// Build the band over the pivot-centered window and drop the counts whose exact condition has no
-    /// mass (unreachable under the penetration prior — a zero draw distribution would make `solve_on`
+    /// mass (unreachable under the penetration prior — a zero draw distribution would make the solve
     /// meaningless). The reachable set is contiguous. `None` if nothing in the window is reachable.
     fn new(n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
         let pivot = Ko::pivot(n);
@@ -248,7 +259,8 @@ impl ColumnEval {
             rules: *rules,
             externals,
             shoes: usable,
-            memo: HashMap::new(),
+            frames: HashMap::new(),
+            summaries: HashMap::new(),
         })
     }
 
@@ -260,20 +272,47 @@ impl ColumnEval {
         self.externals[self.externals.len() - 1]
     }
 
-    /// Solve (memoized) the column at external count `ext`. `ext` must be a usable count.
-    fn column(&mut self, ext: i16) -> &Column {
-        if !self.memo.contains_key(&ext) {
-            let idx = self.externals.iter().position(|&e| e == ext).unwrap();
-            let col = solve_on(self.shoes[idx].clone(), self.up, &self.rules);
-            self.memo.insert(ext, col);
+    /// Solve (memoized) the all-shift `build_evs` tree and reach weights on the band shoe at external
+    /// count `c`, clamping `c` into the usable (contiguous) window so a frame lookup near a window edge
+    /// still lands on a solved count. Returns the clamped key actually used.
+    fn ensure_frame(&mut self, c: i16) -> i16 {
+        let c = c.clamp(self.lo(), self.hi());
+        if !self.frames.contains_key(&c) {
+            let idx = self.externals.iter().position(|&e| e == c).unwrap();
+            let shoe = self.shoes[idx].clone();
+            let tree = build_evs(shoe.clone(), self.up, &self.rules);
+            let reach = reach_weights(shoe, self.up, &self.rules, &tree, true);
+            self.frames.insert(c, (tree, reach));
         }
-        &self.memo[&ext]
+        c
+    }
+
+    /// The WoO-merged chart summary at index-count `ext` (memoized): each hand read from the band frame
+    /// at `ext - map(U) - map(hand)`, so the running count `ext` includes the hand and the up-card.
+    fn summary(&mut self, ext: i16) -> &ColumnSummary {
+        if !self.summaries.contains_key(&ext) {
+            let mu = Ko::map(&self.up);
+            let (lo, hi) = (self.lo(), self.hi());
+            // Solve every frame the merge will read first (mutably), so it can then borrow them all
+            // immutably. `frame_key` reads only locals, so it does not borrow `self`.
+            for k in COUNT_GROUPS {
+                self.ensure_frame(ext - mu - k);
+            }
+            let frame_key = |k: i16| (ext - mu - k).clamp(lo, hi);
+            let (mt, mr) = merge_count_frames(
+                |k| &self.frames[&frame_key(k)].0,
+                |k| &self.frames[&frame_key(k)].1,
+            );
+            let summary = summarize_cells(&mt, &mr);
+            self.summaries.insert(ext, summary);
+        }
+        &self.summaries[&ext]
     }
 
     /// The move `ladder` recommends for `cat` at external count `ext`, or `None` if the category is
     /// absent (e.g. no Hit/Stand EVs to compare for the fallback).
     fn move_at(&mut self, ext: i16, cat: HandCategory, ladder: Ladder) -> Option<Move> {
-        let ci = self.column(ext).summary.get(&cat)?;
+        let ci = self.summary(ext).get(&cat)?;
         match ladder {
             Ladder::Primary => Some(ci.headline),
             Ladder::HitStand => {
