@@ -16,11 +16,18 @@
 //! restores from cache) like a rules change. On a finite shoe the chart also shows **count-index
 //! thresholds** — the running counts at which the recommended move flips (see [`index`]).
 //!
+//! The interface is organised into top-level [`Tab`]s: the **strategy** tab (the chart described above)
+//! and a **training** tab ([`training`]) — a hand-by-hand blackjack drill against the live shoe for
+//! practising basic strategy, count-indexed deviations, and the running count. The training tab's game
+//! engine is left as a documented seam; the harness (tab switch, layout, rendering, key routing) is wired
+//! up around it.
+//!
 //! ## Module map
 //!
 //! - [`config`] — the solve configuration (`ShoeChoice`, `CountSetting`) and the per-column solve entry.
 //! - [`column`] — a solved up-card column (`Column`) and the generic `solve_on`.
 //! - [`index`] — the count-index subsystem (the running counts at which a cell's play flips).
+//! - [`training`] — the training-tab model and the (stubbed) game-simulation seam.
 //! - [`app`] — the [`App`] state, the async solve lifecycle, and the event loop.
 //! - [`input`] — keyboard input and the modal field editors.
 //! - [`render`] — all drawing.
@@ -31,6 +38,7 @@ mod config;
 mod index;
 mod input;
 mod render;
+mod training;
 
 use crate::card::Card;
 use crate::hand::{HandCategory, Move};
@@ -65,6 +73,15 @@ const MOVE_ORDER: [Move; 5] = [
     Move::Split,
     Move::Surrender,
 ];
+
+/// The top-level views, switched with the `1`/`2` keys (and shown in the tab bar).
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Tab {
+    /// The basic-strategy chart and EV explorer.
+    Strategy,
+    /// The hand-by-hand training drill (see [`training`]).
+    Training,
+}
 
 /// The three chart panes.
 #[derive(Clone, Copy)]

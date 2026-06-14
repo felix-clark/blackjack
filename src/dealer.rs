@@ -67,17 +67,32 @@ fn dealer_dist_to_map(dist: DealerDist) -> HashMap<DealerOutcome, f64> {
 /// is what collapses the factorial of draw orders: `5` then `6` and `6` then `5` reach the same
 /// `DealerHand`, so the subtree below it is solved once.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct DealerHand {
+pub(crate) struct DealerHand {
     counts: [u8; 10],
 }
 
 impl DealerHand {
-    fn from_cards(cards: &CardCol) -> Self {
+    pub(crate) fn from_cards(cards: &CardCol) -> Self {
+        // NOTE: This seems to fundamentally just be a cast of the CardCol internals to u8. A map
+        // might suffice if we had access to CardCol internal.
         let mut counts = [0u8; 10];
         for (card, n) in cards.iter() {
             counts[card.rank_index()] = n as u8;
         }
         Self { counts }
+    }
+
+    pub(crate) fn from_card_vec(cards: &[Card]) -> Self {
+        // let mut counts = [0u8; 10];
+        let mut this = Self { counts: [0u8; 10] };
+        for card in cards.iter() {
+            this.add_card(card);
+        }
+        this
+    }
+
+    pub(crate) fn add_card(&mut self, card: &Card) {
+        self.counts[card.rank_index()] += 1;
     }
 
     /// The hand with one more card of the rank at `index`.
@@ -114,12 +129,12 @@ impl DealerHand {
     }
 
     /// A natural is the only two-card 21: ace + ten.
-    fn is_natural(&self) -> bool {
+    pub(crate) fn is_natural(&self) -> bool {
         self.num_cards() == 2 && self.best_total() == 21
     }
 
     /// Whether the dealer must take another card, given the soft-17 rule.
-    fn must_hit(&self, hs17: bool) -> bool {
+    pub(crate) fn must_hit(&self, hs17: bool) -> bool {
         let hard = self.hard_total();
         if hard >= 17 {
             return false;
@@ -131,7 +146,7 @@ impl DealerHand {
     }
 
     /// The outcome once the dealer stops drawing.
-    fn terminal_outcome(&self) -> DealerOutcome {
+    pub(crate) fn terminal_outcome(&self) -> DealerOutcome {
         let total = self.best_total();
         if total > 21 {
             DealerOutcome::Bust

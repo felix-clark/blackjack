@@ -607,15 +607,22 @@ mod tests {
     #[ignore]
     fn occurrence_window_by_decks() {
         let pivot_note = "(KO pivot is +4 for every deck count)";
-        println!("external running-count occurrence windows, pen={COUNT_PENETRATION:?} {pivot_note}");
+        println!(
+            "external running-count occurrence windows, pen={COUNT_PENETRATION:?} {pivot_note}"
+        );
         println!("production threshold INDEX_TAIL_MASS = {INDEX_TAIL_MASS} per tail (marked *)");
         for n in [1u8, 2, 4, 6, 8] {
             let dist = CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION);
             let (flo, fhi) = (dist.first().unwrap().0, dist.last().unwrap().0);
-            let peak = dist.iter().cloned().fold((0i16, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+            let peak = dist
+                .iter()
+                .cloned()
+                .fold((0i16, 0.0), |a, b| if b.1 > a.1 { b } else { a });
             println!(
                 "n={n}: full span=[{flo:>3},{fhi:>3}] (width {:>3})  peak c={:>2} P={:.3}",
-                fhi - flo + 1, peak.0, peak.1
+                fhi - flo + 1,
+                peak.0,
+                peak.1
             );
             for tail in [1e-2, 1e-3, 1e-4] {
                 let (lo, hi) = occurrence_window(&dist, tail);
