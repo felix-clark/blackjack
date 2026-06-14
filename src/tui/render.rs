@@ -9,12 +9,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::card::Card;
-use crate::hand::Move;
+use crate::hand::{HandState, Move};
+use crate::rules::Ruleset;
 use crate::shoe::CardCol;
 
 use super::app::{App, Mode};
 use super::config::ShoeChoice;
-use super::{MOVE_ORDER, PANES, Pane, UP_CARDS};
+use super::training::{Phase, Training};
+use super::{MOVE_ORDER, PANES, Pane, Tab, UP_CARDS};
 
 /// Width one pane needs to render untruncated: 2 border + 4 row-label + 10 up-cards × 3. Below
 /// `3 × PANE_WIDTH` the chart stacks the panes vertically instead of side by side.
@@ -22,10 +24,46 @@ const PANE_WIDTH: u16 = 2 + 4 + 10 * 3;
 
 impl App {
     pub(super) fn render(&self, f: &mut Frame) {
+        // A one-line tab bar tops every view; the body and footer fill the rest.
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(f.area());
+        self.render_tabs(f, root[0]);
+
+        match self.tab {
+            Tab::Strategy => self.render_strategy(f, root[1]),
+            Tab::Training => self.render_training(f, root[1]),
+        }
+    }
+
+    /// The top tab bar: the available views with the active one highlighted.
+    fn render_tabs(&self, f: &mut Frame, area: Rect) {
+        let tab_span = |label: &str, active: bool| {
+            let style = if active {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Span::styled(format!(" {label} "), style)
+        };
+        let line = Line::from(vec![
+            tab_span("1 Strategy", self.tab == Tab::Strategy),
+            Span::raw(" "),
+            tab_span("2 Training", self.tab == Tab::Training),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+    }
+
+    /// The strategy tab: the three-pane chart and the status footer.
+    fn render_strategy(&self, f: &mut Frame, body: Rect) {
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(3)])
-            .split(f.area());
+            .split(body);
 
         // Lay the panes side by side when there's room for all three (each needs PANE_WIDTH); fall
         // back to a vertical stack on narrower terminals, where the extra height is available.
@@ -411,6 +449,383 @@ impl App {
             .title(" Card counting ");
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    /// The training tab: the felt (dealer + player hands), a side column of count/feedback/stats
+    /// panels, and a key-hint footer, plus the count-quiz overlay when it is open.
+    fn render_training(&self, f: &mut Frame, body: Rect) {
+        let t = &self.training;
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(2)])
+            .split(body);
+        // Felt on the left, a fixed-width info column on the right (stacked vertically when narrow).
+        let cols = if rows[0].width >= 64 {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(38)])
+                .split(rows[0])
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(10), Constraint::Min(0)])
+                .split(rows[0])
+        };
+
+        render_felt(f, cols[0], t);
+        let side = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Length(9),
+                Constraint::Min(0),
+            ])
+            .split(cols[1]);
+        render_count_panel(f, side[0], t);
+        render_feedback_panel(f, side[1], t);
+        render_stats_panel(f, side[2], t);
+
+        render_training_footer(f, rows[1], t, &self.rules);
+
+        if t.entering_count {
+            render_count_quiz(f, t);
+        }
+    }
+}
+
+/// The felt: the dealer's hand, the player's hand(s), and the current status line.
+fn render_felt(f: &mut Frame, area: Rect, t: &Training) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(" Table ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Dealer row. The hole card (index 1) is hidden — and uncounted — until the paced dealer turn flips
+    // it (so it stays a "?" through the player's turn and only the moment its [`DEALER_STEP`] tick lands).
+    let revealed = !t.hole_down;
+    let mut dealer: Vec<Span> = vec![Span::styled("Dealer  ", Style::default().fg(Color::Gray))];
+    if t.dealer.is_empty() {
+        dealer.push(Span::styled("—", Style::default().fg(Color::DarkGray)));
+    } else {
+        let mut cards_w = 0;
+        for (i, &card) in t.dealer.iter().enumerate() {
+            let (text, style) = if i == 1 && !revealed {
+                ("? ".to_string(), Style::default().fg(Color::DarkGray))
+            } else {
+                (format!("{card} "), Style::default().fg(Color::White))
+            };
+            cards_w += text.chars().count();
+            dealer.push(Span::styled(text, style));
+        }
+        let shown: Vec<Card> = if revealed {
+            t.dealer.clone()
+        } else {
+            t.dealer[..1].to_vec()
+        };
+        push_total(&mut dealer, cards_w, cards_total_label(&shown));
+    }
+    lines.push(Line::from(dealer));
+    lines.push(Line::from(""));
+
+    // Player hand(s).
+    if t.hands.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Press Enter to deal a hand.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (i, hand) in t.hands.iter().enumerate() {
+        let active = t.phase == Phase::Player && i == t.active;
+        let marker = if active { "\u{203a}" } else { " " };
+        let label = if t.hands.len() > 1 {
+            format!("{marker}Hand {} ", i + 1)
+        } else {
+            format!("{marker}You    ")
+        };
+        let mut spans: Vec<Span> = vec![Span::styled(
+            label,
+            Style::default()
+                .fg(if active { Color::Yellow } else { Color::Gray })
+                .add_modifier(if active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )];
+        let mut cards_w = 0;
+        for &card in &hand.cards {
+            let text = format!("{card} ");
+            cards_w += text.chars().count();
+            spans.push(Span::styled(text, Style::default().fg(Color::White)));
+        }
+        push_total(&mut spans, cards_w, cards_total_label(&hand.cards));
+        if hand.doubled {
+            spans.push(Span::styled(" x2", Style::default().fg(Color::LightBlue)));
+        }
+        if let Some(result) = hand.result {
+            spans.push(Span::styled(
+                format!("  {} {:+.2}", result.label(), hand.net),
+                Style::default().fg(ev_color(hand.net)),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Status / feedback line, kept at the bottom of the felt.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        t.message.clone(),
+        Style::default().fg(Color::Cyan),
+    )));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The count-drill panel. On a finite shoe the true running count is kept hidden (that is the thing
+/// being practised) and the player checks themselves with the `n` quiz; penetration is shown since a
+/// counter sees it. The infinite deck has no count at all, so it reads as a plain basic-strategy drill.
+fn render_count_panel(f: &mut Frame, area: Rect, t: &Training) {
+    let title = if t.is_finite() { " Count " } else { " Deck " };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines = if let Some(decks_left) = t.decks_remaining() {
+        let (q, c) = (t.stats.count_quizzes, t.stats.count_correct);
+        let acc = if q > 0 {
+            format!("{:.0}%", 100.0 * c as f64 / q as f64)
+        } else {
+            "—".to_string()
+        };
+        vec![
+            Line::from(Span::styled(
+                "RC  hidden  (n to guess)",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(format!("Decks left  {decks_left:.1}")),
+            Line::from(format!("Quizzes     {c}/{q}  {acc}")),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "\u{221e} deck \u{00b7} no count",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "basic-strategy drill",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    };
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The last graded decision: the player's move against the basic / indexed / exact-optimal references,
+/// and the EV gap. Empty until [`Training::evaluate`](super::training::Training::evaluate) is wired up.
+fn render_feedback_panel(f: &mut Frame, area: Rect, t: &Training) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Last decision ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    match &t.last_mark {
+        None if t.grading() => lines.push(Line::from(Span::styled(
+            "grading\u{2026}",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            "play a hand to see feedback",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Some(m) => {
+            lines.push(Line::from(format!("you played  {}", move_name(m.chosen))));
+            let ref_line = |name: &str, mv: Move| {
+                let agree = mv == m.chosen;
+                Line::from(vec![
+                    Span::styled(format!("{name:<8}  "), Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!(
+                            "{} {}",
+                            if agree { "\u{2713}" } else { "\u{2717}" },
+                            move_name(mv)
+                        ),
+                        Style::default().fg(if agree { Color::Green } else { Color::Red }),
+                    ),
+                ])
+            };
+            lines.push(ref_line("basic", m.basic));
+            match m.indexed {
+                Some(mv) => lines.push(ref_line("indexed", mv)),
+                None => lines.push(Line::from(vec![
+                    Span::styled("indexed   ", Style::default().fg(Color::Gray)),
+                    Span::styled("— n/a", Style::default().fg(Color::DarkGray)),
+                ])),
+            }
+            lines.push(ref_line("optimal", m.optimal));
+            lines.push(Line::from(vec![
+                Span::raw(format!("EV cost   {:+.4}", m.ev_chosen - m.ev_optimal)),
+                // A newer decision is still being graded in the background.
+                Span::styled(
+                    if t.grading() { "  grading\u{2026}" } else { "" },
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The running session scoreboard: decision accuracy against each reference, realised net, and EV gap.
+fn render_stats_panel(f: &mut Frame, area: Rect, t: &Training) {
+    let block = Block::default().borders(Borders::ALL).title(" Session ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let s = &t.stats;
+    let rate = |n: u32| {
+        if s.decisions > 0 {
+            format!(
+                "{n}/{}  {:.0}%",
+                s.decisions,
+                100.0 * n as f64 / s.decisions as f64
+            )
+        } else {
+            "—".to_string()
+        }
+    };
+    // The indexed reference is count-only, so it is n/a on the infinite deck — show a dash there rather
+    // than a misleading 0%.
+    let indexed = if t.is_finite() {
+        format!("Indexed     {}", rate(s.agree_indexed))
+    } else {
+        "Indexed     —".to_string()
+    };
+    let lines = vec![
+        Line::from(format!("Rounds      {}", s.rounds)),
+        Line::from(format!("Decisions   {}", s.decisions)),
+        Line::from(format!("Basic       {}", rate(s.agree_basic))),
+        Line::from(indexed),
+        Line::from(format!("Optimal     {}", rate(s.agree_optimal))),
+        Line::from(vec![
+            Span::raw("EV gap      "),
+            Span::styled(
+                format!("{:+.3}", s.ev_gap),
+                Style::default().fg(ev_color(s.ev_gap)),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("Net         "),
+            Span::styled(
+                format!("{:+.2} u", s.realized),
+                Style::default().fg(ev_color(s.realized)),
+            ),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The training footer: the phase tag plus a context-sensitive key map. During the player's turn only
+/// the *legal* actions for the active hand are listed (via [`Training::allowed_move`]); otherwise the
+/// deal key. The count/tab/quit keys are always shown.
+fn render_training_footer(f: &mut Frame, area: Rect, t: &Training, rules: &Ruleset) {
+    let phase = match t.phase {
+        Phase::Ready => "ready",
+        Phase::Dealing => "dealing",
+        Phase::Player => "your turn",
+        Phase::Dealer => "dealer",
+        Phase::Settled => "settled",
+    };
+    let action = if t.phase == Phase::Player {
+        [
+            (Move::Hit, "h hit"),
+            (Move::Stand, "s stand"),
+            (Move::Double, "d double"),
+            (Move::Split, "p split"),
+            (Move::Surrender, "r surr"),
+        ]
+        .iter()
+        .filter(|(mv, _)| t.allowed_move(*mv, rules))
+        .map(|(_, label)| *label)
+        .collect::<Vec<_>>()
+        .join(" \u{00b7} ")
+    } else {
+        "Enter deal".to_string()
+    };
+    // The count quiz is finite-shoe only (the infinite deck has no count to guess).
+    let count_key = if t.is_finite() {
+        " \u{00b7} n count"
+    } else {
+        ""
+    };
+    let keys = format!("{action}{count_key} \u{00b7} 1 strategy \u{00b7} q quit");
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("[{phase}]"),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(keys, Style::default().fg(Color::DarkGray))),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// The running-count quiz overlay: the player's working guess, adjusted with `h`/`l` and submitted with
+/// Enter.
+fn render_count_quiz(f: &mut Frame, t: &Training) {
+    let lines = vec![
+        Line::from(format!("  Running count guess:  {:+}  ", t.count_entry)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  hl adjust \u{00b7} Enter submit \u{00b7} Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let width = 40;
+    let height = lines.len() as u16 + 2;
+    let area = centered_rect(width, height, f.area());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" What's the count? ");
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The collapsed total of a set of cards as a short felt label: `bust`, `blackjack`, `soft 18`, or a
+/// bare hard total. An empty set reads as `0`.
+/// Width of the dealt-cards field on the felt: cards render left-justified within it (each rank is
+/// `"X "`, two columns), and the running total is right-justified in [`TOTAL_COL_W`] immediately after,
+/// so the total reads as its own column set off from the cards rather than butting up against them.
+const CARDS_COL_W: usize = 24;
+/// Width of the right-justified hand-total column (fits the widest label, `"blackjack"`).
+const TOTAL_COL_W: usize = 9;
+
+/// Append the hand `total` as a right-justified column after the `cards_w`-wide run of card spans,
+/// padding the cards field out to [`CARDS_COL_W`] first so every row's total lines up in its own column.
+fn push_total(spans: &mut Vec<Span<'static>>, cards_w: usize, total: String) {
+    if let Some(pad) = CARDS_COL_W.checked_sub(cards_w).filter(|&p| p > 0) {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans.push(Span::styled(
+        format!("{total:>TOTAL_COL_W$}"),
+        Style::default().fg(Color::Gray),
+    ));
+}
+
+fn cards_total_label(cards: &[Card]) -> String {
+    if cards.is_empty() {
+        return "0".to_string();
+    }
+    match HandState::from(&CardCol::from_hand(cards)) {
+        HandState::Bust => "bust".to_string(),
+        HandState::Natural => "blackjack".to_string(),
+        HandState::Soft(n) => format!("soft {n}"),
+        HandState::Hard(n) => format!("{n}"),
     }
 }
 

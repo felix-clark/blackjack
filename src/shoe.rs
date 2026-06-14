@@ -1,3 +1,7 @@
+use rand::{
+    Rng,
+    distr::{Distribution, weighted::WeightedIndex},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
@@ -343,6 +347,17 @@ pub trait Shoe: Clone {
 
     /// Iterate over all possible cards in the deck with their weights
     fn all_draw_probs(&self) -> impl Iterator<Item = (Card, f64)>;
+
+    /// Draw a random card, weighted by [`draw_prob`](Shoe::draw_prob), and remove it from the shoe
+    /// (depleting a finite shoe; a no-op on a non-depleting one — so it samples *without* replacement on
+    /// the former and at the fixed rank frequencies on the latter, both via [`draw`](Shoe::draw)).
+    fn draw_rand(&mut self, rng: &mut impl Rng) -> Card {
+        let (cards, weights): (Vec<_>, Vec<_>) = self.all_draw_probs().unzip();
+        let dist = WeightedIndex::new(&weights).unwrap();
+        let card = cards[dist.sample(rng)];
+        self.draw(&card);
+        card
+    }
 
     /// The shoe remaining after a whole hand (a multiset of cards) is removed: multiset difference
     /// for a finite shoe, unchanged for a non-depleting one.

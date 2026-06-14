@@ -104,7 +104,12 @@ impl ShoeChoice {
             // `external` with the Ace removed. Without this offset the hole card would be conditioned on
             // `external + map(Ace)` instead.
             (ShoeChoice::Decks(n), Some(c)) => insurance_after_up(
-                CountShoe::from_external::<Ko>(n, c.external - Ko::map(&up), c.cmp, COUNT_PENETRATION),
+                CountShoe::from_external::<Ko>(
+                    n,
+                    c.external - Ko::map(&up),
+                    c.cmp,
+                    COUNT_PENETRATION,
+                ),
                 up,
             ),
             (ShoeChoice::Decks(n), None) => insurance_after_up(CardCol::from_decks(n), up),

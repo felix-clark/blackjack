@@ -22,7 +22,8 @@ use super::index::{
     INDEX_FILL_CONCURRENCY, INDEX_MARKER_MAX_RC, IndexKey, IndexReport, IndexResult,
     compute_index_report,
 };
-use super::{PANES, Pane, SOLVE_ORDER, UP_CARDS};
+use super::training::Training;
+use super::{PANES, Pane, SOLVE_ORDER, Tab, UP_CARDS};
 
 /// Which overlay (if any) is currently up.
 #[derive(PartialEq)]
@@ -45,6 +46,10 @@ pub(super) struct Cursor {
 type ChartKey = (ShoeChoice, Ruleset, Option<CountSetting>);
 
 pub(super) struct App {
+    /// The active top-level view (strategy chart vs. training drill).
+    pub(super) tab: Tab,
+    /// The training-tab state (its game engine is the stubbed seam in [`super::training`]).
+    pub(super) training: Training,
     pub(super) rules: Ruleset,
     pub(super) shoe: ShoeChoice,
     /// Whether a count condition is imposed, and its value/comparison. Only applied on a finite shoe.
@@ -100,6 +105,8 @@ impl App {
             cmp: CountCmp::Eq,
         };
         Self {
+            tab: Tab::Strategy,
+            training: Training::new(ShoeChoice::Infinite),
             rules: Ruleset::default(),
             shoe: ShoeChoice::Infinite,
             count_on: false,
@@ -266,6 +273,15 @@ impl App {
             .is_some_and(|ci| ci.count_dependent_within(INDEX_MARKER_MAX_RC))
     }
 
+    /// Switch the active top-level view. Entering the training tab re-points its live shoe at the
+    /// currently selected deck count if it changed under it (e.g. via the rules modal).
+    pub(super) fn set_tab(&mut self, tab: Tab) {
+        if tab == Tab::Training {
+            self.training.sync_shoe(self.shoe);
+        }
+        self.tab = tab;
+    }
+
     pub(super) fn active_pane(&self) -> Pane {
         PANES[self.cursor.pane]
     }
@@ -306,6 +322,11 @@ impl App {
         loop {
             self.drain_results();
             self.drain_index_results();
+            // Fold in any background training-decision grades that have finished.
+            self.training.drain_evals();
+            // Advance the paced dealer turn (one card per tick when its timer is up; a no-op otherwise).
+            let rules = self.rules;
+            self.training.tick(&rules);
             // Background-fill every cell's count index once the base chart is up (finite shoe only).
             self.schedule_index_fill();
             terminal.draw(|f| self.render(f))?;
