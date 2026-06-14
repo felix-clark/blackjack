@@ -490,6 +490,10 @@ impl App {
         if t.entering_count {
             render_count_quiz(f, t);
         }
+        // The rules editor is shared across tabs (opened with `r`), so draw its overlay here too.
+        if self.mode == Mode::Rules {
+            self.render_rules(f);
+        }
     }
 }
 

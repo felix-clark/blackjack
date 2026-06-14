@@ -19,8 +19,7 @@ use crate::rules::Ruleset;
 use super::column::{Column, ColumnResult};
 use super::config::{CountSetting, ShoeChoice};
 use super::index::{
-    INDEX_FILL_CONCURRENCY, INDEX_MARKER_MAX_RC, IndexKey, IndexReport, IndexResult,
-    compute_index_report,
+    INDEX_FILL_CONCURRENCY, IndexKey, IndexReport, IndexResult, compute_index_report,
 };
 use super::training::Training;
 use super::{PANES, Pane, SOLVE_ORDER, Tab, UP_CARDS};
@@ -264,13 +263,18 @@ impl App {
     }
 
     /// Whether `cat` vs `up` is a count-dependent cell whose report has already been computed and whose
-    /// flips fall within the notable [`INDEX_MARKER_MAX_RC`] window — the cue for the chart's `°` marker.
-    /// (Extreme-count-only flips are suppressed here but still shown in the popup.)
+    /// flips fall within the report's notable `[mark_lo, mark_hi]` band — the cue for the chart's `°`
+    /// marker. The band is occurrence-mass derived (deck/penetration-aware), so for an unbalanced count
+    /// it tracks the common running-count range instead of a fixed window around zero. (Flips out in the
+    /// occurrence tails are suppressed here but still shown in the popup.)
     pub(super) fn index_dependent(&self, cat: HandCategory, up: Card) -> bool {
-        self.index_key(up)
-            .and_then(|key| self.index_cache.get(&key))
-            .and_then(|report| report.cats.get(&cat))
-            .is_some_and(|ci| ci.count_dependent_within(INDEX_MARKER_MAX_RC))
+        let Some(report) = self.index_key(up).and_then(|key| self.index_cache.get(&key)) else {
+            return false;
+        };
+        report
+            .cats
+            .get(&cat)
+            .is_some_and(|ci| ci.count_dependent_in_band(report.mark_lo, report.mark_hi))
     }
 
     /// Switch the active top-level view. Entering the training tab re-points its live shoe at the

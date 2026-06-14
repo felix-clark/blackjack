@@ -81,12 +81,27 @@ fn occurrence_window(dist: &[(i16, f64)], tail_each: f64) -> (i16, i16) {
 /// chart workers to avoid swamping the cores the in-column split parallelism already wants.
 pub(super) const INDEX_FILL_CONCURRENCY: usize = 3;
 
-/// Chart `°` markers are only drawn for cells whose play actually shifts within a *notable* running
-/// count: roughly `|RC| ≤` this. A flip that only triggers at an extreme count (splitting tens vs 2 at
-/// RC ≈ +18, say) is suppressed on the chart — it is vanishingly rare in real play and acting on it
-/// would be conspicuous — but the full ladder is still shown in the popup. Stand-in for a future live
-/// "marker sensitivity" control; the popup is always exhaustive regardless.
-pub(super) const INDEX_MARKER_MAX_RC: i16 = 4;
+/// How much occurrence mass the chart `°` marker's *notable* band drops off **each** tail — the
+/// commonly-held core of the band, deliberately looser than [`INDEX_TAIL_MASS`] (which bounds the full
+/// solved/popup window). Because it is a mass threshold on the live occurrence distribution
+/// ([`CountShoe::external_count_distribution`]), this core tracks the deck count and penetration and is
+/// system-agnostic — for a balanced count it straddles 0, for an unbalanced one (KO) it slides down to
+/// where the running count actually sits (≈ the IRC..pivot span). That is the whole fix for the
+/// negative side: at six decks the typical count is ≈ −20..−8, so a deviation at RC −10 is *common*,
+/// not extreme, yet a fixed `|RC| ≤ 4` window (centered on 0, as for a balanced count) suppressed its
+/// marker. See [`INDEX_MARKER_PIVOT_MARGIN`] for why the mass core alone is not enough on the high side.
+const INDEX_MARKER_TAIL_MASS: f64 = 0.10;
+
+/// How far either side of the **pivot** (the zero-edge running count: 0 for a balanced count, +4 for
+/// KO) the marker band always reaches, on top of the [`INDEX_MARKER_TAIL_MASS`] mass core. The
+/// occurrence distribution is heavily left-skewed for multi-deck KO (its mass piles up near the very
+/// negative IRC), so a symmetric mass trim alone clips the high tail down to ≈ pivot and would drop the
+/// canonical high-count deviations — insurance, 16vT stand, etc. — which for KO cluster a few counts
+/// either side of the pivot regardless of deck count. Anchoring a fixed margin at the pivot (not at 0)
+/// keeps those flagged for every deck count while the mass core supplies the deck-dependent common
+/// (negative) range. The final band is `[min(mass_lo, pivot − M), max(mass_hi, pivot + M)]`; flips
+/// outside it are suppressed on the chart but still shown in full in the always-exhaustive popup.
+const INDEX_MARKER_PIVOT_MARGIN: i16 = 5;
 
 /// Whether a move is only available as the opening action on a two-card hand (so it disappears once the
 /// hand has been hit). These are exactly the headline moves a [`CategoryIndex`] gives a *fallback*
@@ -98,17 +113,17 @@ fn is_start_only(mv: Move) -> bool {
 
 /// Whether an ascending `(move, lo, hi)` run list has a play change whose *flip point* — the running
 /// count at which the later move takes over, i.e. the `lo` of each run after the first — falls inside
-/// the inclusive window `[-max_abs_rc, max_abs_rc]`. Used by the chart marker to ignore flips that only
-/// happen at extreme counts.
+/// the inclusive band `[band_lo, band_hi]`. Used by the chart marker to ignore flips that only happen
+/// out in the occurrence tails. The band is generally asymmetric and off-zero (an unbalanced count's
+/// common range does not straddle 0), so it is passed explicitly rather than as a `±` half-width.
 ///
-/// This keys on the boundary, not on which moves are *visible* in the window: a Hit→Stand index at
-/// RC −4 fires even though its Hit leg lives entirely at RC ≤ −5 (outside the window). Counting
-/// distinct in-window moves missed exactly that case — one leg of an in-window flip can sit just
-/// outside it.
-fn flips_within(runs: &[(Move, i16, i16)], max_abs_rc: i16) -> bool {
+/// This keys on the boundary, not on which moves are *visible* in the band: a Hit→Stand index at the
+/// band's lower edge fires even though its Hit leg lives entirely below the band. Counting distinct
+/// in-band moves missed exactly that case — one leg of an in-band flip can sit just outside it.
+fn flips_in_band(runs: &[(Move, i16, i16)], band_lo: i16, band_hi: i16) -> bool {
     runs.iter()
         .skip(1)
-        .any(|&(_, lo, _)| lo.abs() <= max_abs_rc)
+        .any(|&(_, lo, _)| (band_lo..=band_hi).contains(&lo))
 }
 
 /// One chart category's count-dependent move ladder over the index window, in ascending running-count
@@ -123,13 +138,16 @@ pub(super) struct CategoryIndex {
 }
 
 impl CategoryIndex {
-    /// The cell's right play genuinely shifts with the running count within a *notable* window
-    /// `|RC| ≤ max_abs_rc` — what the chart `°` marker keys on: either the headline flips or there is a
-    /// Hit/Stand flip behind a start-only headline move, somewhere in the window. A ladder that is
-    /// constant across the window (its only flips are at extreme, practically-unreachable counts) is
-    /// treated as not count-dependent *for display*; the popup still renders the whole ladder.
-    pub(super) fn count_dependent_within(&self, max_abs_rc: i16) -> bool {
-        flips_within(&self.primary, max_abs_rc) || flips_within(&self.fallback, max_abs_rc)
+    /// The cell's right play genuinely shifts with the running count within the *notable* band
+    /// `[band_lo, band_hi]` — what the chart `°` marker keys on: either the headline flips or there is a
+    /// Hit/Stand flip behind a start-only headline move, somewhere in the band. A ladder that is
+    /// constant across the band (its only flips are out in the occurrence tails) is treated as not
+    /// count-dependent *for display*; the popup still renders the whole ladder. The band is the
+    /// report's [`mark_lo`..=`mark_hi`](IndexReport), tracking the deck count and penetration (see
+    /// [`INDEX_MARKER_TAIL_MASS`] and [`INDEX_MARKER_PIVOT_MARGIN`]).
+    pub(super) fn count_dependent_in_band(&self, band_lo: i16, band_hi: i16) -> bool {
+        flips_in_band(&self.primary, band_lo, band_hi)
+            || flips_in_band(&self.fallback, band_lo, band_hi)
     }
 
     /// The distinct start-only moves the primary ladder recommends somewhere (so the popup can label the
@@ -154,6 +172,12 @@ impl CategoryIndex {
 pub(super) struct IndexReport {
     pub(super) lo: i16,
     pub(super) hi: i16,
+    /// The chart `°` marker's *notable* count band, inside the solved `[lo, hi]` window: the
+    /// commonly-held occurrence-mass core ([`INDEX_MARKER_TAIL_MASS`]) unioned with a fixed margin
+    /// around the pivot ([`INDEX_MARKER_PIVOT_MARGIN`]). A flip is marked only if its boundary falls in
+    /// `[mark_lo, mark_hi]` — for an unbalanced count this sits well off zero and is asymmetric.
+    pub(super) mark_lo: i16,
+    pub(super) mark_hi: i16,
     pub(super) cats: HashMap<HandCategory, CategoryIndex>,
     pub(super) complete: bool,
 }
@@ -273,6 +297,10 @@ struct ColumnEval {
     /// Usable (positive-mass) external counts, ascending; aligned with `shoes`.
     externals: Vec<i16>,
     shoes: Vec<CountShoe>,
+    /// The chart marker's notable count band (mass core ∪ pivot margin — see [`IndexReport::mark_lo`]),
+    /// clamped into the usable window. Defaults to the full window for fixed-width test builds.
+    mark_lo: i16,
+    mark_hi: i16,
     /// Per band external count: the (memoized) all-shift solve there (`build_evs` tree + reach weights).
     /// The per-frame inputs the WoO merge reads. Filled on demand by [`ensure_frame`], disk-first.
     frames: HashMap<i16, Frame>,
@@ -283,15 +311,30 @@ struct ColumnEval {
 impl ColumnEval {
     /// Build the band over the occurrence-bounded window: the central span of the running-count
     /// occurrence distribution that keeps all but [`INDEX_TAIL_MASS`] of the mass per tail (so we solve
-    /// every count realistically held and leave the rare extremes open-ended), clamped to always cover
-    /// the marker range so no displayable flip can hide outside it. `None` if nothing is reachable.
+    /// every count realistically held and leave the rare extremes open-ended), widened to always contain
+    /// the marker's notable band (mass core ∪ pivot margin — see [`INDEX_MARKER_PIVOT_MARGIN`]) so every
+    /// marked flip is visible in the popup. The marker band is then clamped inside the reachable window.
+    /// `None` if nothing is reachable.
     fn new(n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
         let dist = CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION);
+        let pivot = Ko::pivot(n);
+        // The marker's notable band: the commonly-held occurrence-mass core, always extended to cover a
+        // fixed margin either side of the pivot so the advantage-region (high-count) deviations stay
+        // flagged despite the distribution's skew. See INDEX_MARKER_PIVOT_MARGIN.
+        let (mass_lo, mass_hi) = occurrence_window(&dist, INDEX_MARKER_TAIL_MASS);
+        let mark_lo = mass_lo.min(pivot - INDEX_MARKER_PIVOT_MARGIN);
+        let mark_hi = mass_hi.max(pivot + INDEX_MARKER_PIVOT_MARGIN);
+        // Solved/popup window: the wider realistically-reachable span, widened to always contain the
+        // marker band (so every marked flip is visible in the popup).
         let (mut lo, mut hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
-        // Never trim inside the marker range — a flip the chart would draw must be inside the window.
-        lo = lo.min(-INDEX_MARKER_MAX_RC);
-        hi = hi.max(INDEX_MARKER_MAX_RC);
-        Self::build(n, up, rules, lo, hi)
+        lo = lo.min(mark_lo);
+        hi = hi.max(mark_hi);
+        let mut eval = Self::build(n, up, rules, lo, hi)?;
+        // Clamp into the actually-solved (reachable) window — `build` may drop unreachable edge counts —
+        // so the band never references an unsolved count.
+        eval.mark_lo = mark_lo.clamp(eval.lo(), eval.hi());
+        eval.mark_hi = mark_hi.clamp(eval.lo(), eval.hi());
+        Some(eval)
     }
 
     /// Build over an explicit inclusive external-count window `[lo, hi]`, dropping the counts whose exact
@@ -313,12 +356,17 @@ impl ColumnEval {
         if externals.is_empty() {
             return None;
         }
+        // Default the marker band to the full solved window; `new` narrows it to the occurrence-mass
+        // band, while fixed-width test builds keep the whole window.
+        let (mark_lo, mark_hi) = (externals[0], externals[externals.len() - 1]);
         Some(Self {
             n,
             up,
             rules: *rules,
             externals,
             shoes: usable,
+            mark_lo,
+            mark_hi,
             frames: HashMap::new(),
             summaries: HashMap::new(),
         })
@@ -464,6 +512,8 @@ pub(super) fn compute_index_report(
     let mut report = IndexReport {
         lo: eval.lo(),
         hi: eval.hi(),
+        mark_lo: eval.mark_lo,
+        mark_hi: eval.mark_hi,
         cats: HashMap::new(),
         complete: false,
     };
@@ -596,6 +646,30 @@ mod tests {
         );
     }
 
+    /// Regression for the soft-double deviation marker: A5 vs 3 (soft 16) deviates Hit→Double as the
+    /// count climbs, and that flip must land inside the marker band so the chart draws its `°` — even on
+    /// a single deck, where the flip sits at RC +5. The old fixed `|RC| ≤ 4` window dropped exactly that
+    /// (the flip was *visible in the popup* but unmarked on the chart), which the pivot-anchored band
+    /// (reaching pivot + [`INDEX_MARKER_PIVOT_MARGIN`] = +9) restores. `#[ignore]` (count-conditioned
+    /// solve); run `--release --ignored`.
+    #[test]
+    #[ignore]
+    fn count_index_soft16_vs_3_marks_single_deck() {
+        let mut eval = ColumnEval::new(1, Card::Pip(3), &Ruleset::default()).expect("usable window");
+        let (mlo, mhi) = (eval.mark_lo, eval.mark_hi);
+        let ci = eval.category_index(HandCategory::Soft(16));
+        assert!(
+            ci.primary.iter().any(|&(m, _, _)| m == Move::Double),
+            "expected a Hit→Double deviation, got primary={:?}",
+            ci.primary
+        );
+        assert!(
+            ci.count_dependent_in_band(mlo, mhi),
+            "soft 16 vs 3 must be marked; primary={:?} band=[{mlo},{mhi}]",
+            ci.primary
+        );
+    }
+
     /// PROTOTYPE MEASUREMENT (not an assertion): for each deck count, print the external running-count
     /// occurrence distribution's full reachable span and the [`occurrence_window`] at a few tail
     /// thresholds — i.e. how wide the count-index sweep needs to be to cover all-but-the-practically-
@@ -611,6 +685,9 @@ mod tests {
             "external running-count occurrence windows, pen={COUNT_PENETRATION:?} {pivot_note}"
         );
         println!("production threshold INDEX_TAIL_MASS = {INDEX_TAIL_MASS} per tail (marked *)");
+        println!(
+            "marker band: mass core (drop {INDEX_MARKER_TAIL_MASS}/tail) \u{222a} pivot \u{00b1}{INDEX_MARKER_PIVOT_MARGIN} (marked +)"
+        );
         for n in [1u8, 2, 4, 6, 8] {
             let dist = CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION);
             let (flo, fhi) = (dist.first().unwrap().0, dist.last().unwrap().0);
@@ -632,6 +709,14 @@ mod tests {
                     hi - lo + 1
                 );
             }
+            // The production marker band: mass core ∪ pivot ± margin (the actual `°` cue range).
+            let pivot = Ko::pivot(n);
+            let (mass_lo, mass_hi) = occurrence_window(&dist, INDEX_MARKER_TAIL_MASS);
+            let (mlo, mhi) = (
+                mass_lo.min(pivot - INDEX_MARKER_PIVOT_MARGIN),
+                mass_hi.max(pivot + INDEX_MARKER_PIVOT_MARGIN),
+            );
+            println!("  + marker band -> [{mlo:>3},{mhi:>3}]  width {:>3}", mhi - mlo + 1);
         }
     }
 
