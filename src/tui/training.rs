@@ -35,9 +35,9 @@ use crate::diskcache;
 use crate::hand::{HandState, Move, best_move, categorize, pair_rank};
 use crate::rules::Ruleset;
 use crate::shoe::{CardCol, InfiniteDeck, Shoe};
-use crate::simulation::{build_evs_with_splits, pair_split_evs_for, resolve_ev};
+use crate::simulation::{build_evs_with_splits, dealer_natural_prob, pair_split_evs_for, resolve_ev};
 
-use super::column::{ColumnSummary, solve_on};
+use super::column::ColumnSummary;
 use super::config::ShoeChoice;
 use super::index::{IndexKey, IndexReport};
 
@@ -149,42 +149,193 @@ impl TrainHand {
     }
 }
 
-/// A graded player decision: the move the player chose versus the three reference plays, with the EV of
-/// each. Produced by [`Training::evaluate`] and surfaced in the feedback panel.
+/// One reference play: the move a yardstick recommends, paired with its EV on *this* hand's exact solve
+/// (so `mark.ev_chosen - ref.ev` is the EV gap of the player's actual choice versus that reference). All
+/// reference EVs share the one move-EV basis, so the gaps are directly comparable across references.
+#[derive(Clone, Copy)]
+pub(super) struct RefPlay {
+    pub(super) mv: Move,
+    pub(super) ev: f64,
+}
+
+/// A graded player decision: the move the player chose versus each reference play, with the EV of each.
+/// Produced by [`Training::evaluate`] and surfaced in the feedback panel.
 ///
-/// The three references are the standard training yardsticks:
+/// The reference yardsticks, weakest to strongest:
+/// - **simple** — a beginner's hand-vs-up-card strategy (see [`simple_move`]), no count, no composition,
 /// - **basic** — the count-independent basic-strategy play (the chart's headline move),
 /// - **indexed** — the count-index play at the *true* running count (the deviation a counter makes),
 /// - **optimal** — the exact, composition-dependent best play for this very shoe and hand.
+///
+/// A good counter should beat **simple** and **basic** on EV and never beat **optimal**.
 pub(super) struct DecisionMark {
     pub(super) chosen: Move,
-    pub(super) basic: Move,
-    /// The count-index deviation at the current running count, or `None` until the (expensive,
-    /// count-conditioned) index lookup is wired up — the harness renders it as "n/a" meanwhile.
-    pub(super) indexed: Option<Move>,
-    pub(super) optimal: Move,
-    /// EV of the move actually chosen.
+    pub(super) simple: RefPlay,
+    pub(super) basic: RefPlay,
+    /// The count-index deviation at the current running count, or `None` on the infinite deck / until the
+    /// index report is cached — the harness renders it as "n/a" meanwhile.
+    pub(super) indexed: Option<RefPlay>,
+    pub(super) optimal: RefPlay,
+    /// EV of the move actually chosen (so `ev_chosen - optimal.ev` is the mistake cost, ≤ 0).
     pub(super) ev_chosen: f64,
-    /// EV of the exact-optimal move (so `ev_chosen - ev_optimal` is the mistake cost, ≤ 0 gap).
-    pub(super) ev_optimal: f64,
+    /// Whether this is the round's **opening** decision (the first move on the pristine two-card hand,
+    /// before any hit/split/double). The opening decision seeds the round's EV (its `ev_chosen` values the
+    /// whole round under optimal continuation, so a split/hit round is valued once, not double-counted);
+    /// each *downstream* decision then folds in only its regret (`ev_chosen − optimal.ev` ≤ 0), which
+    /// telescopes the total onto the player's actual-policy value. Reference EV totals take only the
+    /// opening EV. Agreement stats, by contrast, count *every* decision.
+    pub(super) opening: bool,
 }
 
-/// Running training scoreboard: decision accuracy against each reference, realised vs. theoretical EV,
-/// and count-quiz accuracy. All cumulative over the session; the render layer turns these into rates.
-#[derive(Default)]
+/// One reference yardstick's running scoreboard, plus the rule for pulling its play out of a graded
+/// decision. The four yardsticks (weakest to strongest: simple, basic, indexed, optimal) are scored
+/// uniformly through this one type — [`RefScore::all`] is the whole table — so adding or reordering a
+/// reference touches one list, not a dozen parallel fields. The only structural difference between them
+/// is [`Self::all_round`].
+pub(super) struct RefScore {
+    /// Display label ("Simple", "Basic", "Indexed", "Optimal").
+    pub(super) label: &'static str,
+    /// Whether this reference is defined on *every* decision and round. True for simple/basic/optimal;
+    /// false for **indexed**, which is count-only — n/a on the infinite deck and until the index report
+    /// is cached — so it covers a subset of decisions/rounds and carries its own denominators. An
+    /// all-round reference also collects no-decision naturals and accrues downstream-mistake regret,
+    /// keeping its [`Self::player_ev`] equal to [`TrainStats::ev_player`]; indexed does neither (it tracks
+    /// count *deviations*, so it stays opening-decision-only).
+    all_round: bool,
+    /// Pull this reference's recommended play out of a graded decision, or `None` where it is undefined
+    /// (only indexed ever is — see [`Self::all_round`]).
+    get: fn(&DecisionMark) -> Option<RefPlay>,
+
+    /// Decisions matching this reference, over [`Self::decisions`] — the decisions where it was defined.
+    pub(super) agree: u32,
+    pub(super) decisions: u32,
+    /// Cumulative opening (reference) EV over [`Self::rounds`], the rounds this reference covers.
+    pub(super) ev: f64,
+    pub(super) rounds: u32,
+    /// The player's own cumulative EV over exactly the rounds this reference covers, so the EV gap is
+    /// simply `player_ev - ev`. For an all-round reference this tracks [`TrainStats::ev_player`]; for
+    /// indexed it is the opening-only player EV over the count-deviation rounds.
+    pub(super) player_ev: f64,
+}
+
+impl RefScore {
+    /// The reference table the trainer scores against, in display order (weakest to strongest).
+    fn all() -> Vec<RefScore> {
+        let mk = |label, all_round, get: fn(&DecisionMark) -> Option<RefPlay>| RefScore {
+            label,
+            all_round,
+            get,
+            agree: 0,
+            decisions: 0,
+            ev: 0.0,
+            rounds: 0,
+            player_ev: 0.0,
+        };
+        vec![
+            mk("Simple", true, |m| Some(m.simple)),
+            mk("Basic", true, |m| Some(m.basic)),
+            mk("Indexed", false, |m| m.indexed),
+            mk("Optimal", true, |m| Some(m.optimal)),
+        ]
+    }
+
+    /// Whether this reference has anything to display yet: the all-round references always do; indexed
+    /// only once it has graded a count-deviation round.
+    pub(super) fn shown(&self) -> bool {
+        self.all_round || self.rounds > 0
+    }
+
+    /// The player-minus-reference EV gap over the rounds this reference covers.
+    pub(super) fn gap(&self) -> f64 {
+        self.player_ev - self.ev
+    }
+
+    /// Fold one graded decision into this reference. `None` from the extractor (indexed only) means the
+    /// reference is undefined here and nothing accrues.
+    fn grade(&mut self, mark: &DecisionMark) {
+        let Some(play) = (self.get)(mark) else {
+            return;
+        };
+        // Agreement counts *every* decision where the reference was defined — this is where later-street
+        // and per-arm mistakes surface.
+        self.decisions += 1;
+        if mark.chosen == play.mv {
+            self.agree += 1;
+        }
+        if mark.opening {
+            // The opening decision seeds the round: the reference takes its opening EV, the player takes
+            // the chosen EV (which values the whole round under optimal continuation).
+            self.rounds += 1;
+            self.ev += play.ev;
+            self.player_ev += mark.ev_chosen;
+        } else if self.all_round {
+            // A *downstream* mistake's regret (`ev_chosen - optimal.ev` ≤ 0) is pure player loss versus an
+            // all-round reference, which never acts past the opening — so it widens the gap there. Indexed
+            // stays opening-only and ignores it.
+            self.player_ev += mark.ev_chosen - mark.optimal.ev;
+        }
+    }
+
+    /// Fold a no-decision natural round. The player and every all-round reference settle it identically;
+    /// indexed abstains (it tracks count deviations, and a natural offers none).
+    fn settle_natural(&mut self, ev: f64) {
+        if self.all_round {
+            self.rounds += 1;
+            self.ev += ev;
+            self.player_ev += ev;
+        }
+    }
+}
+
+/// Running training scoreboard: per-reference decision accuracy and expected value (one [`RefScore`] per
+/// yardstick in [`Self::refs`]), the player's own expectation, and count-quiz accuracy. All cumulative
+/// over the session; the render layer turns these into rates. Two accumulation grains live here on
+/// purpose (see [`Training::fold_decision`] and [`RefScore::grade`]):
+///
+/// - **Agreement** counts *every* graded decision — this is where later-street and per-arm mistakes show.
+/// - **Expected value** is accumulated per *round*, so it stays comparable to (and converges on) the
+///   strategy-table edge and the realised [`Self::realized`] Net. Each round contributes once: the
+///   opening decision's EV (which values the whole round under optimal continuation), plus any
+///   *downstream* mistake's regret (`ev_chosen − ev_optimal` ≤ 0), plus no-decision naturals folded
+///   straight in ([`Training::fold_no_decision`]). Over every round the denominator is [`Self::rounds`].
 pub(super) struct TrainStats {
     pub(super) rounds: u32,
     pub(super) decisions: u32,
-    /// Decisions matching the basic-strategy / indexed / exact-optimal reference, respectively.
-    pub(super) agree_basic: u32,
-    pub(super) agree_indexed: u32,
-    pub(super) agree_optimal: u32,
-    /// Cumulative EV the player gave up versus exact-optimal play (≤ 0; the sum of per-decision gaps).
-    pub(super) ev_gap: f64,
+
+    /// One running scoreboard per reference yardstick (simple, basic, indexed, optimal), in display
+    /// order; see [`RefScore`].
+    pub(super) refs: Vec<RefScore>,
+
+    /// The player's own cumulative expected units over *all* rounds — the "You" headline. It carries the
+    /// opening EV, every downstream-mistake regret, and the folded no-decision naturals. A good counter
+    /// runs it above simple/basic and below optimal, and `ev_player / rounds` tracks the table edge. Each
+    /// reference's gap is this same value restricted to the rounds that reference covers, minus the
+    /// reference's EV — tracked per reference as [`RefScore::player_ev`] so [`RefScore::gap`] is a plain
+    /// subtraction even for the subset-covering indexed reference.
+    pub(super) ev_player: f64,
+
     /// Cumulative net units actually won/lost across settled rounds.
     pub(super) realized: f64,
+    /// Cumulative units actually wagered across settled rounds — the sum of every hand's bet, so doubles
+    /// and split arms each add their own stake. The exposure denominator behind [`Self::realized`].
+    pub(super) units_bet: f64,
     pub(super) count_quizzes: u32,
     pub(super) count_correct: u32,
+}
+
+impl Default for TrainStats {
+    fn default() -> Self {
+        TrainStats {
+            rounds: 0,
+            decisions: 0,
+            refs: RefScore::all(),
+            ev_player: 0.0,
+            realized: 0.0,
+            units_bet: 0.0,
+            count_quizzes: 0,
+            count_correct: 0,
+        }
+    }
 }
 
 /// The trainer's live draw source. Its two modes are exactly the two games a trainer can drill, and
@@ -299,8 +450,13 @@ pub(super) struct Training {
     pub(super) stats: TrainStats,
     /// A one-line status/feedback message shown under the table.
     pub(super) message: String,
-    /// Count-independent basic-strategy reference, solved lazily on the infinite deck (per up-card) and
-    /// memoized for the session — see [`Training::evaluate`]. Invalidated when the ruleset changes.
+    /// Count-independent basic-strategy reference: the chart's own count-agnostic column for the live
+    /// shoe (the very [`Column`](super::column::Column) the strategy tab renders with counting off),
+    /// solved lazily per up-card and memoized for the session — see [`Training::spawn_eval`]. Keyed by
+    /// up-card alone; a deck or ruleset change clears the whole cache (see [`reset_to`](Self::reset_to)),
+    /// so every live entry belongs to the current shoe+rules. Solving on the live shoe — not a generic
+    /// infinite deck — is what makes basic match the chart cell-for-cell: deck count flips marginal
+    /// cells (e.g. soft 13 vs 5 hits on an infinite deck but doubles on six).
     basic: HashMap<Card, ColumnSummary>,
     /// The ruleset `basic` was solved under; a change clears the cache.
     basic_rules: Ruleset,
@@ -438,6 +594,9 @@ impl Training {
         self.last_mark = None;
         self.message =
             "Press Enter to deal \u{00b7} n: guess the count \u{00b7} 1: strategy tab".into();
+        // The basic reference is the live shoe's count-agnostic chart, so a deck switch invalidates
+        // every memoized summary (a 6-deck cell is not a 2-deck one).
+        self.basic.clear();
         // Any grade still in flight was computed for the old shoe; drop it on arrival.
         self.eval_valid_from = self.eval_seq;
     }
@@ -525,13 +684,27 @@ impl Training {
         // over by the paced dealer turn (which then settles), not revealed inline.
         let dealer_natural = DealerHand::from_card_vec(&self.dealer).is_natural();
         let peeks = rules.peek.peeks() && matches!(up, Card::Ace | Card::Ten);
+        let player_natural = self.hands[0].col().is_nat21();
         if peeks && dealer_natural {
+            // No decision: the dealer's confirmed natural pushes a player natural and beats anything else.
+            // Folded into the EV totals so they stay consistent with the table edge (this is the
+            // dealer-natural deficit that `EdgeTerm::value` subtracts).
+            self.fold_no_decision(if player_natural { 0.0 } else { -1.0 });
             self.start_dealer();
             return;
         }
         // A player natural stands pat: there is no decision, so go straight to the dealer (who, under no
-        // peek, may still turn over a natural for a push).
-        if self.hands[0].col().is_nat21() {
+        // peek, may still turn over a natural for a push). Fold its EV in: the blackjack payout, discounted
+        // by the chance an unpeeked dealer still draws a natural for a push.
+        if player_natural {
+            let bj = rules.bj_payout.multiplier();
+            let dealer_may_be_natural = !peeks && matches!(up, Card::Ace | Card::Ten);
+            let ev = if dealer_may_be_natural {
+                bj * (1.0 - self.dealer_natural_prob_seen(up))
+            } else {
+                bj
+            };
+            self.fold_no_decision(ev);
             self.hands[0].done = true;
             self.start_dealer();
             return;
@@ -711,6 +884,7 @@ impl Training {
             hand.result = Some(result);
             hand.net = net;
             round_net += net;
+            self.stats.units_bet += hand.bet;
         }
 
         self.stats.rounds += 1;
@@ -721,8 +895,8 @@ impl Training {
 
     /// Drain any finished background grades, folding each into the scoreboard (see
     /// [`fold_decision`](Self::fold_decision)). Stale results — graded under a ruleset/deck the trainer
-    /// has since left — are dropped; a freshly-solved infinite-deck basic summary is memoized so the next
-    /// decision on that up-card skips it. Called every event-loop tick from [`super::app`].
+    /// has since left — are dropped; a freshly-solved basic summary is memoized so the next decision on
+    /// that up-card skips it. Called every event-loop tick from [`super::app`].
     pub(super) fn drain_evals(&mut self) {
         while let Ok(res) = self.eval_rx.try_recv() {
             self.pending_evals = self.pending_evals.saturating_sub(1);
@@ -749,22 +923,54 @@ impl Training {
     /// Fold a graded decision into the running scoreboard and surface it in the feedback panel. `seq`
     /// orders the panel so an out-of-order completion never replaces a newer grade.
     fn fold_decision(&mut self, seq: u64, mark: DecisionMark) {
-        self.stats.decisions += 1;
-        if mark.chosen == mark.basic {
-            self.stats.agree_basic += 1;
+        let s = &mut self.stats;
+        s.decisions += 1;
+        // The player's own value: the opening decision seeds the round (its `ev_chosen` values the whole
+        // round under optimal continuation, so a split/hit round is valued once and stays comparable to
+        // realised Net and the table edge); a *downstream* decision folds in only its regret
+        // (`ev_chosen - optimal.ev` ≤ 0), the performance-difference telescoping that corrects `ev_player`
+        // for later-street mistakes the opening EV assumed away.
+        if mark.opening {
+            s.ev_player += mark.ev_chosen;
+        } else {
+            s.ev_player += mark.ev_chosen - mark.optimal.ev;
         }
-        if mark.indexed == Some(mark.chosen) {
-            self.stats.agree_indexed += 1;
+        // Every reference scores the same decision off its own extractor (see [`RefScore::grade`]):
+        // agreement over all defined decisions, EV per opening round.
+        for r in &mut s.refs {
+            r.grade(&mark);
         }
-        if mark.chosen == mark.optimal {
-            self.stats.agree_optimal += 1;
-        }
-        // The gap is the EV the choice gave up vs the exact-optimal play (≤ 0).
-        self.stats.ev_gap += mark.ev_chosen - mark.ev_optimal;
         // Newest grade wins the feedback panel; cumulative stats above are order-independent.
         if seq >= self.last_mark_seq {
             self.last_mark_seq = seq;
             self.last_mark = Some(mark);
+        }
+    }
+
+    /// Fold a no-decision round (a natural that settles before any player action) into the EV totals so
+    /// they stay consistent with the strategy-table edge. There is no decision, so the player and every
+    /// reference settle the round identically — the same value lands in each. `indexed` is left out: it
+    /// tracks count *deviations*, and a natural offers none.
+    fn fold_no_decision(&mut self, ev: f64) {
+        let s = &mut self.stats;
+        s.ev_player += ev;
+        for r in &mut s.refs {
+            r.settle_natural(ev);
+        }
+    }
+
+    /// The probability, from the player's view, that the dealer's hole-card completes a natural — the
+    /// honest conditional used to value a no-decision player-natural round against an *unpeeked* ten/ace
+    /// up-card. The player sees their hand and the up-card but not the hole, so the unseen population is
+    /// the live shoe with the hole added back in (on the infinite deck it is just the fixed draw).
+    fn dealer_natural_prob_seen(&self, up: Card) -> f64 {
+        match &self.shoe {
+            TrainShoe::Finite { cards, .. } => {
+                let mut unseen = *cards;
+                unseen.insert(self.dealer[1]);
+                dealer_natural_prob(up, &unseen)
+            }
+            TrainShoe::Infinite => dealer_natural_prob(up, &InfiniteDeck {}),
         }
     }
 
@@ -773,12 +979,14 @@ impl Training {
     /// - **optimal** (and the chosen/optimal EVs): the exact best play for *this* depleted shoe, from
     ///   [`build_evs_with_splits`] on the live composition — count-aware by construction; on the infinite
     ///   deck the (composition-independent) basic EVs already are exact-optimal, so no live solve runs;
-    /// - **basic**: the count-independent infinite-deck headline, solved once per up-card and memoized;
+    /// - **basic**: the count-agnostic chart headline for the live shoe — the same column the strategy
+    ///   tab renders with counting off ([`ShoeChoice::solve`] with no count, disk-cached), solved once
+    ///   per up-card and memoized — so the trainer's basic matches the chart cell-for-cell;
     /// - **indexed**: the count-index deviation at the player's current running count, read from the
     ///   chart's **disk-cached** [`IndexReport`] (see [`indexed_move`](Self::indexed_move)) — `None` until
     ///   that up-card's index has been solved (it fills in the background while the strategy tab is open).
     ///
-    /// All the heavy work ([`build_evs_with_splits`] and the cold infinite-deck basic solve) runs on the
+    /// All the heavy work ([`build_evs_with_splits`] and the cold basic chart solve) runs on the
     /// worker, so the move never blocks the UI; the cheap inputs (the index lookup, the reconstructed
     /// solver shoe, the memoized basic summary) are captured here and shipped to the pure
     /// [`run_eval`]. The finished grade folds back in via [`drain_evals`](Self::drain_evals).
@@ -788,6 +996,9 @@ impl Training {
         }
         let up = self.dealer[0];
         let hand = self.hands[self.active].col();
+        // The round's opening decision: the first move, on the lone pristine two-card hand before any
+        // hit/split/double. Only these feed the per-round EV totals (see [`DecisionMark::opening`]).
+        let opening = self.active == 0 && self.hands.len() == 1 && self.hands[0].cards.len() == 2;
 
         // A ruleset change invalidates the memoized basic summaries and any grade still in flight (it was
         // computed under the old rules), so drop both before issuing this job's `seq`.
@@ -802,6 +1013,9 @@ impl Training {
             up,
             chosen,
             rules: *rules,
+            // The live shoe selection, so the basic reference is solved on the same shoe the chart
+            // renders (count off) rather than a generic infinite deck — see [`EvalJob::shoe`].
+            shoe: self.shoe.choice(),
             // The moves legal on *this* (possibly multi-card) hand, so the basic-strategy reference is
             // judged among only the actions the player can actually take — a three-card 16 is graded on
             // Hit-vs-Stand, never against the two-card-only Surrender headline. Resolved here while we
@@ -818,6 +1032,7 @@ impl Training {
             finite_shoe: self.reconstruct_solver_shoe(&hand, up),
             // Reuse the memoized basic summary if we have it; otherwise the worker solves and echoes it.
             basic_summary: self.basic.get(&up).cloned(),
+            opening,
             hand,
         };
         self.eval_seq += 1;
@@ -911,6 +1126,10 @@ struct EvalJob {
     up: Card,
     hand: CardCol,
     rules: Ruleset,
+    /// The live shoe selection. The basic reference is solved on *this* shoe with counting off — i.e.
+    /// the exact count-agnostic column the strategy chart renders — so the trainer's "basic" matches
+    /// the chart cell-for-cell (deck count flips marginal cells, so an infinite-deck solve would not).
+    shoe: ShoeChoice,
     chosen: Move,
     /// The moves legal on the live hand (computed on the UI thread), so the basic reference is the best
     /// of *these* by the chart EVs rather than the unconditional two-card headline.
@@ -920,9 +1139,13 @@ struct EvalJob {
     /// The round-start shoe for the finite live solve; `None` on the infinite deck (whose optimal play is
     /// the composition-independent basic play, taken from `basic_summary`).
     finite_shoe: Option<CardCol>,
-    /// The memoized infinite-deck basic summary for this up-card, if already solved; `None` asks the
-    /// worker to solve it and echo it back (in [`EvalResult::basic_summary`]) for memoization.
+    /// The memoized count-agnostic basic summary for this up-card, if already solved; `None` asks the
+    /// worker to solve it (on [`shoe`](Self::shoe)) and echo it back (in [`EvalResult::basic_summary`])
+    /// for memoization.
     basic_summary: Option<ColumnSummary>,
+    /// Whether this is the round's opening decision (drives the per-round EV totals; see
+    /// [`DecisionMark::opening`]). Resolved on the UI thread from the live hand state.
+    opening: bool,
 }
 
 /// A finished decision grade streamed back from an eval worker (see [`Training::drain_evals`]).
@@ -933,8 +1156,8 @@ struct EvalResult {
     /// The graded decision, or `None` if the hand was somehow absent from the solved tree (unreachable in
     /// practice). Sent regardless so the pending-grade counter is always settled.
     mark: Option<DecisionMark>,
-    /// `Some` only when the worker had to solve the infinite-deck basic summary, so the main thread can
-    /// memoize it (keyed by `up`).
+    /// `Some` only when the worker had to solve the basic summary, so the main thread can memoize it
+    /// (keyed by `up`).
     basic_summary: Option<ColumnSummary>,
 }
 
@@ -944,12 +1167,15 @@ struct EvalResult {
 /// and assembles the [`DecisionMark`]. Runs off the UI thread.
 fn run_eval(job: EvalJob) -> EvalResult {
     let cat = categorize(&job.hand);
-    // Basic strategy: the count-independent infinite-deck play. Use the memoized summary if the caller
-    // had one, else solve it here and hand it back for memoization.
+    // Basic strategy: the count-agnostic chart play for the live shoe — the very column the strategy tab
+    // renders with counting off ([`ShoeChoice::solve`] with `count: None`, disk-cached, so this reuses
+    // the chart's own solve when it exists). Solving on the live shoe (not a generic infinite deck) is
+    // what makes the trainer's basic match the chart cell-for-cell. Use the memoized summary if the
+    // caller had one, else solve it here and hand it back for memoization.
     let (basic_summary, computed) = match job.basic_summary {
         Some(summary) => (summary, None),
         None => {
-            let summary = solve_on(InfiniteDeck {}, job.up, &job.rules).summary;
+            let summary = job.shoe.solve(job.up, &job.rules, None).summary;
             (summary.clone(), Some(summary))
         }
     };
@@ -965,18 +1191,28 @@ fn run_eval(job: EvalJob) -> EvalResult {
         let optimal = best_move(&move_evs);
         let ev_optimal = move_evs[&optimal];
         let ev_chosen = move_evs.get(&job.chosen).copied().unwrap_or(ev_optimal);
+        // Each reference's EV on this hand's exact solve. A reference move that isn't available on the
+        // live hand (an absent key) falls back to the optimal EV — harmless, since such a reference move
+        // was already coerced to a legal action below or by the caller.
+        let ev_of = |mv: Move| move_evs.get(&mv).copied().unwrap_or(ev_optimal);
+        let play = |mv: Move| RefPlay { mv, ev: ev_of(mv) };
+
+        // Basic strategy judged among only the legal moves (so a multi-card hand isn't graded against the
+        // two-card-only Surrender/Double headline); on a two-card hand this is exactly the chart headline,
+        // since the legal set then spans the cell's full move list.
+        let basic = basic_cell
+            .map(|c| best_allowed_move(&c.move_evs, &job.allowed))
+            .unwrap_or(optimal);
+        // Simple: the beginner's hand-vs-up-card play, coerced to a move the live hand can actually make.
+        let simple = coerce_available(simple_move(&job.hand, job.up), &move_evs);
         DecisionMark {
             chosen: job.chosen,
-            // Basic strategy judged among only the legal moves (so a multi-card hand isn't graded
-            // against the two-card-only Surrender/Double headline); on a two-card hand this is exactly
-            // the chart headline, since the legal set then spans the cell's full move list.
-            basic: basic_cell
-                .map(|c| best_allowed_move(&c.move_evs, &job.allowed))
-                .unwrap_or(optimal),
-            indexed: job.indexed,
-            optimal,
+            simple: play(simple),
+            basic: play(basic),
+            indexed: job.indexed.map(play),
+            optimal: play(optimal),
             ev_chosen,
-            ev_optimal,
+            opening: job.opening,
         }
     });
 
@@ -1053,6 +1289,43 @@ fn best_allowed_move(move_evs: &HashMap<Move, f64>, allowed: &[Move]) -> Move {
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .map(|(m, _)| m)
         .unwrap_or_else(|| best_move(move_evs))
+}
+
+/// The "Simplified Basic Strategy" from knock-out blackjack
+fn simple_move(hand: &CardCol, up: Card) -> Move {
+    use Move::*;
+    let up = match up {
+        Card::Ace => 11,
+        c => c.hard(),
+    };
+    // Always split aces and eights
+    if let Some(rank) = pair_rank(hand)
+        && (rank == Card::Ace || rank == Card::Pip(8))
+    {
+        return Split;
+    }
+    // Stand soft hands at 18+
+    if hand.best_count() >= 18 {
+        return Stand;
+    }
+    let hard_count = hand.hard_count();
+    // Double down on hard 10 or 11 if beating the dealer
+    if hand.len() == 2 && (10..=11).contains(&hard_count) && hard_count > up {
+        return Double;
+    }
+    let stand_at = if up <= 6 { 12 } else { 17 };
+    if hard_count >= stand_at { Stand } else { Hit }
+}
+
+/// Coerce a reference move into one the live hand can actually make, so its EV is always present in the
+/// exact solve's `move_evs`. A start-only move (Double/Split/Surrender) the hand can no longer take — it
+/// has already hit, or isn't a pair — degrades to Hit, the conventional "take another card" fallback;
+/// Stand is the universal last resort.
+fn coerce_available(mv: Move, move_evs: &HashMap<Move, f64>) -> Move {
+    [mv, Move::Hit, Move::Stand]
+        .into_iter()
+        .find(|m| move_evs.contains_key(m))
+        .unwrap_or(mv)
 }
 
 /// The full move name, shared with the strategy tab's vocabulary.

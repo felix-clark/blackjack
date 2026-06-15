@@ -455,37 +455,40 @@ impl App {
     /// panels, and a key-hint footer, plus the count-quiz overlay when it is open.
     fn render_training(&self, f: &mut Frame, body: Rect) {
         let t = &self.training;
+        // The felt + info column sit above a full-width Session scoreboard, with the key-map footer last.
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(2)])
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(SESSION_H),
+                Constraint::Length(2),
+            ])
             .split(body);
-        // Felt on the left, a fixed-width info column on the right (stacked vertically when narrow).
-        let cols = if rows[0].width >= 64 {
+        let main = rows[0];
+        // Fixed-width info column on the left, felt on the right (stacked vertically when narrow), so
+        // the count/feedback corrections sit by the eye rather than off on the far edge.
+        let cols = if main.width >= 64 {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(0), Constraint::Length(38)])
-                .split(rows[0])
+                .constraints([Constraint::Length(28), Constraint::Min(0)])
+                .split(main)
         } else {
             Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(10), Constraint::Min(0)])
-                .split(rows[0])
+                .split(main)
         };
 
-        render_felt(f, cols[0], t);
+        render_felt(f, cols[1], t, &self.rules);
         let side = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(5),
-                Constraint::Length(9),
-                Constraint::Min(0),
-            ])
-            .split(cols[1]);
+            .constraints([Constraint::Length(5), Constraint::Min(0)])
+            .split(cols[0]);
         render_count_panel(f, side[0], t);
         render_feedback_panel(f, side[1], t);
-        render_stats_panel(f, side[2], t);
+        render_stats_panel(f, rows[1], t);
 
-        render_training_footer(f, rows[1], t, &self.rules);
+        render_training_footer(f, rows[2], t);
 
         if t.entering_count {
             render_count_quiz(f, t);
@@ -498,7 +501,7 @@ impl App {
 }
 
 /// The felt: the dealer's hand, the player's hand(s), and the current status line.
-fn render_felt(f: &mut Frame, area: Rect, t: &Training) {
+fn render_felt(f: &mut Frame, area: Rect, t: &Training, rules: &Ruleset) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green))
@@ -506,23 +509,27 @@ fn render_felt(f: &mut Frame, area: Rect, t: &Training) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Hand totals are flush with the felt's right edge so practising means reading the cards, not
+    // leaning on a total next to them.
+    let width = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
 
     // Dealer row. The hole card (index 1) is hidden — and uncounted — until the paced dealer turn flips
     // it (so it stays a "?" through the player's turn and only the moment its [`DEALER_STEP`] tick lands).
     let revealed = !t.hole_down;
-    let mut dealer: Vec<Span> = vec![Span::styled("Dealer  ", Style::default().fg(Color::Gray))];
+    let dealer_label = "Dealer  ";
+    let mut dealer: Vec<Span> = vec![Span::styled(dealer_label, Style::default().fg(Color::Gray))];
     if t.dealer.is_empty() {
         dealer.push(Span::styled("—", Style::default().fg(Color::DarkGray)));
     } else {
-        let mut cards_w = 0;
+        let mut used = dealer_label.chars().count();
         for (i, &card) in t.dealer.iter().enumerate() {
             let (text, style) = if i == 1 && !revealed {
                 ("? ".to_string(), Style::default().fg(Color::DarkGray))
             } else {
                 (format!("{card} "), Style::default().fg(Color::White))
             };
-            cards_w += text.chars().count();
+            used += text.chars().count();
             dealer.push(Span::styled(text, style));
         }
         let shown: Vec<Card> = if revealed {
@@ -530,7 +537,7 @@ fn render_felt(f: &mut Frame, area: Rect, t: &Training) {
         } else {
             t.dealer[..1].to_vec()
         };
-        push_total(&mut dealer, cards_w, cards_total_label(&shown));
+        push_total(&mut dealer, used, cards_total_label(&shown), width);
     }
     lines.push(Line::from(dealer));
     lines.push(Line::from(""));
@@ -550,6 +557,7 @@ fn render_felt(f: &mut Frame, area: Rect, t: &Training) {
         } else {
             format!("{marker}You    ")
         };
+        let mut used = label.chars().count();
         let mut spans: Vec<Span> = vec![Span::styled(
             label,
             Style::default()
@@ -560,33 +568,60 @@ fn render_felt(f: &mut Frame, area: Rect, t: &Training) {
                     Modifier::empty()
                 }),
         )];
-        let mut cards_w = 0;
         for &card in &hand.cards {
             let text = format!("{card} ");
-            cards_w += text.chars().count();
+            used += text.chars().count();
             spans.push(Span::styled(text, Style::default().fg(Color::White)));
         }
-        push_total(&mut spans, cards_w, cards_total_label(&hand.cards));
         if hand.doubled {
-            spans.push(Span::styled(" x2", Style::default().fg(Color::LightBlue)));
+            let x2 = " x2";
+            used += x2.chars().count();
+            spans.push(Span::styled(x2, Style::default().fg(Color::LightBlue)));
         }
+        // The result sits to the left of the flush-right total.
         if let Some(result) = hand.result {
-            spans.push(Span::styled(
-                format!("  {} {:+.2}", result.label(), hand.net),
-                Style::default().fg(ev_color(hand.net)),
-            ));
+            let text = format!("  {} {:+.2}", result.label(), hand.net);
+            used += text.chars().count();
+            spans.push(Span::styled(text, Style::default().fg(ev_color(hand.net))));
         }
+        push_total(&mut spans, used, cards_total_label(&hand.cards), width);
         lines.push(Line::from(spans));
     }
 
-    // Status / feedback line, kept at the bottom of the felt.
+    // Status / feedback line, kept under the hands.
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         t.message.clone(),
         Style::default().fg(Color::Cyan),
     )));
 
+    // The legal-action key list rides right under the message during the player's turn, so the keys
+    // are next to the play view rather than stranded in the footer.
+    if t.phase == Phase::Player {
+        let keys = MOVE_ORDER
+            .iter()
+            .filter(|&&mv| t.allowed_move(mv, rules))
+            .map(|&mv| move_key_hint(mv))
+            .collect::<Vec<_>>()
+            .join("  \u{00b7}  ");
+        lines.push(Line::from(Span::styled(
+            keys,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A legal action as a `key label` hint for the felt's move list, e.g. `h hit`.
+fn move_key_hint(mv: Move) -> &'static str {
+    match mv {
+        Move::Hit => "h hit",
+        Move::Stand => "s stand",
+        Move::Double => "d double",
+        Move::Split => "p split",
+        Move::Surrender => "r surr",
+    }
 }
 
 /// The count-drill panel. On a finite shoe the true running count is kept hidden (that is the thing
@@ -644,7 +679,7 @@ fn render_feedback_panel(f: &mut Frame, area: Rect, t: &Training) {
             Style::default().fg(Color::DarkGray),
         ))),
         None => lines.push(Line::from(Span::styled(
-            "play a hand to see feedback",
+            "play a hand for feedback",
             Style::default().fg(Color::DarkGray),
         ))),
         Some(m) => {
@@ -663,17 +698,18 @@ fn render_feedback_panel(f: &mut Frame, area: Rect, t: &Training) {
                     ),
                 ])
             };
-            lines.push(ref_line("basic", m.basic));
+            lines.push(ref_line("simple", m.simple.mv));
+            lines.push(ref_line("basic", m.basic.mv));
             match m.indexed {
-                Some(mv) => lines.push(ref_line("indexed", mv)),
+                Some(r) => lines.push(ref_line("indexed", r.mv)),
                 None => lines.push(Line::from(vec![
                     Span::styled("indexed   ", Style::default().fg(Color::Gray)),
                     Span::styled("— n/a", Style::default().fg(Color::DarkGray)),
                 ])),
             }
-            lines.push(ref_line("optimal", m.optimal));
+            lines.push(ref_line("optimal", m.optimal.mv));
             lines.push(Line::from(vec![
-                Span::raw(format!("EV cost   {:+.4}", m.ev_chosen - m.ev_optimal)),
+                Span::raw(format!("EV cost   {:+.4}", m.ev_chosen - m.optimal.ev)),
                 // A newer decision is still being graded in the background.
                 Span::styled(
                     if t.grading() { "  grading\u{2026}" } else { "" },
@@ -685,59 +721,98 @@ fn render_feedback_panel(f: &mut Frame, area: Rect, t: &Training) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The running session scoreboard: decision accuracy against each reference, realised net, and EV gap.
+/// Total height the Session scoreboard claims at the bottom of the training tab: a summary line, a column
+/// header, the five strategy rows (You + four references), and the box border.
+const SESSION_H: u16 = 9;
+
+/// The running session scoreboard: a row per strategy (You, then the Simple/Basic/Indexed/Optimal
+/// yardsticks weakest-to-strongest) showing decision agreement, the strategy's expected value, and — for
+/// the references — the player's gap to it (`EV(you) − EV(ref)`). EV and gap are shown as cumulative
+/// units and as a per-bet rate (per initial bet, normalised over all rounds). The gap is positive when the player
+/// out-earns the reference (the goal vs Simple/Basic) and ≤ 0 versus Optimal by construction. EV is the
+/// variance-free companion to the realised Net in the summary line.
 fn render_stats_panel(f: &mut Frame, area: Rect, t: &Training) {
     let block = Block::default().borders(Borders::ALL).title(" Session ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let s = &t.stats;
-    let rate = |n: u32| {
-        if s.decisions > 0 {
-            format!(
-                "{n}/{}  {:.0}%",
-                s.decisions,
-                100.0 * n as f64 / s.decisions as f64
-            )
+    // Agreement rate over `d` graded decisions (n/a when the reference covered none yet).
+    let pct = |n: u32, d: u32| {
+        if d > 0 {
+            format!("{:.0}%", 100.0 * n as f64 / d as f64)
         } else {
-            "—".to_string()
+            "\u{2014}".to_string()
         }
     };
-    // The indexed reference is count-only, so it is n/a on the infinite deck — show a dash there rather
-    // than a misleading 0%.
-    let indexed = if t.is_finite() {
-        format!("Indexed     {}", rate(s.agree_indexed))
-    } else {
-        "Indexed     —".to_string()
+    // Per-bet rate of a cumulative units figure, over `d` rounds (the per-initial-bet normaliser).
+    let per_bet = |x: f64, d: u32| if d > 0 { 100.0 * x / d as f64 } else { 0.0 };
+    // A units/per-bet value cell (EV or gap): two right-aligned columns coloured by sign; `None` (an
+    // undefined indexed figure, or the player's own gap) renders as a dash. `d` is the per-bet denominator
+    // for this row (all rounds for You/Simple/Basic/Optimal, indexed rounds for Indexed).
+    let cell = move |v: Option<f64>, d: u32| -> Vec<Span<'static>> {
+        match v {
+            Some(x) => {
+                let c = ev_color(x);
+                vec![
+                    Span::styled(format!("{x:>+9.3}"), Style::default().fg(c)),
+                    Span::styled(format!("{:>+7.1}%", per_bet(x, d)), Style::default().fg(c)),
+                ]
+            }
+            None => vec![
+                Span::styled(format!("{:>9}", "\u{2014}"), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{:>8}", "")),
+            ],
+        }
     };
-    let lines = vec![
-        Line::from(format!("Rounds      {}", s.rounds)),
-        Line::from(format!("Decisions   {}", s.decisions)),
-        Line::from(format!("Basic       {}", rate(s.agree_basic))),
-        Line::from(indexed),
-        Line::from(format!("Optimal     {}", rate(s.agree_optimal))),
+    // One strategy row: label, agreement, EV cell, gap cell, all normalised over `d` rounds.
+    let row = |label: &str, agree: String, ev: Option<f64>, gap: Option<f64>, d: u32| {
+        let mut spans = vec![
+            Span::raw(format!("{label:<9}")),
+            Span::raw(format!("{agree:>6}")),
+        ];
+        spans.extend(cell(ev, d));
+        spans.extend(cell(gap, d));
+        Line::from(spans)
+    };
+
+    let mut lines = vec![
         Line::from(vec![
-            Span::raw("EV gap      "),
+            Span::raw(format!(
+                "Rounds {} \u{00b7} Units bet {:.2} \u{00b7} Decisions {} \u{00b7} Net ",
+                s.rounds, s.units_bet, s.decisions
+            )),
             Span::styled(
-                format!("{:+.3}", s.ev_gap),
-                Style::default().fg(ev_color(s.ev_gap)),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("Net         "),
-            Span::styled(
-                format!("{:+.2} u", s.realized),
+                format!("{:+.2}u", s.realized),
                 Style::default().fg(ev_color(s.realized)),
             ),
         ]),
+        Line::from(Span::styled(
+            format!(
+                "{:<9}{:>6}{:>9}{:>8}{:>9}{:>8}",
+                "", "agree", "EV", "/bet", "gap", "/bet"
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+        // "You" is the player's own expectation — no self-agreement, no self-gap.
+        row("You", "\u{2014}".to_string(), Some(s.ev_player), None, s.rounds),
     ];
+    // One row per reference yardstick. The conditional indexed reference shows dashes until it has graded
+    // a count-deviation round (`shown()` is false); `pct` already dashes a zero agreement denominator.
+    for r in &s.refs {
+        let (ev, gap) = if r.shown() {
+            (Some(r.ev), Some(r.gap()))
+        } else {
+            (None, None)
+        };
+        lines.push(row(r.label, pct(r.agree, r.decisions), ev, gap, r.rounds));
+    }
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The training footer: the phase tag plus a context-sensitive key map. During the player's turn only
-/// the *legal* actions for the active hand are listed (via [`Training::allowed_move`]); otherwise the
-/// deal key. The count/tab/quit keys are always shown.
-fn render_training_footer(f: &mut Frame, area: Rect, t: &Training, rules: &Ruleset) {
+/// The training footer: the phase tag plus the global key map (deal/count/tab/quit). The legal-action
+/// keys for the active hand live on the felt, right under the status line (see [`render_felt`]).
+fn render_training_footer(f: &mut Frame, area: Rect, t: &Training) {
     let phase = match t.phase {
         Phase::Ready => "ready",
         Phase::Dealing => "dealing",
@@ -745,29 +820,15 @@ fn render_training_footer(f: &mut Frame, area: Rect, t: &Training, rules: &Rules
         Phase::Dealer => "dealer",
         Phase::Settled => "settled",
     };
-    let action = if t.phase == Phase::Player {
-        [
-            (Move::Hit, "h hit"),
-            (Move::Stand, "s stand"),
-            (Move::Double, "d double"),
-            (Move::Split, "p split"),
-            (Move::Surrender, "r surr"),
-        ]
-        .iter()
-        .filter(|(mv, _)| t.allowed_move(*mv, rules))
-        .map(|(_, label)| *label)
-        .collect::<Vec<_>>()
-        .join(" \u{00b7} ")
+    // The action keys move to the felt during the player's turn; off-turn the deal key leads here.
+    let deal = if t.phase == Phase::Player {
+        ""
     } else {
-        "Enter deal".to_string()
+        "Enter deal \u{00b7} "
     };
     // The count quiz is finite-shoe only (the infinite deck has no count to guess).
-    let count_key = if t.is_finite() {
-        " \u{00b7} n count"
-    } else {
-        ""
-    };
-    let keys = format!("{action}{count_key} \u{00b7} 1 strategy \u{00b7} q quit");
+    let count_key = if t.is_finite() { "n count \u{00b7} " } else { "" };
+    let keys = format!("{deal}{count_key}1 strategy \u{00b7} q quit");
     let lines = vec![
         Line::from(Span::styled(
             format!("[{phase}]"),
@@ -802,23 +863,19 @@ fn render_count_quiz(f: &mut Frame, t: &Training) {
 
 /// The collapsed total of a set of cards as a short felt label: `bust`, `blackjack`, `soft 18`, or a
 /// bare hard total. An empty set reads as `0`.
-/// Width of the dealt-cards field on the felt: cards render left-justified within it (each rank is
-/// `"X "`, two columns), and the running total is right-justified in [`TOTAL_COL_W`] immediately after,
-/// so the total reads as its own column set off from the cards rather than butting up against them.
-const CARDS_COL_W: usize = 24;
 /// Width of the right-justified hand-total column (fits the widest label, `"blackjack"`).
 const TOTAL_COL_W: usize = 9;
 
-/// Append the hand `total` as a right-justified column after the `cards_w`-wide run of card spans,
-/// padding the cards field out to [`CARDS_COL_W`] first so every row's total lines up in its own column.
-fn push_total(spans: &mut Vec<Span<'static>>, cards_w: usize, total: String) {
-    if let Some(pad) = CARDS_COL_W.checked_sub(cards_w).filter(|&p| p > 0) {
+/// Append the hand `total` flush with the felt's right edge: pad from the `used`-wide run of spans
+/// already on the row (label + cards + any result) out to `width`, so the total reads as its own
+/// column hard against the window edge, away from the cards.
+fn push_total(spans: &mut Vec<Span<'static>>, used: usize, total: String, width: usize) {
+    let total = format!("{total:>TOTAL_COL_W$}");
+    let want = used + total.chars().count();
+    if let Some(pad) = width.checked_sub(want).filter(|&p| p > 0) {
         spans.push(Span::raw(" ".repeat(pad)));
     }
-    spans.push(Span::styled(
-        format!("{total:>TOTAL_COL_W$}"),
-        Style::default().fg(Color::Gray),
-    ));
+    spans.push(Span::styled(total, Style::default().fg(Color::Gray)));
 }
 
 fn cards_total_label(cards: &[Card]) -> String {
