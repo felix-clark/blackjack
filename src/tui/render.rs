@@ -484,7 +484,12 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(5), Constraint::Min(0)])
             .split(cols[0]);
-        render_count_panel(f, side[0], t);
+        // A drill swaps the count/deck panel for a drill-status panel — its frame has no running count.
+        if t.is_drill() {
+            render_drill_panel(f, side[0], t);
+        } else {
+            render_count_panel(f, side[0], t);
+        }
         render_feedback_panel(f, side[1], t);
         render_stats_panel(f, rows[1], t);
 
@@ -492,6 +497,9 @@ impl App {
 
         if t.entering_count {
             render_count_quiz(f, t);
+        }
+        if t.configuring_drill {
+            render_drill_setup(f, t);
         }
         // The rules editor is shared across tabs (opened with `r`), so draw its overlay here too.
         if self.mode == Mode::Rules {
@@ -663,6 +671,39 @@ fn render_count_panel(f: &mut Frame, area: Rect, t: &Training) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The drill-status panel (shown in place of the count panel while drilling): the active categories and
+/// a reminder that each round is dealt from a fresh shoe — the basic-strategy frame, with no count.
+fn render_drill_panel(f: &mut Frame, area: Rect, t: &Training) {
+    let block = Block::default().borders(Borders::ALL).title(" Drill ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut cats: Vec<&str> = Vec::new();
+    if t.drill.soft {
+        cats.push("soft");
+    }
+    if t.drill.pairs {
+        cats.push("pairs");
+    }
+    let cats = if cats.is_empty() {
+        "none".to_string()
+    } else {
+        cats.join(" + ")
+    };
+    let lines = vec![
+        Line::from(format!("Drilling  {cats}")),
+        Line::from(Span::styled(
+            "fresh shoe each round",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "m setup \u{00b7} basic strategy",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// The last graded decision: the player's move against the basic / indexed / exact-optimal references,
 /// and the EV gap. Empty until [`Training::evaluate`](super::training::Training::evaluate) is wired up.
 fn render_feedback_panel(f: &mut Frame, area: Rect, t: &Training) {
@@ -760,7 +801,10 @@ fn render_stats_panel(f: &mut Frame, area: Rect, t: &Training) {
                 ]
             }
             None => vec![
-                Span::styled(format!("{:>9}", "\u{2014}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:>9}", "\u{2014}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{:>8}", "")),
             ],
         }
@@ -779,11 +823,11 @@ fn render_stats_panel(f: &mut Frame, area: Rect, t: &Training) {
     let mut lines = vec![
         Line::from(vec![
             Span::raw(format!(
-                "Rounds {} \u{00b7} Units bet {:.2} \u{00b7} Decisions {} \u{00b7} Net ",
+                "Rounds {} \u{00b7} Units bet {:.1} \u{00b7} Decisions {} \u{00b7} Net ",
                 s.rounds, s.units_bet, s.decisions
             )),
             Span::styled(
-                format!("{:+.2}u", s.realized),
+                format!("{:+.1}u", s.realized),
                 Style::default().fg(ev_color(s.realized)),
             ),
         ]),
@@ -795,7 +839,13 @@ fn render_stats_panel(f: &mut Frame, area: Rect, t: &Training) {
             Style::default().fg(Color::DarkGray),
         )),
         // "You" is the player's own expectation — no self-agreement, no self-gap.
-        row("You", "\u{2014}".to_string(), Some(s.ev_player), None, s.rounds),
+        row(
+            "You",
+            "\u{2014}".to_string(),
+            Some(s.ev_player),
+            None,
+            s.rounds,
+        ),
     ];
     // One row per reference yardstick. The conditional indexed reference shows dashes until it has graded
     // a count-deviation round (`shown()` is false); `pct` already dashes a zero agreement denominator.
@@ -826,9 +876,21 @@ fn render_training_footer(f: &mut Frame, area: Rect, t: &Training) {
     } else {
         "Enter deal \u{00b7} "
     };
-    // The count quiz is finite-shoe only (the infinite deck has no count to guess).
-    let count_key = if t.is_finite() { "n count \u{00b7} " } else { "" };
-    let keys = format!("{deal}{count_key}1 strategy \u{00b7} q quit");
+    // The count quiz is for the counted game only (no count in a drill or on the infinite deck).
+    let count_key = if t.counting_active() {
+        "n count \u{00b7} "
+    } else {
+        ""
+    };
+    // The drill setup is reachable off-turn; the hint flags whether a drill is currently running.
+    let drill_key = if t.phase == Phase::Player {
+        ""
+    } else if t.is_drill() {
+        "m drill* \u{00b7} "
+    } else {
+        "m drill \u{00b7} "
+    };
+    let keys = format!("{deal}{count_key}{drill_key}1 strategy \u{00b7} q quit");
     let lines = vec![
         Line::from(Span::styled(
             format!("[{phase}]"),
@@ -857,6 +919,41 @@ fn render_count_quiz(f: &mut Frame, t: &Training) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
         .title(" What's the count? ");
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The drill-setup overlay: toggle which hand categories the drill deals (Soft / Pairs), then start
+/// drilling, drop back to free play, or cancel.
+fn render_drill_setup(f: &mut Frame, t: &Training) {
+    let row = |sel: bool, label: &str, on: bool| {
+        let marker = if sel { "\u{203a}" } else { " " };
+        let box_ = if on { "[x]" } else { "[ ]" };
+        Line::from(Span::styled(
+            format!("  {marker} {box_} {label}"),
+            Style::default().fg(if sel { Color::Yellow } else { Color::White }),
+        ))
+    };
+    let lines = vec![
+        row(t.drill_sel == 0, "Soft hands", t.drill.soft),
+        row(t.drill_sel == 1, "Pairs", t.drill.pairs),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  jk move \u{00b7} space toggle \u{00b7} sp soft/pairs",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  Enter start \u{00b7} f free play \u{00b7} Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let width = 44;
+    let height = lines.len() as u16 + 2;
+    let area = centered_rect(width, height, f.area());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Drill setup ");
     f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }

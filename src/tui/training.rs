@@ -32,7 +32,7 @@ use crate::card::Card;
 use crate::count::{CountSystem, Ko};
 use crate::dealer::DealerHand;
 use crate::diskcache;
-use crate::hand::{HandState, Move, best_move, categorize, pair_rank};
+use crate::hand::{HandCategory, HandState, Move, best_move, categorize, pair_rank};
 use crate::rules::Ruleset;
 use crate::shoe::{CardCol, InfiniteDeck, Shoe};
 use crate::simulation::{build_evs_with_splits, dealer_natural_prob, pair_split_evs_for, resolve_ev};
@@ -411,6 +411,46 @@ impl TrainShoe {
     }
 }
 
+/// Which hand categories the **drill** restricts the dealt opening to. A drill is the basic-strategy
+/// frame: each round is dealt from a *fresh* shoe (matching the strategy derivation, not the depleting
+/// counted game), with the player's two opening cards constrained to a selected category so practice
+/// can focus on the hands that actually need it.
+///
+/// Soft hands and pairs are the first two categories, each independently selectable (either or both).
+/// The split mirrors the chart's own [`categorize`] router exactly — `A,A`/`T,T` are pairs, `A,5` is
+/// soft, and `A,T` (a natural) falls in neither — so a drilled hand always lands on the chart row the
+/// player is practising. This is the extension point for the rest of the planned drill knobs (hard
+/// categories like 12 / 15–16 / 9, composition exclusions like no-`T,T`, and eventually a target count
+/// consumed by [`Training::deal_drill_opening`]).
+#[derive(Clone, Copy)]
+pub(super) struct DrillSpec {
+    pub(super) soft: bool,
+    pub(super) pairs: bool,
+}
+
+impl DrillSpec {
+    /// Whether any category is selected — the precondition for entering a drill (an empty selection has
+    /// nothing to deal, so [`Training::start_drill`] refuses it).
+    fn any(self) -> bool {
+        self.soft || self.pairs
+    }
+
+    /// Whether a two-card opening hand falls in a selected category. Routes through [`categorize`], so a
+    /// pair is judged as a pair and a natural (`A,T`) matches nothing.
+    ///
+    /// `A,A` and `T,T` are excluded from the pairs drill: aces are always split (no condition seen so far
+    /// recommends otherwise) and the `T,T` deviations are rare and marginal, so neither rewards practice.
+    /// (Making this a configurable knob is the natural next step; for now they are simply dropped.)
+    fn accepts(self, opening: &CardCol) -> bool {
+        match categorize(opening) {
+            HandCategory::Soft(_) => self.soft,
+            HandCategory::Pair(Card::Ace | Card::Ten) => false,
+            HandCategory::Pair(_) => self.pairs,
+            _ => false,
+        }
+    }
+}
+
 /// The training-tab state: the live shoe, the in-progress round, the count-quiz overlay, and the
 /// session scoreboard.
 pub(super) struct Training {
@@ -445,6 +485,19 @@ pub(super) struct Training {
     pub(super) entering_count: bool,
     /// The player's working count guess in the quiz overlay.
     pub(super) count_entry: i16,
+    /// Whether the trainer is in **drill** mode: each round dealt from a fresh shoe with the opening hand
+    /// constrained to [`drill`](Self::drill)'s categories (a basic-strategy drill), rather than the
+    /// depleting counted game. Counting UI is hidden while this is set (see [`counting_active`]).
+    ///
+    /// [`counting_active`]: Self::counting_active
+    pub(super) drilling: bool,
+    /// The drill's category selection, persisted across rounds and overlay open/close so reopening the
+    /// setup remembers it. Defaults to both categories on.
+    pub(super) drill: DrillSpec,
+    /// Whether the drill-setup overlay is open.
+    pub(super) configuring_drill: bool,
+    /// The selected field (row) in the drill-setup overlay.
+    pub(super) drill_sel: usize,
     /// The most recent graded decision, shown in the feedback panel until the next one.
     pub(super) last_mark: Option<DecisionMark>,
     pub(super) stats: TrainStats,
@@ -499,6 +552,13 @@ impl Training {
             opening_dealt: 0,
             entering_count: false,
             count_entry: 0,
+            drilling: false,
+            drill: DrillSpec {
+                soft: true,
+                pairs: true,
+            },
+            configuring_drill: false,
+            drill_sel: 0,
             last_mark: None,
             stats: TrainStats::default(),
             message: "Press Enter to deal \u{00b7} n: guess the count \u{00b7} 1: strategy tab"
@@ -560,6 +620,18 @@ impl Training {
     /// reference — on this.
     pub(super) fn is_finite(&self) -> bool {
         self.shoe.is_finite()
+    }
+
+    /// Whether the trainer is in drill mode (see [`drilling`](Self::drilling)).
+    pub(super) fn is_drill(&self) -> bool {
+        self.drilling
+    }
+
+    /// Whether the counting machinery is live: a finite shoe *and* not drilling. The render/input layers
+    /// gate the count panel, the `n` quiz, and the indexed reference on this — a drill is a fresh-shoe
+    /// basic-strategy frame with no running count, so its counting UI is hidden even on a finite deck.
+    pub(super) fn counting_active(&self) -> bool {
+        self.is_finite() && !self.drilling
     }
 
     /// Re-point the live shoe at the currently selected [`ShoeChoice`] if its deck count changed (e.g.
@@ -625,9 +697,6 @@ impl Training {
     /// is dealt face-down and uncounted; the naturals/peek are resolved once the deal lands (see
     /// [`finish_opening_deal`](Self::finish_opening_deal)).
     pub(super) fn deal(&mut self, rules: &Ruleset) {
-        if self.needs_shuffle() {
-            self.reset_shoe();
-        }
         self.hands = vec![TrainHand::new(1.0)];
         self.dealer.clear();
         self.hole_down = false;
@@ -635,13 +704,83 @@ impl Training {
         self.active = 0;
 
         // Draw all four up front (so the hole exists for the peek and the shoe is depleted now), but reveal
-        // them one per `DEAL_STEP` tick: player, dealer up, player, dealer hole.
-        self.opening = vec![self.draw(), self.draw(), self.draw(), self.draw()];
+        // them one per `DEAL_STEP` tick: player, dealer up, player, dealer hole. A drill deals a
+        // *constrained* opening from a fresh shoe; free play deals straight off the live shoe, reshuffling
+        // at penetration first.
+        self.opening = if self.drilling {
+            self.deal_drill_opening()
+        } else {
+            if self.needs_shuffle() {
+                self.reset_shoe();
+            }
+            vec![self.draw(), self.draw(), self.draw(), self.draw()]
+        };
         self.opening_dealt = 0;
         self.phase = Phase::Dealing;
         self.message = "Dealing\u{2026}".into();
         // Lay the first card immediately so the felt isn't momentarily empty; the rest follow on the timer.
         self.deal_step(rules);
+    }
+
+    /// Draw a drill opening: reject-sample a *fresh full shoe* until the player's two cards land in a
+    /// selected category, returning the four opening cards (player, dealer up, player, dealer hole) in the
+    /// same order [`deal`](Self::deal) lays out. Each attempt restores the shoe to full first, so the deal
+    /// is drawn at honest fresh-shoe frequencies (matching the basic-strategy derivation) and the accepted
+    /// deal leaves the shoe depleted by exactly those four cards — what [`reconstruct_solver_shoe`] expects.
+    ///
+    /// This is the seam for the future count dimension: dealing from a count-target shoe instead of a fresh
+    /// one is the only change drilling at a given count needs. The retry cap is a safety net only — a drill
+    /// is never entered with an empty selection (see [`start_drill`](Self::start_drill)), and soft/pairs are
+    /// common, so a match lands in a handful of attempts.
+    ///
+    /// [`reconstruct_solver_shoe`]: Self::reconstruct_solver_shoe
+    fn deal_drill_opening(&mut self) -> Vec<Card> {
+        for _ in 0..10_000 {
+            // Fresh shoe per attempt so a rejected deal doesn't deplete the next one.
+            self.shoe.reset();
+            self.running_count = initial_count(&self.shoe);
+            let opening = vec![self.draw(), self.draw(), self.draw(), self.draw()];
+            let hand = CardCol::from_hand(&[opening[0], opening[2]]);
+            if self.drill.accepts(&hand) {
+                return opening;
+            }
+        }
+        // Unreachable in practice (a non-empty selection always has common matches); fall back to whatever
+        // the last fresh shoe dealt rather than loop forever.
+        vec![self.draw(), self.draw(), self.draw(), self.draw()]
+    }
+
+    /// Enter drill mode and deal the first constrained round. Refuses an empty category selection (nothing
+    /// to deal), leaving the setup overlay open with a prompt instead. Called from the drill-setup overlay's
+    /// confirm key.
+    pub(super) fn start_drill(&mut self, rules: &Ruleset) {
+        if !self.drill.any() {
+            self.message = "Select at least one category to drill.".into();
+            return;
+        }
+        self.drilling = true;
+        self.configuring_drill = false;
+        // A grade still in flight was computed for the pre-drill shoe; drop it on arrival.
+        self.eval_valid_from = self.eval_seq;
+        self.deal(rules);
+    }
+
+    /// Leave drill mode for normal counted/free play: restore a fresh full shoe and count, abandon any
+    /// in-progress round, and close the setup overlay. The session scoreboard is kept (a drill and the
+    /// counted game both grade rounds into the same totals).
+    pub(super) fn stop_drill(&mut self) {
+        self.drilling = false;
+        self.configuring_drill = false;
+        self.reset_shoe();
+        self.phase = Phase::Ready;
+        self.hands.clear();
+        self.dealer.clear();
+        self.hole_down = false;
+        self.step_at = None;
+        self.last_mark = None;
+        self.eval_valid_from = self.eval_seq;
+        self.message =
+            "Press Enter to deal \u{00b7} n: guess the count \u{00b7} 1: strategy tab".into();
     }
 
     /// Lay one opening card into its seat (revealing — and so counting — every card but the face-down
@@ -686,6 +825,14 @@ impl Training {
         let peeks = rules.peek.peeks() && matches!(up, Card::Ace | Card::Ten);
         let player_natural = self.hands[0].col().is_nat21();
         if peeks && dealer_natural {
+            // In a drill the point is to practise a *decision*, so a peeked dealer blackjack — which would
+            // settle before the player acts — is thrown back and the round re-dealt from a fresh shoe. This
+            // only fires when the peek rule is actually set (it gates `peeks`); a no-peek dealer natural is
+            // revealed during the dealer turn, after the player has already decided, so it stands.
+            if self.drilling {
+                self.deal(rules);
+                return;
+            }
             // No decision: the dealer's confirmed natural pushes a player natural and beats anything else.
             // Folded into the EV totals so they stay consistent with the table edge (this is the
             // dealer-natural deficit that `EdgeTerm::value` subtracts).
@@ -1074,6 +1221,11 @@ impl Training {
     /// longer make — already hit, or not a pair — we drop to the Hit/Stand `fallback` ladder, mirroring
     /// the popup's "if can't …" logic.
     fn indexed_move(&self, hand: &CardCol, up: Card, rules: &Ruleset) -> Option<Move> {
+        // A drill is a fresh-shoe basic-strategy frame with no running count, so there is no count
+        // deviation to reference — the feedback panel shows "indexed — n/a".
+        if self.drilling {
+            return None;
+        }
         // The index is a finite-shoe, count-conditioned object: the infinite deck has no count, so no
         // index deviation exists there. Keyed by the concrete deck count (the trainer's `n_decks`), it
         // shares the exact disk cache the strategy tab populates for a `Decks(n)` selection.

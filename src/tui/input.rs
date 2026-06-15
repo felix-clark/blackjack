@@ -19,6 +19,9 @@ const RULES_FIELDS: usize = 8;
 /// Number of fields in the count modal (enabled, comparison, value).
 const COUNT_FIELDS: usize = 3;
 
+/// Number of toggleable category rows in the drill-setup overlay (Soft, Pairs).
+const DRILL_FIELDS: usize = 2;
+
 impl App {
     /// Handle one key press. Returns `true` to quit.
     pub(super) fn handle_key(&mut self, code: KeyCode) -> bool {
@@ -226,13 +229,46 @@ impl App {
             }
             return false;
         }
+        // The drill-setup overlay captures input while open: toggle the categories, then start drilling,
+        // drop back to free play, or cancel.
+        if self.training.configuring_drill {
+            match code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.training.drill_sel = (self.training.drill_sel + 1) % DRILL_FIELDS;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.training.drill_sel =
+                        (self.training.drill_sel + DRILL_FIELDS - 1) % DRILL_FIELDS;
+                }
+                KeyCode::Char('h')
+                | KeyCode::Left
+                | KeyCode::Char('l')
+                | KeyCode::Right
+                | KeyCode::Char(' ') => self.toggle_drill_field(self.training.drill_sel),
+                // Direct toggles, regardless of the selected row.
+                KeyCode::Char('s') => self.toggle_drill_field(0),
+                KeyCode::Char('p') => self.toggle_drill_field(1),
+                KeyCode::Enter => {
+                    let rules = self.rules;
+                    self.training.start_drill(&rules);
+                }
+                KeyCode::Char('f') => self.training.stop_drill(),
+                KeyCode::Esc | KeyCode::Char('m') => self.training.configuring_drill = false,
+                _ => {}
+            }
+            return false;
+        }
 
         match code {
             KeyCode::Char('q') => return true,
             KeyCode::Char('1') => self.set_tab(Tab::Strategy),
-            // Open the running-count quiz — finite shoe only (the infinite deck has no count).
-            KeyCode::Char('n') if self.training.is_finite() => {
+            // Open the running-count quiz — counted game only (no count in a drill or on the infinite deck).
+            KeyCode::Char('n') if self.training.counting_active() => {
                 self.training.entering_count = true;
+            }
+            // Open the drill-setup overlay off-turn (editing it mid-round would abandon the round anyway).
+            KeyCode::Char('m') if self.training.phase != Phase::Player => {
+                self.training.configuring_drill = true;
             }
             // Deal a fresh round from the Ready or Settled phase (Enter or `d`).
             KeyCode::Enter | KeyCode::Char('d')
@@ -254,6 +290,15 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Toggle a drill-setup category row (0 = Soft, 1 = Pairs).
+    fn toggle_drill_field(&mut self, field: usize) {
+        match field {
+            0 => self.training.drill.soft = !self.training.drill.soft,
+            1 => self.training.drill.pairs = !self.training.drill.pairs,
+            _ => {}
+        }
     }
 
     /// Change the selected count-modal field by `delta`: toggle enabled, cycle the comparison, or
