@@ -10,7 +10,8 @@ use std::sync::mpsc::Sender;
 use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
-use crate::count::{CountCmp, CountKind, CountShoe, CountSystem, HiLo, Ko, TC_HALF_UNITS};
+use crate::count::{CountCmp, CountKind, CountSystem, HiLo, Ko, TC_HALF_UNITS};
+use crate::countshoe::CountShoe;
 use crate::diskcache;
 use crate::hand::{HandCategory, Move};
 use crate::reach::{reach_weights, summarize_cells};
@@ -633,8 +634,8 @@ pub(super) fn compute_index_report(
     // inclusive side of its cutoff, so a true-count report needs the basic-strategy moves. They come from
     // the uncounted base column (system-independent, disk-cached — usually already solved for the chart).
     // The running-count display keeps its offset boundaries, so it skips this solve.
-    let base = (kind == CountKind::TrueCount)
-        .then(|| ShoeChoice::Decks(n).solve(up, rules, None).summary);
+    let base =
+        (kind == CountKind::TrueCount).then(|| ShoeChoice::Decks(n).solve(up, rules, None).summary);
     let set_basic = |ci: &mut CategoryIndex, cat| {
         if let Some(base) = &base {
             (ci.basic, ci.basic_fallback) = basic_moves(base, cat);

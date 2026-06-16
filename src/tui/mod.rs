@@ -118,21 +118,10 @@ impl Pane {
                     (HandCategory::Soft(n), label)
                 })
                 .collect(),
-            Pane::Pairs => [
-                Card::Pip(2),
-                Card::Pip(3),
-                Card::Pip(4),
-                Card::Pip(5),
-                Card::Pip(6),
-                Card::Pip(7),
-                Card::Pip(8),
-                Card::Pip(9),
-                Card::Ten,
-                Card::Ace,
-            ]
-            .iter()
-            .map(|&r| (HandCategory::Pair(r), format!("{r}{r}")))
-            .collect(),
+            Pane::Pairs => UP_CARDS
+                .iter()
+                .map(|&r| (HandCategory::Pair(r), format!("{r}{r}")))
+                .collect(),
         }
     }
 }

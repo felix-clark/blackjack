@@ -17,7 +17,7 @@ use crate::card::Card;
 use crate::dealer::{DealerOutcome, dealer_outcome_probs};
 use crate::hand::{HandCategory, HandState, Move, best_move, categorize};
 use crate::rules::Ruleset;
-use crate::shoe::{CardCol, N_RANKS, Shoe};
+use crate::shoe::{CardCol, Shoe};
 use crate::split::split_move_ev;
 
 /// Terminal payoff of a standing/resolved player hand against one dealer outcome, as a multiple of
@@ -284,11 +284,9 @@ pub(crate) fn build_evs_with_splits<S: Shoe + Clone + Eq + Hash>(
 /// [`pair_split_evs_for`] fans out over. Call on the shoe *after* the up-card is removed (matching
 /// where the splits are actually played from).
 pub(crate) fn splittable_pairs<S: Shoe>(shoe: &S) -> Vec<CardCol> {
-    (0..N_RANKS)
-        .map(|i| {
-            let r = Card::from_rank_index(i);
-            CardCol::from_hand(&[r, r])
-        })
+    Card::ALL
+        .iter()
+        .map(|&r| CardCol::from_hand(&[r, r]))
         .filter(|pair| shoe.contains_hand(pair))
         .collect()
 }

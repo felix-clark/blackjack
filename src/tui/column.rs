@@ -8,7 +8,8 @@ use std::hash::Hash;
 use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
-use crate::count::{CountCmp, CountShoe, CountSystem, cond_for_frame};
+use crate::count::{CountCmp, CountSystem, cond_for_frame};
+use crate::countshoe::CountShoe;
 use crate::hand::{HandCategory, Move};
 use crate::reach::{CellInfo, reach_weights, summarize_cells};
 use crate::rules::Ruleset;

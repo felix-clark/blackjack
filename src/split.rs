@@ -353,7 +353,8 @@ mod tests {
     #[test]
     #[ignore]
     fn freeze_split_error() {
-        use crate::count::{CountCondition, CountShoe, CountSystem, Ko, Penetration};
+        use crate::count::{CountCondition, CountSystem, Ko, Penetration};
+        use crate::countshoe::CountShoe;
         use crate::rules::Ruleset;
         use crate::simulation::Basis;
         use std::time::Instant;

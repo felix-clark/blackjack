@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
 use crate::count::{
-    CountCmp, CountKind, CountShoe, CountSystem, CountSystemId, Penetration, TC_HALF_UNITS,
-    cond_for_frame, dispatch_system,
+    CountCmp, CountKind, CountSystem, CountSystemId, Penetration, TC_HALF_UNITS, cond_for_frame,
+    dispatch_system,
 };
+use crate::countshoe::CountShoe;
 use crate::diskcache;
 use crate::rules::Ruleset;
 use crate::shoe::{CardCol, InfiniteDeck, Shoe};

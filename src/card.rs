@@ -61,6 +61,22 @@ impl TryFrom<char> for Card {
 }
 
 impl Card {
+    /// Every rank once, in dense `rank_index` order (Ace, 2..9, Ten) — the canonical iteration order
+    /// that pairs with [`rank_index`](Card::rank_index)/[`from_rank_index`](Card::from_rank_index) and
+    /// the `[_; N_RANKS]` dense arrays. Use this instead of re-spelling the ten-card literal.
+    pub const ALL: [Card; 10] = [
+        Card::Ace,
+        Card::Pip(2),
+        Card::Pip(3),
+        Card::Pip(4),
+        Card::Pip(5),
+        Card::Pip(6),
+        Card::Pip(7),
+        Card::Pip(8),
+        Card::Pip(9),
+        Card::Ten,
+    ];
+
     pub fn hard(&self) -> u8 {
         match &self {
             Card::Ace => 1,

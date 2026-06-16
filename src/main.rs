@@ -1,5 +1,6 @@
 pub(crate) mod card;
 pub(crate) mod count;
+pub(crate) mod countshoe;
 pub(crate) mod dealer;
 pub(crate) mod diskcache;
 pub(crate) mod hand;
