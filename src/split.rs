@@ -12,7 +12,7 @@ use std::hash::Hash;
 use crate::card::*;
 use crate::dealer::*;
 use crate::hand::{HandState, pair_rank};
-use crate::rules::Ruleset;
+use crate::rules::{Ruleset, SplitAces};
 use crate::shoe::*;
 use crate::simulation::{Basis, resolve_ev};
 
@@ -79,11 +79,18 @@ struct SplitSolver<S: Shoe + Clone + Eq + Hash> {
     basis: Basis,
     /// The rank being split (every arm is seeded with one of these).
     split_card: Card,
-    /// Split aces draw exactly one card and stand (and, since this also keeps them off the re-split
-    /// decision node, never re-split). These flags are solver-wide because under the current rules
-    /// they don't vary with split depth; supporting depth-varying rules (e.g. a different double
-    /// permission for re-split arms) would move them into the per-call state / memo key.
+    /// This arm draws exactly one card and stands — true only for split aces under
+    /// [`SplitAces::OneCard`](crate::rules::SplitAces::OneCard). It both forces the one-card stand and
+    /// (by keeping the arm off the re-split decision node) prevents re-splitting. Solver-wide because
+    /// under the supported rules it doesn't vary with split depth; depth-varying rules (e.g. a different
+    /// double permission for re-split arms) would move it into the per-call state / memo key.
     one_card_only: bool,
+    /// Whether a drawn pair of the split rank may itself be re-split (the rank-level re-split
+    /// permission, not the per-depth hand cap — that's `splits`). The only rank this ever forbids is
+    /// the ace: it is unconditionally `true` for every other rank, and for aces tracks
+    /// [`SplitAces::resplit`](crate::rules::SplitAces::resplit). Distinct from `one_card_only` only in
+    /// the ace `NoResplit` case, which plays the arm out but bars re-splitting it.
+    allow_resplit: bool,
     /// Double after split allowed.
     das: bool,
     /// The total-cards budget for exact cross-arm depletion (see [`Ruleset::split_cards`]): the number
@@ -106,12 +113,23 @@ struct SplitSolver<S: Shoe + Clone + Eq + Hash> {
 }
 
 impl<S: Shoe + Clone + Eq + Hash> SplitSolver<S> {
-    fn new(shoe0: S, basis: Basis, split_card: Card, das: bool, budget: u8) -> Self {
+    fn new(
+        shoe0: S,
+        basis: Basis,
+        split_card: Card,
+        das: bool,
+        split_aces: SplitAces,
+        budget: u8,
+    ) -> Self {
+        // The split-ace restrictions apply only when the rank being split is the ace; every other rank
+        // plays out fully and re-splits freely (within the hand cap).
+        let is_ace = split_card == Card::Ace;
         Self {
             shoe0,
             basis,
             split_card,
-            one_card_only: split_card == Card::Ace,
+            one_card_only: is_ace && !split_aces.draws_more(),
+            allow_resplit: !is_ace || split_aces.resplit(),
             das,
             budget,
             dealer_cache: HashMap::new(),
@@ -271,8 +289,11 @@ impl<S: Shoe + Clone + Eq + Hash> SplitSolver<S> {
             best = best.max(hit);
         }
 
-        // Doubling (first action only, when DAS is allowed; never for one-card split aces).
-        if first && self.das && !self.one_card_only {
+        // Doubling (first action only, when DAS is allowed). Never offered on split aces at any
+        // `SplitAces` level: real tables that let you draw to / re-split aces still bar doubling them
+        // (a drawn split ace is a soft hand, not a hard 11), so this carve-out keeps DAS governing only
+        // non-ace splits rather than coupling the two axes.
+        if first && self.das && self.split_card != Card::Ace {
             let dbl: f64 = draws
                 .iter()
                 .map(|&(c, p)| {
@@ -286,12 +307,13 @@ impl<S: Shoe + Clone + Eq + Hash> SplitSolver<S> {
             best = best.max(dbl);
         }
 
-        // Re-splitting: a drawn pair card may be split again while the hand budget allows. (Split
-        // aces never reach here — `one_card_only` stands them after one card.) One equal card becomes
-        // the current arm's seed and the other an extra pending sibling, spending one re-split unit;
-        // both already removed from `shoe`. This spawns a new arm, so it crosses an arm boundary
+        // Re-splitting: a drawn pair card may be split again while the hand budget allows and the rank
+        // permits it (`allow_resplit` is false for aces unless the ruleset allows re-splitting them;
+        // one-card split aces never reach here at all — they stand after one card). One equal card
+        // becomes the current arm's seed and the other an extra pending sibling, spending one re-split
+        // unit; both already removed from `shoe`. This spawns a new arm, so it crosses an arm boundary
         // (`advance_arm`); the cards budget threads on unchanged (the re-split draws no new card).
-        if first && splits > 0 && current.get_count(&self.split_card) == 2 {
+        if first && self.allow_resplit && splits > 0 && current.get_count(&self.split_card) == 2 {
             let seed = CardCol::from_hand(&[self.split_card]);
             let next = self.advance_arm(shoe.clone(), budget);
             let resplit = self.value(seed, false, pending + 1, splits - 1, next, budget);
@@ -325,7 +347,14 @@ pub(crate) fn split_move_ev<S: Shoe + Clone + Eq + Hash>(
     // (exact cross-arm depletion preserved), a frozen-tilt view for the count-conditioned shoe so the
     // arm recursion doesn't recondition the count on every draw (the order-limit on splits).
     let split_shoe = shoe_minus_hand.for_split();
-    let mut solver = SplitSolver::new(split_shoe.clone(), basis, split_card, rules.das, budget);
+    let mut solver = SplitSolver::new(
+        split_shoe.clone(),
+        basis,
+        split_card,
+        rules.das,
+        rules.split_aces,
+        budget,
+    );
     let seed = CardCol::from_hand(&[split_card]);
     // The root arm starts with the full budget (the solver's stored value).
     let budget = solver.budget;
@@ -380,8 +409,14 @@ mod tests {
 
             // Exact — same solve but on the un-frozen, per-draw-reconditioned count shoe.
             let splits_remaining = rules.max_split_hands.saturating_sub(2);
-            let mut solver =
-                SplitSolver::new(shoe.clone(), basis, pr, rules.das, rules.split_cards);
+            let mut solver = SplitSolver::new(
+                shoe.clone(),
+                basis,
+                pr,
+                rules.das,
+                rules.split_aces,
+                rules.split_cards,
+            );
             let seed = CardCol::from_hand(&[pr]);
             let budget = solver.budget;
             let start = Instant::now();
@@ -487,6 +522,71 @@ mod tests {
         assert!(
             split > 0.0 && split < 1.0,
             "A,A vs 6 split EV in a sane range: {split}"
+        );
+    }
+
+    /// The three `SplitAces` levels form an increasing-liberality ladder, so each relaxation can only
+    /// raise the split EV of an ace pair: `OneCard ≤ NoResplit ≤ Resplit`. Checked on the infinite deck
+    /// (the cleanest basis) for A,A against a 6. The one-card→hit gap should be sizeable (drawing out a
+    /// soft ace is worth a lot); the resplit gap is smaller but real.
+    #[test]
+    fn split_aces_liberality_monotone() {
+        let rules = |sa| Ruleset {
+            split_aces: sa,
+            split_cards: 0,
+            ..Ruleset::default()
+        };
+        let shoe = InfiniteDeck {};
+        let pair = CardCol::from_hand(&[Card::Ace, Card::Ace]);
+        let ev = |sa| {
+            let r = rules(sa);
+            split_move_ev(&pair, &shoe, Basis::new(Card::Pip(6), &r), &r)
+        };
+        let one = ev(SplitAces::OneCard);
+        let hit = ev(SplitAces::NoResplit);
+        let resplit = ev(SplitAces::Resplit);
+        assert!(
+            hit > one + 1e-4,
+            "hitting split aces beats one-card (A,A vs 6): {hit} vs {one}"
+        );
+        assert!(
+            resplit > hit - 1e-12,
+            "re-splitting aces is at least as good as no-resplit: {resplit} vs {hit}"
+        );
+    }
+
+    /// Doubling is barred on split aces at every `SplitAces` level, so toggling DAS must leave an
+    /// ace-split EV untouched — even under `NoResplit`, where the arms draw out and could otherwise
+    /// double. A non-ace pair (where post-split doubles are real) must move with DAS, proving the
+    /// toggle is wired and the ace invariance is a genuine carve-out, not a dead switch.
+    #[test]
+    fn no_double_on_split_aces_regardless_of_das() {
+        let rules = |das, sa| Ruleset {
+            das,
+            split_aces: sa,
+            split_cards: 0,
+            ..Ruleset::default()
+        };
+        let shoe = InfiniteDeck {};
+        let ev = |pair: &CardCol, das, sa| {
+            let r = rules(das, sa);
+            split_move_ev(pair, &shoe, Basis::new(Card::Pip(6), &r), &r)
+        };
+        let aces = CardCol::from_hand(&[Card::Ace, Card::Ace]);
+        let aces_das = ev(&aces, true, SplitAces::NoResplit);
+        let aces_nodas = ev(&aces, false, SplitAces::NoResplit);
+        assert_close(
+            aces_das,
+            aces_nodas,
+            "split-ace EV is DAS-invariant (no double on split aces)",
+        );
+        // Sanity: the same toggle genuinely moves a pair whose arms can double.
+        let eights = CardCol::from_hand(&[Card::Pip(8), Card::Pip(8)]);
+        let eights_das = ev(&eights, true, SplitAces::OneCard);
+        let eights_nodas = ev(&eights, false, SplitAces::OneCard);
+        assert!(
+            eights_das > eights_nodas + 1e-4,
+            "DAS raises 8,8 split EV (post-split doubles are real): {eights_das} vs {eights_nodas}"
         );
     }
 

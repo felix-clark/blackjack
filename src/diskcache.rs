@@ -25,7 +25,7 @@ use serde::de::DeserializeOwned;
 
 /// Bump on any change to the on-disk layout or semantics of a cached type. Old files (under the prior
 /// version's subdirectory) are then simply never read again.
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 12;
 
 /// Process-unique suffix source for temp files, so concurrent writers (the chart workers and the
 /// index-fill workers all cache in parallel) never collide on the same scratch path.

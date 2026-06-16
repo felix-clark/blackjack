@@ -334,7 +334,8 @@ impl App {
                     Some(ci) => {
                         let (wmin, wmax) = (report.lo, report.hi);
                         for &(mv, lo, hi) in &ci.primary {
-                            lines.push(rc_run_line(mv, lo, hi, wmin, wmax, here, axis, ci.basic, 2));
+                            lines
+                                .push(rc_run_line(mv, lo, hi, wmin, wmax, here, axis, ci.basic, 2));
                         }
                         if !ci.fallback.is_empty() {
                             let label = match ci.start_only_moves().as_slice() {
@@ -397,6 +398,7 @@ impl App {
             format!("Dealer peek   {}", yn(r.peek.peeks())),
             format!("Blackjack     {}", r.bj_payout.label()),
             format!("Surrender     {}", r.peek.surrender_label()),
+            format!("Split aces    {}", r.split_aces.label()),
             format!("Max hands     {}", r.max_split_hands),
             format!("Split prec.   {}", r.split_cards),
         ];

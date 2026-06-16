@@ -7,6 +7,7 @@
 //! terminal payoff table. The hand/move vocabulary lives in [`crate::hand`], rule knobs in
 //! [`crate::rules`].
 
+use std::cmp;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,9 +39,9 @@ pub(crate) fn resolve_ev(
         (HandState::Bust, _) => -1.,
         (_, DealerOutcome::Bust) => 1.,
         (HandState::Hard(p) | HandState::Soft(p), DealerOutcome::Total(d)) => match p.cmp(&d) {
-            std::cmp::Ordering::Less => -1.,
-            std::cmp::Ordering::Equal => 0.,
-            std::cmp::Ordering::Greater => 1.,
+            cmp::Ordering::Less => -1.,
+            cmp::Ordering::Equal => 0.,
+            cmp::Ordering::Greater => 1.,
         },
     }
 }
@@ -672,13 +673,13 @@ pub(crate) fn bs_value_tree<S: Shoe + Clone + Eq + Hash>(
     // Children (larger total) before parents: a Hit grows the total by ≥1, so descending-total order
     // guarantees every Hit child's BS value is computed before the hand that hits into it.
     let mut hands: Vec<&CardCol> = ev_tree.keys().collect();
-    hands.sort_by_key(|h| std::cmp::Reverse(h.hard_count()));
+    hands.sort_by_key(|h| cmp::Reverse(h.hard_count()));
 
     // Fold over descending-total order, accumulating into the BS-value map: each hand's Hit value
     // reads its children's already-folded values, so the accumulator must be threaded, not collected.
-    hands.into_iter().fold(
-        HashMap::with_capacity(ev_tree.len()),
-        |mut bs, hand| {
+    hands
+        .into_iter()
+        .fold(HashMap::with_capacity(ev_tree.len()), |mut bs, hand| {
             let move_ev = &ev_tree[hand].1;
             let mv = table_move(table.get(&categorize(hand)), move_ev);
             let value = if mv == Move::Hit {
@@ -702,8 +703,7 @@ pub(crate) fn bs_value_tree<S: Shoe + Clone + Eq + Hash>(
             };
             bs.insert(*hand, value);
             bs
-        },
-    )
+        })
 }
 
 /// Like [`edge_term`], but reading each starting hand's value from a [`bs_value_tree`] — i.e. the
@@ -837,7 +837,11 @@ mod tests {
         let multi17 = CardCol::from_hand(&[Card::Ten, Card::Pip(4), Card::Pip(3)]);
         assert_eq!(categorize(&multi17), HandCategory::Hard(17));
         let stand = tree[&multi17].1[&Move::Stand];
-        assert_close(bs[&multi17], stand, "multi-card H17 falls back to table Stand");
+        assert_close(
+            bs[&multi17],
+            stand,
+            "multi-card H17 falls back to table Stand",
+        );
 
         // The two-card root takes its charted (Surrender) value, and the edge never beats optimal.
         let nat_free = |hand: &CardCol| hand.len() == 2 && !hand.is_nat21();
@@ -847,7 +851,11 @@ mod tests {
                 assert_close(bs[hand], mv[&charted], "two-card root = charted move EV");
             }
             let opt = mv.values().copied().fold(f64::NEG_INFINITY, f64::max);
-            assert!(bs[hand] <= opt + 1e-12, "BS value {} > optimal {opt}", bs[hand]);
+            assert!(
+                bs[hand] <= opt + 1e-12,
+                "BS value {} > optimal {opt}",
+                bs[hand]
+            );
         }
 
         assert!(

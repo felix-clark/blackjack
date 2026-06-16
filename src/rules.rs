@@ -93,6 +93,47 @@ impl BjPayout {
     }
 }
 
+/// How split aces may be played, as a *single* 3-level axis because the two underlying permissions —
+/// drawing more than one card to a split ace, and re-splitting a drawn ace — are coupled: re-splitting
+/// aces is incoherent when each split ace receives exactly one card (there is no decision node to
+/// re-split at), so the only meaningful settings are the three points on an increasing-liberality
+/// ladder. Bundling them lets the type system rule out the incoherent "one card *and* re-split"
+/// combination, the same way [`PeekRule`] rules out no-peek late surrender.
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) enum SplitAces {
+    /// Each split ace draws exactly one card and stands — no hitting, no doubling, no re-splitting.
+    /// The near-universal rule, and the default.
+    OneCard,
+    /// Split aces may draw and play out like any other split arm (hit, and double when DAS allows),
+    /// but a drawn ace may *not* be re-split.
+    NoResplit,
+    /// Split aces play out fully and a drawn ace may itself be re-split (subject to the hand cap).
+    Resplit,
+}
+
+impl SplitAces {
+    /// Whether a split ace may take more than its forced first card — i.e. play out (hit, and double
+    /// when DAS allows) rather than standing on one card. False only for [`SplitAces::OneCard`].
+    pub(crate) fn draws_more(self) -> bool {
+        self != SplitAces::OneCard
+    }
+
+    /// Whether a split ace that draws another ace may be re-split. Only [`SplitAces::Resplit`] allows it
+    /// (and it implies [`draws_more`](Self::draws_more), since a re-split arm goes on to draw).
+    pub(crate) fn resplit(self) -> bool {
+        self == SplitAces::Resplit
+    }
+
+    /// A short label for display.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SplitAces::OneCard => "one card",
+            SplitAces::NoResplit => "no resplit",
+            SplitAces::Resplit => "resplit",
+        }
+    }
+}
+
 /// The stipulation of miscellaneous rules other than the number of decks (?).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct Ruleset {
@@ -131,9 +172,11 @@ pub(crate) struct Ruleset {
     /// validation, never exposed as a chart option. The default `4` is ~5–10× more accurate than
     /// independent (sub-1e-4 vs the exact value) while staying sub-second per query.
     pub(crate) split_cards: u8,
-    // TODO: finer split-aces rules. Currently split aces always get exactly one card and cannot be
-    // re-split (the common rule); a future axis could relax either, and "no double on split aces /
-    // tens" would refine `das` per split rank — see the `SplitSolver` field comments.
+    /// How split aces may be played (see [`SplitAces`]): forced one card (default), hit-but-no-resplit,
+    /// or full re-split. Aces are special-cased at most tables because their soft-21 potential is so
+    /// strong; this is the axis that relaxes the restriction. ("No double on split aces / tens" would be
+    /// a further refinement of `das` per split rank — still future work.)
+    pub(crate) split_aces: SplitAces,
 }
 
 impl Default for Ruleset {
@@ -148,6 +191,7 @@ impl Default for Ruleset {
             // investment option that specifies the depth of the exact enumeration in multiple
             // splits.
             split_cards: 4,
+            split_aces: SplitAces::OneCard,
         }
     }
 }

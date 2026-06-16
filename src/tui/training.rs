@@ -943,7 +943,7 @@ impl Training {
                 hand.doubled = true;
                 hand.done = true;
             }
-            Move::Split => self.split_active(),
+            Move::Split => self.split_active(rules),
             Move::Surrender => {
                 self.hands[self.active].surrendered = true;
                 self.hands[self.active].done = true;
@@ -952,10 +952,11 @@ impl Training {
         self.advance();
     }
 
-    /// Split the active pair into two hands, each re-drawing a card. Split aces get exactly one card and
-    /// stand (the common rule). The new hand is inserted right after the active one so play proceeds
-    /// left-to-right.
-    fn split_active(&mut self) {
+    /// Split the active pair into two hands, each re-drawing a card. Under the one-card rule split aces
+    /// get exactly one card and stand (the common default); when the ruleset lets them play out they are
+    /// left live like any other split arm. The new hand is inserted right after the active one so play
+    /// proceeds left-to-right.
+    fn split_active(&mut self, rules: &Ruleset) {
         let i = self.active;
         // A pair, so both cards share a rank; seed each arm with one of them.
         let rank = self.hands[i].cards[0];
@@ -972,7 +973,7 @@ impl Training {
         self.reveal(c2);
         new_hand.cards.push(c2);
 
-        if rank == Card::Ace {
+        if rank == Card::Ace && !rules.split_aces.draws_more() {
             self.hands[i].done = true;
             new_hand.done = true;
         }
@@ -1349,13 +1350,22 @@ impl Training {
             // Cannot hit a doubled hand or one already at 21 (or bust, though such a hand is never active).
             Move::Hit => !hand.doubled && hand.col().best_count() < 21,
             Move::Stand => true,
-            // Double on the first two cards; after a split it needs DAS.
-            Move::Double => n_cards == 2 && (rules.das || n_hands == 1),
-            // Split a fresh pair while under the hand cap.
+            // Double on the first two cards; after a split it needs DAS. Never on a split-ace arm,
+            // though, at any `SplitAces` level — tables that let aces draw still bar doubling them.
+            Move::Double => {
+                n_cards == 2
+                    && (rules.das || n_hands == 1)
+                    && !(hand.from_split && hand.cards[0] == Card::Ace)
+            }
+            // Split a fresh pair while under the hand cap. Re-splitting aces (an ace pair that is
+            // itself a split arm) additionally needs the ruleset to allow it.
             Move::Split => {
                 n_cards == 2
                     && hand.cards[0] == hand.cards[1]
                     && n_hands < rules.max_split_hands as usize
+                    && !(hand.cards[0] == Card::Ace
+                        && hand.from_split
+                        && !rules.split_aces.resplit())
             }
             // Surrender only the original two-card hand (not after a split or a hit), if the rules offer it.
             Move::Surrender => {

@@ -437,10 +437,7 @@ pub trait Shoe: Clone {
     {
         // Total finite supply seeds the hypergeometric falling-factorial denominator; for an
         // infinite deck every `rank_count` is `None`, leaving this 0 and unused.
-        let remaining = Card::ALL
-            .iter()
-            .filter_map(|c| self.rank_count(c))
-            .sum();
+        let remaining = Card::ALL.iter().filter_map(|c| self.rank_count(c)).sum();
         WeightedPartitions {
             stack: vec![PartitionFrame {
                 next_rank: Some(N_RANKS - 1),

@@ -126,8 +126,12 @@ pub(crate) fn reach_weights<S: Shoe + Clone>(
 ///   one-card difference in a multi-deck shoe.
 /// - *Dealt-hand policy*: an arm `{r,c}` is propagated by the pair-free hand's stored optimal move.
 ///   Exact when `das` is on; off-DAS arms that would hit instead of double are mis-routed (rare).
-/// - *Split aces*: forced one card then stand (no decision), so they manufacture no downstream
-///   decision mass and are skipped entirely.
+/// - *Split aces*: under the one-card rule they get a forced card then stand (no decision), so they
+///   manufacture no downstream decision mass and are skipped entirely; under a hit/re-split rule they
+///   are injected like any other rank (re-splitting gated on the ruleset). Doubling is barred on split
+///   aces at every level (see `split.rs`), but their arms are propagated by the *generic* `{A,c}`
+///   policy, which may read a Double headline and treat the arm as terminal where the solver would
+///   hit — the same rare double-routing slip as the off-DAS case, never on the default one-card rule.
 /// - *Per-line resplit depth*: the budget is spent along each resplit line rather than as a global
 ///   hand cap, so multi-resplit rounds (probability ~`p_r²`) can slightly overcount arms. Exact for
 ///   `max_split_hands ≤ 3` and for the common single-resplit case.
@@ -144,9 +148,11 @@ fn inject_split_arms<S: Shoe + Clone>(
             continue;
         }
         let Some(r) = pair_rank(pair) else { continue };
-        // Split aces get one card and stand — no manufactured decisions. And only act where the
-        // policy actually splits.
-        if r == Card::Ace || best_move(move_ev) != Move::Split {
+        // One-card split aces get a single card and stand — no manufactured decisions, so skip them.
+        // (When the ruleset lets split aces play out they *do* manufacture downstream decisions, so
+        // they are injected like any other rank.) And only act where the policy actually splits.
+        let one_card_aces = r == Card::Ace && !rules.split_aces.draws_more();
+        if one_card_aces || best_move(move_ev) != Move::Split {
             continue;
         }
         let entry = reach.get(pair).copied().unwrap_or(0.0);
@@ -156,10 +162,14 @@ fn inject_split_arms<S: Shoe + Clone>(
         // Independent arms: every arm draws from the post-split shoe (both pair cards removed).
         let shoe0 = shoe_minus_up.remove_hand(pair);
         let draws = basis.draw_probs(&shoe0);
-        let resplit_optimal = ev_tree
-            .get(pair)
-            .map(|(_, m)| best_move(m) == Move::Split)
-            .unwrap_or(false);
+        // Whether a drawn pair re-splits in the forward pass: aces re-split only when the ruleset
+        // allows it (and then always do — splitting aces is invariably optimal); every other rank
+        // re-splits when its own pair cell chooses to split.
+        let resplit_optimal = if r == Card::Ace {
+            rules.split_aces.resplit()
+        } else {
+            best_move(move_ev) == Move::Split
+        };
         // Two initial arms, each occurring with the full entry mass.
         for _ in 0..2 {
             seed_arm(r, &draws, splits_remaining, resplit_optimal, entry, reach);

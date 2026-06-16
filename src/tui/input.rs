@@ -6,7 +6,7 @@ use ratatui::crossterm::event::KeyCode;
 
 use crate::count::{CountCmp, CountKind, CountSystemId, TC_HALF_UNITS};
 use crate::hand::Move;
-use crate::rules::{BjPayout, PeekRule, PeekSurrender};
+use crate::rules::{BjPayout, PeekRule, PeekSurrender, SplitAces};
 
 use super::app::{App, Mode};
 use super::config::{DECK_OPTIONS, SPLIT_OPTIONS};
@@ -14,7 +14,7 @@ use super::training::Phase;
 use super::{PANES, Tab, UP_CARDS};
 
 /// Number of editable fields in the rules modal.
-const RULES_FIELDS: usize = 8;
+const RULES_FIELDS: usize = 9;
 
 /// Number of fields in the count modal (system, constraint, value). The on/off toggle is folded into
 /// the constraint field as its `none` option.
@@ -206,6 +206,15 @@ impl App {
                 let n = SPLIT_OPTIONS.len() as i32;
                 self.rules.split_cards = SPLIT_OPTIONS[(i + delta).rem_euclid(n) as usize];
             }
+            8 => {
+                let order = [SplitAces::OneCard, SplitAces::NoResplit, SplitAces::Resplit];
+                let i = order
+                    .iter()
+                    .position(|&s| s == self.rules.split_aces)
+                    .unwrap_or(0) as i32;
+                let n = order.len() as i32;
+                self.rules.split_aces = order[(i + delta).rem_euclid(n) as usize];
+            }
             _ => {}
         }
     }
@@ -328,7 +337,8 @@ impl App {
                     CountSystemId::Ko => CountSystemId::HiLo,
                     CountSystemId::HiLo => CountSystemId::Ko,
                 };
-                if self.count.system.kind() == CountKind::TrueCount && self.count.cmp == CountCmp::Eq
+                if self.count.system.kind() == CountKind::TrueCount
+                    && self.count.cmp == CountCmp::Eq
                 {
                     self.count.cmp = CountCmp::Ge;
                 }
