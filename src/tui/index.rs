@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
-use crate::count::{CountCmp, CountShoe, CountSystem, Ko};
+use crate::count::{CountCmp, CountKind, CountShoe, CountSystem, HiLo, Ko, TC_HALF_UNITS};
 use crate::diskcache;
 use crate::hand::{HandCategory, Move};
 use crate::reach::{reach_weights, summarize_cells};
@@ -19,7 +19,9 @@ use crate::shoe::Shoe;
 use crate::simulation::build_evs;
 
 use super::PANES;
-use super::column::{COUNT_GROUPS, ColumnSummary, ReachMap, Tree, merge_count_frames};
+use super::column::{
+    COUNT_GROUPS, ColumnSummary, ReachMap, Tree, merge_count_frames, solve_counted,
+};
 use super::config::{COUNT_PENETRATION, ShoeChoice};
 
 /// One solved frame: the `build_evs` EV tree and its game-time reach weights — the unit the count-index
@@ -28,10 +30,11 @@ use super::config::{COUNT_PENETRATION, ShoeChoice};
 /// (the band counts a column's WoO merges share), since distinct up-cards never share a frame.
 type Frame = (Tree, ReachMap);
 
-/// What a persisted frame is keyed under: up-card, deck count, and exact external running count. The
-/// band's comparison is always `Eq` and its penetration prior a fixed constant
-/// ([`COUNT_PENETRATION`]), so neither is in the key; the ruleset is.
-type FrameKey = (Card, u8, i16, Ruleset);
+/// What a persisted frame is keyed under: up-card, deck count, exact external count, ruleset, and the
+/// counting-system family ([`CountKind`], so a running-count frame and a true-count frame at the same
+/// numeric count never alias). The band's comparison is always `Eq` and its penetration prior a fixed
+/// constant ([`COUNT_PENETRATION`]), so neither is in the key.
+type FrameKey = (Card, u8, i16, Ruleset, CountKind);
 
 /// Disk namespace for persisted frames (distinct from the chart's `"column"` cache).
 const FRAME_KIND: &str = "frame";
@@ -131,10 +134,18 @@ fn flips_in_band(runs: &[(Move, i16, i16)], band_lo: i16, band_hi: i16) -> bool 
 /// never changes ⇒ no count dependence). `fallback` is the Hit-vs-Stand ladder that applies once a
 /// start-only headline move is unavailable (a hand that has already been hit); it is populated only
 /// when `primary` actually contains a start-only move.
+///
+/// `basic`/`basic_fallback` are the **no-count** (basic-strategy) moves for the two ladders — the
+/// headline and the Hit-vs-Stand fallback of the uncounted base chart. They identify which runs are
+/// *deviations* (a run whose move differs from basic) so the true-count display can give the deviation
+/// the inclusive side of its cutoff (see [`fmt_tc_range`](super::render::fmt_tc_range)). Populated only
+/// for a true-count report (the running-count display keeps the offset boundaries); `None` otherwise.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct CategoryIndex {
     pub(super) primary: Vec<(Move, i16, i16)>,
     pub(super) fallback: Vec<(Move, i16, i16)>,
+    pub(super) basic: Option<Move>,
+    pub(super) basic_fallback: Option<Move>,
 }
 
 impl CategoryIndex {
@@ -185,7 +196,7 @@ pub(super) struct IndexReport {
 /// What an [`IndexReport`] is cached/keyed under. Deliberately *without* the player's count (the report
 /// is count-independent) and without the chart's count comparison (the index is always exact-count
 /// based).
-pub(super) type IndexKey = (Card, ShoeChoice, Ruleset);
+pub(super) type IndexKey = (Card, ShoeChoice, Ruleset, CountKind);
 
 /// A finished (or partial) count-index report, tagged with the index epoch it was computed under so a
 /// stale one (the shoe or ruleset changed) is dropped on arrival.
@@ -281,30 +292,45 @@ enum Ladder {
     HitStand,
 }
 
-/// A column's count-index evaluator: the windowed band of count-conditioned shoes (one per integer
-/// external count, all sharing one deconvolution — see [`CountShoe::band`]) plus memos of the work.
+/// A column's count-index evaluator, over either count family (`kind`).
 ///
-/// Move lookups follow the Wizard-of-Odds count convention (the running count *includes* the cell's hand
-/// and the up-card — see [`merge_count_frames`]). The move at index-count `ext` is therefore read off a
-/// merged column whose hands each come from the band shoe at `ext - map(U) - map(hand)`; those per-band
-/// solves (`build_evs` + reach) are memoized in `frames` (disk-backed — see [`ensure_frame`]), so each
-/// band count is solved at most once and shared across every index-count whose window reaches it.
-/// `summaries` memoizes the merged per-`ext` summary so all categories and both ladders reuse it.
+/// **Running (KO):** a windowed band of count-conditioned shoes (one per integer external running count,
+/// all sharing one deconvolution — see [`CountShoe::band_external`]). Move lookups follow the
+/// Wizard-of-Odds convention (the running count *includes* the cell's hand and the up-card — see
+/// [`merge_count_frames`]): the move at index-count `ext` is read off a merged column whose hands each
+/// come from the band shoe at `ext - map(U) - map(hand)`; those per-band solves (`build_evs` + reach) are
+/// memoized in `frames` (disk-backed — see [`ensure_frame`]) and shared across index-counts. The move at
+/// `ext` is the best move conditioned on the count being *exactly* `ext`.
+///
+/// **TrueCount (Hi-Lo):** an exact true count is measure-zero, so there is no exact-count conditioning.
+/// Instead the move at integer true count `ext` is read straight off the **one-sided conditioned solve on
+/// the side `ext` sits**: `TC ≥ ext` for `ext ≥ 0`, `TC ≤ ext` for `ext < 0` (see
+/// [`true_summary`](Self::true_summary)). This is exactly the column the chart shows when the player
+/// imposes that same `TC` constraint, so the reported index threshold and the conditioned chart agree by
+/// construction — a deviation is declared at the count where `TC ≥ c` first recommends it, not one count
+/// later (the earlier slice-differencing was conservative by a count). Each solve is the WoO-merged
+/// [`solve_counted`]`::<HiLo>` conditioned column, memoized in `summaries`. No band/`frames` are used here.
+///
+/// `summaries` memoizes the per-`ext` summary so all categories and both ladders reuse it.
 struct ColumnEval {
+    kind: CountKind,
     n: u8,
     up: Card,
     rules: Ruleset,
-    /// Usable (positive-mass) external counts, ascending; aligned with `shoes`.
+    /// The integer count axis, ascending: usable external running counts (Running) or the true-count
+    /// search window (TrueCount). For Running it is aligned with `shoes`.
     externals: Vec<i16>,
+    /// Running only: the per-count band shoes aligned with `externals`. Empty for TrueCount.
     shoes: Vec<CountShoe>,
     /// The chart marker's notable count band (mass core ∪ pivot margin — see [`IndexReport::mark_lo`]),
     /// clamped into the usable window. Defaults to the full window for fixed-width test builds.
     mark_lo: i16,
     mark_hi: i16,
-    /// Per band external count: the (memoized) all-shift solve there (`build_evs` tree + reach weights).
-    /// The per-frame inputs the WoO merge reads. Filled on demand by [`ensure_frame`], disk-first.
+    /// Running only: per band external count, the (memoized) all-shift solve there (`build_evs` tree +
+    /// reach weights) the WoO merge reads. Filled on demand by [`ensure_frame`], disk-first.
     frames: HashMap<i16, Frame>,
-    /// Per index-count `ext`: the merged WoO chart summary read by the ladders.
+    /// Per index-count `ext`: the per-`ext` chart summary read by the ladders (WoO-merged exact-count for
+    /// Running; the one-sided `TC ≥/≤ ext` conditioned column for TrueCount).
     summaries: HashMap<i16, ColumnSummary>,
 }
 
@@ -315,7 +341,14 @@ impl ColumnEval {
     /// the marker's notable band (mass core ∪ pivot margin — see [`INDEX_MARKER_PIVOT_MARGIN`]) so every
     /// marked flip is visible in the popup. The marker band is then clamped inside the reachable window.
     /// `None` if nothing is reachable.
-    fn new(n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
+    fn new(kind: CountKind, n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
+        match kind {
+            CountKind::Running => Self::new_running(n, up, rules),
+            CountKind::TrueCount => Self::new_true(n, up, rules),
+        }
+    }
+
+    fn new_running(n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
         let dist = CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION);
         let pivot = Ko::pivot(n);
         // The marker's notable band: the commonly-held occurrence-mass core, always extended to cover a
@@ -329,7 +362,7 @@ impl ColumnEval {
         let (mut lo, mut hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
         lo = lo.min(mark_lo);
         hi = hi.max(mark_hi);
-        let mut eval = Self::build(n, up, rules, lo, hi)?;
+        let mut eval = Self::build_running(n, up, rules, lo, hi)?;
         // Clamp into the actually-solved (reachable) window — `build` may drop unreachable edge counts —
         // so the band never references an unsolved count.
         eval.mark_lo = mark_lo.clamp(eval.lo(), eval.hi());
@@ -337,12 +370,47 @@ impl ColumnEval {
         Some(eval)
     }
 
-    /// Build over an explicit inclusive external-count window `[lo, hi]`, dropping the counts whose exact
-    /// condition has no mass (unreachable under the penetration prior — a zero draw distribution would
-    /// make the solve meaningless). The reachable set is contiguous. `None` if nothing is reachable.
-    fn build(n: u8, up: Card, rules: &Ruleset, lo: i16, hi: i16) -> Option<Self> {
+    /// Build the true-count evaluator over the occurrence-bounded integer-TC window. The window is the
+    /// probability-motivated central span of the true-count occurrence distribution (same
+    /// [`INDEX_TAIL_MASS`] tail bound as the running-count sweep — the true count's spread is far narrower,
+    /// so this is naturally a handful of integers around 0), widened to the marker band (pivot 0 ±
+    /// [`INDEX_MARKER_PIVOT_MARGIN`]). No band shoes: each `TC ≥ ext` solve is an on-demand
+    /// [`solve_counted`] in [`summary`](Self::summary).
+    fn new_true(n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
+        let dist = CountShoe::true_count_distribution::<HiLo>(n, COUNT_PENETRATION);
+        if dist.is_empty() {
+            return None;
+        }
+        let pivot = 0; // balanced ⇒ the zero-edge true count is 0
+        let (mass_lo, mass_hi) = occurrence_window(&dist, INDEX_MARKER_TAIL_MASS);
+        let mark_lo = mass_lo.min(pivot - INDEX_MARKER_PIVOT_MARGIN);
+        let mark_hi = mass_hi.max(pivot + INDEX_MARKER_PIVOT_MARGIN);
+        let (mut lo, mut hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
+        lo = lo.min(mark_lo);
+        hi = hi.max(mark_hi);
+        Some(Self {
+            kind: CountKind::TrueCount,
+            n,
+            up,
+            rules: *rules,
+            externals: (lo..=hi).collect(),
+            shoes: Vec::new(),
+            mark_lo: mark_lo.clamp(lo, hi),
+            mark_hi: mark_hi.clamp(lo, hi),
+            frames: HashMap::new(),
+            summaries: HashMap::new(),
+        })
+    }
+
+    /// Build a **running-count** evaluator over an explicit inclusive external-count window `[lo, hi]`,
+    /// dropping the counts whose exact condition has no mass (unreachable under the penetration prior — a
+    /// zero draw distribution would make the solve meaningless). The reachable set is contiguous. `None`
+    /// if nothing is reachable. KO-specific by construction (KO band shoes, exact-count slicing), so the
+    /// `kind` it stamps is always [`CountKind::Running`]; the true-count path shares none of this and
+    /// builds its struct inline in [`new_true`](Self::new_true).
+    fn build_running(n: u8, up: Card, rules: &Ruleset, lo: i16, hi: i16) -> Option<Self> {
         let window: Vec<i16> = (lo..=hi).collect();
-        let shoes = CountShoe::band::<Ko>(n, &window, CountCmp::Eq, COUNT_PENETRATION);
+        let shoes = CountShoe::band_external::<Ko>(n, &window, CountCmp::Eq, COUNT_PENETRATION);
         let mut externals = Vec::new();
         let mut usable = Vec::new();
         for (&e, shoe) in window.iter().zip(shoes) {
@@ -360,6 +428,7 @@ impl ColumnEval {
         // band, while fixed-width test builds keep the whole window.
         let (mark_lo, mark_hi) = (externals[0], externals[externals.len() - 1]);
         Some(Self {
+            kind: CountKind::Running,
             n,
             up,
             rules: *rules,
@@ -377,7 +446,7 @@ impl ColumnEval {
     #[cfg(test)]
     fn new_windowed(n: u8, up: Card, rules: &Ruleset, half_width: i16) -> Option<Self> {
         let pivot = Ko::pivot(n);
-        Self::build(n, up, rules, pivot - half_width, pivot + half_width)
+        Self::build_running(n, up, rules, pivot - half_width, pivot + half_width)
     }
 
     fn lo(&self) -> i16 {
@@ -397,7 +466,9 @@ impl ColumnEval {
         let c = c.clamp(self.lo(), self.hi());
         if !self.frames.contains_key(&c) {
             let (up, n, rules) = (self.up, self.n, self.rules);
-            let key: FrameKey = (up, n, c, rules);
+            // The band sweep is solved on KO (running-count) shoes; tag the key so it can never alias a
+            // future true-count frame at the same numeric count.
+            let key: FrameKey = (up, n, c, rules, Ko::KIND);
             let frame = diskcache::load::<_, Frame>(FRAME_KIND, &key).unwrap_or_else(|| {
                 let idx = self.externals.iter().position(|&e| e == c).unwrap();
                 let shoe = self.shoes[idx].clone();
@@ -412,29 +483,50 @@ impl ColumnEval {
         c
     }
 
-    /// The WoO-merged chart summary at index-count `ext` (memoized): each hand read from the band frame
-    /// at `ext - map(U) - map(hand)`, so the running count `ext` includes the hand and the up-card.
+    /// The per-`ext` chart summary (memoized): WoO-merged exact-count for Running, the one-sided
+    /// `TC ≥/≤ ext` conditioned column for TrueCount.
     fn summary(&mut self, ext: i16) -> &ColumnSummary {
         if !self.summaries.contains_key(&ext) {
-            let mu = Ko::map(&self.up);
-            let (lo, hi) = (self.lo(), self.hi());
-            // Solve every frame the merge will read first (mutably), so it can then borrow them all
-            // immutably. `frame_key` reads only locals, so it does not borrow `self`.
-            for k in COUNT_GROUPS {
-                self.ensure_frame(ext - mu - k);
-            }
-            let frame_key = |k: i16| (ext - mu - k).clamp(lo, hi);
-            // `ensure_frame` above guarantees each band frame is present.
-            let frame = |k: i16| &self.frames[&frame_key(k)];
-            let (mt, mr) = merge_count_frames(|k| &frame(k).0, |k| &frame(k).1);
-            let summary = summarize_cells(&mt, &mr);
+            let summary = match self.kind {
+                CountKind::Running => self.running_summary(ext),
+                CountKind::TrueCount => self.true_summary(ext),
+            };
             self.summaries.insert(ext, summary);
         }
         &self.summaries[&ext]
     }
 
-    /// The move `ladder` recommends for `cat` at external count `ext`, or `None` if the category is
-    /// absent (e.g. no Hit/Stand EVs to compare for the fallback).
+    /// The WoO-merged exact-count summary at running count `ext` (Running): each hand read from the band
+    /// frame at `ext - map(U) - map(hand)`, so the running count `ext` includes the hand and the up-card.
+    fn running_summary(&mut self, ext: i16) -> ColumnSummary {
+        let mu = Ko::map(&self.up);
+        let (lo, hi) = (self.lo(), self.hi());
+        // Solve every frame the merge will read first (mutably), so it can then borrow them all
+        // immutably. `frame_key` reads only locals, so it does not borrow `self`.
+        for k in COUNT_GROUPS {
+            self.ensure_frame(ext - mu - k);
+        }
+        let frame_key = |k: i16| (ext - mu - k).clamp(lo, hi);
+        // `ensure_frame` above guarantees each band frame is present.
+        let frame = |k: i16| &self.frames[&frame_key(k)];
+        let (mt, mr) = merge_count_frames::<Ko>(|k| &frame(k).0, |k| &frame(k).1);
+        summarize_cells(&mt, &mr)
+    }
+
+    /// The one-sided conditioned chart summary on the side `ext` sits (TrueCount): the WoO-merged
+    /// [`solve_counted`]`::<HiLo>` column at the integer true-count cutoff `ext` (passed in half-units),
+    /// compared `TC ≥ ext` for `ext ≥ 0` and `TC ≤ ext` for `ext < 0`. This is the very column the chart
+    /// shows under that `TC` constraint, so its headline is read directly as the index move — the reported
+    /// threshold and the conditioned chart agree by construction.
+    fn true_summary(&self, ext: i16) -> ColumnSummary {
+        let cmp = if ext >= 0 { CountCmp::Ge } else { CountCmp::Le };
+        solve_counted::<HiLo>(self.n, TC_HALF_UNITS * ext, cmp, self.up, &self.rules).summary
+    }
+
+    /// The move `ladder` recommends for `cat` at index-count `ext`, or `None` if the category is absent.
+    /// Read straight off the per-`ext` [`summary`](Self::summary) (exact-count for Running, the one-sided
+    /// `TC ≥/≤ ext` conditioned column for TrueCount). `coalesce_runs` pins the flips between adjacent
+    /// `ext` exactly.
     fn move_at(&mut self, ext: i16, cat: HandCategory, ladder: Ladder) -> Option<Move> {
         let ci = self.summary(ext).get(&cat)?;
         match ladder {
@@ -466,8 +558,34 @@ impl ColumnEval {
         } else {
             Vec::new()
         };
-        CategoryIndex { primary, fallback }
+        // `basic`/`basic_fallback` are filled by the caller from the no-count base chart (they are not a
+        // function of the count window). Left `None` here.
+        CategoryIndex {
+            primary,
+            fallback,
+            basic: None,
+            basic_fallback: None,
+        }
     }
+}
+
+/// The no-count basic-strategy moves for a category's two ladders: the base-chart headline and its
+/// Hit-vs-Stand argmax (the play once a start-only move is off the table). These flag which true-count
+/// runs are *deviations*. Read off the uncounted base column (disk-cached — usually the very column the
+/// chart already solved, so effectively free).
+fn basic_moves(base: &ColumnSummary, cat: HandCategory) -> (Option<Move>, Option<Move>) {
+    let Some(cell) = base.get(&cat) else {
+        return (None, None);
+    };
+    let h = cell.move_evs.get(&Move::Hit).copied();
+    let s = cell.move_evs.get(&Move::Stand).copied();
+    let fallback = match (h, s) {
+        (Some(h), Some(s)) => Some(if h >= s { Move::Hit } else { Move::Stand }),
+        (Some(_), None) => Some(Move::Hit),
+        (None, Some(_)) => Some(Move::Stand),
+        (None, None) => None,
+    };
+    (Some(cell.headline), fallback)
 }
 
 /// The chart's categories split into the cheap (Hard/Soft — no split solves) and the expensive (Pairs)
@@ -505,8 +623,22 @@ pub(super) fn compute_index_report(
         return;
     }
     let up = key.0;
-    let Some(mut eval) = ColumnEval::new(n, up, rules) else {
+    // The index family comes from the key (the chart's selected counting system), so the markers match
+    // the active system and never alias a cached report from the other.
+    let kind = key.3;
+    let Some(mut eval) = ColumnEval::new(kind, n, up, rules) else {
         return;
+    };
+    // The true-count display gives the *deviation* (a play differing from no-count basic strategy) the
+    // inclusive side of its cutoff, so a true-count report needs the basic-strategy moves. They come from
+    // the uncounted base column (system-independent, disk-cached — usually already solved for the chart).
+    // The running-count display keeps its offset boundaries, so it skips this solve.
+    let base = (kind == CountKind::TrueCount)
+        .then(|| ShoeChoice::Decks(n).solve(up, rules, None).summary);
+    let set_basic = |ci: &mut CategoryIndex, cat| {
+        if let Some(base) = &base {
+            (ci.basic, ci.basic_fallback) = basic_moves(base, cat);
+        }
     };
     let (light, pairs) = index_categories();
     let mut report = IndexReport {
@@ -518,7 +650,8 @@ pub(super) fn compute_index_report(
         complete: false,
     };
     for cat in light {
-        let ci = eval.category_index(cat);
+        let mut ci = eval.category_index(cat);
+        set_basic(&mut ci, cat);
         report.cats.insert(cat, ci);
     }
     if tx
@@ -532,7 +665,8 @@ pub(super) fn compute_index_report(
         return; // receiver gone (app exiting)
     }
     for cat in pairs {
-        let ci = eval.category_index(cat);
+        let mut ci = eval.category_index(cat);
+        set_basic(&mut ci, cat);
         report.cats.insert(cat, ci);
     }
     report.complete = true;
@@ -593,7 +727,8 @@ mod tests {
     #[test]
     #[ignore]
     fn count_index_16_vs_ten_flips_with_count() {
-        let mut eval = ColumnEval::new(1, Card::Ten, &Ruleset::default()).expect("usable window");
+        let mut eval = ColumnEval::new(CountKind::Running, 1, Card::Ten, &Ruleset::default())
+            .expect("usable window");
         let ci = eval.category_index(HandCategory::Hard(16));
         assert!(
             ci.primary.len() >= 2,
@@ -618,6 +753,40 @@ mod tests {
         }
     }
 
+    /// The **true-count** analog, end-to-end through the Hi-Lo path (`solve_counted::<HiLo>` + the
+    /// inequality slice differencing): 16 vs Ten (single deck) must flip off Hit as the true count
+    /// climbs, and the boundary must sit near the canonical Hi-Lo index of 0 (Illustrious 18: stand
+    /// 16v10 at TC ≥ 0). This exercises the whole TrueCount evaluator — the occurrence window, the
+    /// `TC ≥ c` conditioned solves, and `coalesce_runs` over the slice move — that the KO test above does
+    /// not. `#[ignore]` (count-conditioned solves); run `--release --ignored`.
+    #[test]
+    #[ignore]
+    fn true_count_index_16_vs_ten_flips_near_zero() {
+        let mut eval = ColumnEval::new(CountKind::TrueCount, 1, Card::Ten, &Ruleset::default())
+            .expect("usable window");
+        let ci = eval.category_index(HandCategory::Hard(16));
+        assert!(
+            ci.primary.len() >= 2,
+            "expected a true-count deviation for 16 vs T, got {:?}",
+            ci.primary
+        );
+        assert_eq!(
+            ci.primary.first().unwrap().0,
+            Move::Hit,
+            "low TC should Hit"
+        );
+        assert_ne!(
+            ci.primary.last().unwrap().0,
+            Move::Hit,
+            "high TC should deviate off Hit"
+        );
+        let boundary = ci.primary.first().unwrap().2; // last TC at which Hit is still best
+        assert!(
+            (-4..=4).contains(&boundary),
+            "Hit→deviation boundary should sit near TC 0 (Hi-Lo index), got Hit up to {boundary}"
+        );
+    }
+
     /// The bug this redesign fixes: at Hard 12 vs 3 (4 decks) the play flips Hit→Stand near RC −3, but
     /// the old window (centered on the player's +4 count) reported "stand at any RC", contradicting the
     /// no-count base table (Hit). The count-independent report must show both runs with the boundary in
@@ -625,8 +794,8 @@ mod tests {
     #[test]
     #[ignore]
     fn count_index_12_vs_3_flips_near_neg3() {
-        let mut eval =
-            ColumnEval::new(4, Card::Pip(3), &Ruleset::default()).expect("usable window");
+        let mut eval = ColumnEval::new(CountKind::Running, 4, Card::Pip(3), &Ruleset::default())
+            .expect("usable window");
         let ci = eval.category_index(HandCategory::Hard(12));
         assert!(
             ci.primary.len() >= 2,
@@ -655,7 +824,8 @@ mod tests {
     #[test]
     #[ignore]
     fn count_index_soft16_vs_3_marks_single_deck() {
-        let mut eval = ColumnEval::new(1, Card::Pip(3), &Ruleset::default()).expect("usable window");
+        let mut eval = ColumnEval::new(CountKind::Running, 1, Card::Pip(3), &Ruleset::default())
+            .expect("usable window");
         let (mlo, mhi) = (eval.mark_lo, eval.mark_hi);
         let ci = eval.category_index(HandCategory::Soft(16));
         assert!(
@@ -716,7 +886,10 @@ mod tests {
                 mass_lo.min(pivot - INDEX_MARKER_PIVOT_MARGIN),
                 mass_hi.max(pivot + INDEX_MARKER_PIVOT_MARGIN),
             );
-            println!("  + marker band -> [{mlo:>3},{mhi:>3}]  width {:>3}", mhi - mlo + 1);
+            println!(
+                "  + marker band -> [{mlo:>3},{mhi:>3}]  width {:>3}",
+                mhi - mlo + 1
+            );
         }
     }
 

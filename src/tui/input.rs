@@ -4,7 +4,7 @@
 
 use ratatui::crossterm::event::KeyCode;
 
-use crate::count::CountCmp;
+use crate::count::{CountCmp, CountKind, CountSystemId, TC_HALF_UNITS};
 use crate::hand::Move;
 use crate::rules::{BjPayout, PeekRule, PeekSurrender};
 
@@ -16,8 +16,24 @@ use super::{PANES, Tab, UP_CARDS};
 /// Number of editable fields in the rules modal.
 const RULES_FIELDS: usize = 8;
 
-/// Number of fields in the count modal (enabled, comparison, value).
+/// Number of fields in the count modal (system, constraint, value). The on/off toggle is folded into
+/// the constraint field as its `none` option.
 const COUNT_FIELDS: usize = 3;
+
+/// The constraint ladder the count modal cycles through for a given system: `None` is "no condition"
+/// (counting off, base chart + background indices), the rest are the comparisons. True counts are
+/// inequality-only, so `==` is offered for running counts only.
+fn constraint_order(system: CountKind) -> &'static [Option<CountCmp>] {
+    match system {
+        CountKind::Running => &[
+            None,
+            Some(CountCmp::Le),
+            Some(CountCmp::Eq),
+            Some(CountCmp::Ge),
+        ],
+        CountKind::TrueCount => &[None, Some(CountCmp::Le), Some(CountCmp::Ge)],
+    }
+}
 
 /// Number of toggleable category rows in the drill-setup overlay (Soft, Pairs).
 const DRILL_FIELDS: usize = 2;
@@ -301,17 +317,52 @@ impl App {
         }
     }
 
-    /// Change the selected count-modal field by `delta`: toggle enabled, cycle the comparison, or
-    /// step the running-count value.
+    /// Change the selected count-modal field by `delta`: cycle the system (KO/Hi-Lo), cycle the
+    /// constraint (incl. `none` = counting off), or step the entered count value.
     fn edit_count(&mut self, delta: i32) {
         match self.count_sel {
-            0 => self.count_on = !self.count_on,
-            1 => {
-                let order = [CountCmp::Le, CountCmp::Eq, CountCmp::Ge];
-                let i = order.iter().position(|&c| c == self.count.cmp).unwrap_or(1) as i32;
-                self.count.cmp = order[(i + delta).rem_euclid(order.len() as i32) as usize];
+            // System: KO ⇄ Hi-Lo. Switching to a true-count system drops an `==` constraint (true
+            // counts are inequality-only).
+            0 => {
+                self.count.system = match self.count.system {
+                    CountSystemId::Ko => CountSystemId::HiLo,
+                    CountSystemId::HiLo => CountSystemId::Ko,
+                };
+                if self.count.system.kind() == CountKind::TrueCount && self.count.cmp == CountCmp::Eq
+                {
+                    self.count.cmp = CountCmp::Ge;
+                }
             }
-            2 => self.count.external = (self.count.external as i32 + delta).clamp(-60, 60) as i16,
+            // Constraint: cycle `none / ≤ / [==] / ≥`. `none` clears `count_on`; a comparison sets it.
+            1 => {
+                let order = constraint_order(self.count.system.kind());
+                let cur = if self.count_on {
+                    order
+                        .iter()
+                        .position(|&c| c == Some(self.count.cmp))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let next = order[(cur as i32 + delta).rem_euclid(order.len() as i32) as usize];
+                match next {
+                    None => self.count_on = false,
+                    Some(cmp) => {
+                        self.count_on = true;
+                        self.count.cmp = cmp;
+                    }
+                }
+            }
+            // Value: a running count steps by 1 over `[-60, 60]`; a true count is stored in half-units
+            // and steps by a whole true count (`TC_HALF_UNITS`) over roughly `[-15, 15]` TC.
+            2 => {
+                let (step, lo, hi) = match self.count.system.kind() {
+                    CountKind::Running => (1, -60, 60),
+                    CountKind::TrueCount => (TC_HALF_UNITS as i32, -30, 30),
+                };
+                self.count.external =
+                    (self.count.external as i32 + delta * step).clamp(lo, hi) as i16;
+            }
             _ => {}
         }
     }

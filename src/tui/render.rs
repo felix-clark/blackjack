@@ -177,10 +177,13 @@ impl App {
         let bj = r.bj_payout.label();
         let surr = r.peek.surrender_label();
         let pending = self.columns.iter().filter(|c| c.is_none()).count();
-        // The overall edge needs every column, so show a placeholder until the batch finishes.
-        let edge = match self.total_edge() {
-            Some(e) => format!("{:+.3}%", e * 100.0),
-            None => "\u{2026}".to_string(),
+        // The overall edge needs every column, so show a placeholder until the batch finishes. The
+        // basic-strategy edge (playing the chart's headlines) trails it in parentheses.
+        let edge = match (self.total_edge(), self.total_bs_edge()) {
+            (Some(opt), Some(bs)) => {
+                format!("{:+.3}% ({:+.3}% BS)", opt * 100.0, bs * 100.0)
+            }
+            _ => "\u{2026}".to_string(),
         };
         let computing = if pending > 0 {
             format!("  computing {}/10", 10 - pending)
@@ -214,9 +217,9 @@ impl App {
 
         // Row 2: everything that moves with the count — the counting system and its current
         // parameterization, the resulting edge, and the insurance EV. Count is only meaningful on a
-        // finite shoe; shown as e.g. "KO RC>=+4" or "off".
+        // finite shoe; shown as e.g. "KO RC>=+4", "Hi-Lo TC>=+1.5", or "off".
         let count = match self.effective_count() {
-            Some(c) => format!("KO RC{}{:+}", c.cmp_label(), c.external),
+            Some(c) => c.label(),
             None if self.count_on => "n/a(\u{221e})".to_string(),
             None => "off".to_string(),
         };
@@ -305,16 +308,19 @@ impl App {
         // then — once the headline is a start-only move (surrender/double/split) — the Hit/Stand
         // fallback for a hand that has already been hit and so can no longer take it.
         if self.index_key(up).is_some() {
+            // The index axis tracks the selected system: running count (KO) or true count (Hi-Lo).
+            let axis = self.count.axis_label();
             lines.push(Line::from(Span::styled(
                 format!(
                     " {:─^w$}",
-                    " count index (exact RC) ",
+                    format!(" count index ({axis}) "),
                     w = width as usize - 3
                 ),
                 Style::default().fg(Color::DarkGray),
             )));
-            // The player's current running count, so their active run can be highlighted.
-            let here = self.count_on.then_some(self.count.external);
+            // The player's current count on the index axis (integer true count for Hi-Lo), so their
+            // active run can be highlighted.
+            let here = self.count_on.then_some(self.count.index_axis_value());
             match self.selected_index_report() {
                 None => lines.push(Line::from(Span::styled(
                     "  computing\u{2026}",
@@ -328,7 +334,7 @@ impl App {
                     Some(ci) => {
                         let (wmin, wmax) = (report.lo, report.hi);
                         for &(mv, lo, hi) in &ci.primary {
-                            lines.push(rc_run_line(mv, lo, hi, wmin, wmax, here, 2));
+                            lines.push(rc_run_line(mv, lo, hi, wmin, wmax, here, axis, ci.basic, 2));
                         }
                         if !ci.fallback.is_empty() {
                             let label = match ci.start_only_moves().as_slice() {
@@ -342,7 +348,17 @@ impl App {
                                 Style::default().fg(Color::DarkGray),
                             )));
                             for &(mv, lo, hi) in &ci.fallback {
-                                lines.push(rc_run_line(mv, lo, hi, wmin, wmax, here, 4));
+                                lines.push(rc_run_line(
+                                    mv,
+                                    lo,
+                                    hi,
+                                    wmin,
+                                    wmax,
+                                    here,
+                                    axis,
+                                    ci.basic_fallback,
+                                    4,
+                                ));
                             }
                         }
                     }
@@ -406,16 +422,22 @@ impl App {
 
     fn render_count(&self, f: &mut Frame) {
         let infinite = matches!(self.shoe, ShoeChoice::Infinite);
+        // The on/off toggle is folded into the constraint: `none` = counting off (base chart + the
+        // background index markers), the comparisons turn it on.
+        let constraint = if self.count_on {
+            self.count.cmp_label().to_string()
+        } else {
+            "none".to_string()
+        };
         let fields = [
-            format!("Counting      {}", yn(self.count_on)),
-            "System        KO".to_string(),
+            format!("System        {}", self.count.system_label()),
+            format!("Constraint    {constraint}"),
             format!(
-                "Condition     RC {} {}",
-                self.count.cmp_label(),
-                self.count.external
+                "Value         {} {}",
+                self.count.axis_label(),
+                self.count.value_str()
             ),
         ];
-        // Field 1 (system) is fixed at KO for now, so selection skips it; show it dimmed.
         let mut lines: Vec<Line> = Vec::new();
         for (i, field) in fields.iter().enumerate() {
             let mut style = if i == self.count_sel {
@@ -423,7 +445,8 @@ impl App {
             } else {
                 Style::default()
             };
-            if i == 1 {
+            // The value is moot while the constraint is `none`; dim it.
+            if i == 2 && !self.count_on {
                 style = style.fg(Color::DarkGray);
             }
             lines.push(Line::from(Span::styled(format!("  {field}  "), style)));
@@ -650,7 +673,7 @@ fn render_count_panel(f: &mut Frame, area: Rect, t: &Training) {
         };
         vec![
             Line::from(Span::styled(
-                "RC  hidden  (n to guess)",
+                format!("{}  RC hidden (n to guess)", t.system.label()),
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(format!("Decks left  {decks_left:.1}")),
@@ -1015,6 +1038,7 @@ fn compact_hand_label(hand: &CardCol) -> String {
 /// One count-index run rendered as a popup line: the move letter (indented `indent` columns) and its
 /// running-count range. The run the player currently sits on (`here`, their external count, set only
 /// when a count is imposed) is bolded and flagged with a `›`.
+#[allow(clippy::too_many_arguments)]
 fn rc_run_line(
     mv: Move,
     lo: i16,
@@ -1022,6 +1046,8 @@ fn rc_run_line(
     wmin: i16,
     wmax: i16,
     here: Option<i16>,
+    axis: &str,
+    basic: Option<Move>,
     indent: usize,
 ) -> Line<'static> {
     let active = here.is_some_and(|e| lo <= e && e <= hi);
@@ -1038,7 +1064,14 @@ fn rc_run_line(
             Style::default().fg(move_color(mv)).add_modifier(emph),
         ),
         Span::styled(
-            fmt_rc_range(lo, hi, wmin, wmax),
+            // The running count's index boundaries sit between adjacent integers (`H ≤ +2 / S ≥ +3`),
+            // so each side reads off its own edge. The true count is a continuum reported at a single
+            // shared cutoff, with the deviation (a move differing from basic `basic`) owning it inclusively.
+            if axis == "TC" {
+                fmt_tc_range(lo, hi, wmin, wmax, axis, basic.is_some_and(|b| b != mv))
+            } else {
+                fmt_rc_range(lo, hi, wmin, wmax, axis)
+            },
             Style::default()
                 .fg(if active { Color::White } else { Color::Gray })
                 .add_modifier(emph),
@@ -1046,16 +1079,59 @@ fn rc_run_line(
     ])
 }
 
-/// A count-index run's running-count range as a counter-friendly threshold, given the swept window
-/// `[wmin, wmax]`. A run that reaches a window edge is shown open-ended (`≤`/`≥`) — any actual flip
-/// lies outside the window — so e.g. `S  RC ≥ +2` reads "stand once the running count hits +2".
-pub(super) fn fmt_rc_range(lo: i16, hi: i16, wmin: i16, wmax: i16) -> String {
+/// A count-index run's count range as a counter-friendly threshold over the `axis` label (`RC`/`TC`),
+/// given the swept window `[wmin, wmax]`. A run that reaches a window edge is shown open-ended (`≤`/`≥`)
+/// — any actual flip lies outside the window — so e.g. `S  TC ≥ +2` reads "stand once the true count
+/// hits +2".
+pub(super) fn fmt_rc_range(lo: i16, hi: i16, wmin: i16, wmax: i16, axis: &str) -> String {
     match (lo <= wmin, hi >= wmax) {
-        (true, true) => "any RC".to_string(),
-        (true, false) => format!("RC \u{2264} {hi:+}"),
-        (false, true) => format!("RC \u{2265} {lo:+}"),
-        (false, false) if lo == hi => format!("RC = {lo:+}"),
-        (false, false) => format!("RC {lo:+}..{hi:+}"),
+        (true, true) => format!("any {axis}"),
+        (true, false) => format!("{axis} \u{2264} {hi:+}"),
+        (false, true) => format!("{axis} \u{2265} {lo:+}"),
+        (false, false) if lo == hi => format!("{axis} = {lo:+}"),
+        (false, false) => format!("{axis} {lo:+}..{hi:+}"),
+    }
+}
+
+/// A count-index run's range for a **true-count** system. Unlike the running count (whose adjacent runs
+/// straddle an integer boundary and so read off offset edges — `H ≤ +2 / S ≥ +3`), the true count is a
+/// continuum reported at a single shared cutoff between complementary runs: the **deviation** (the run
+/// whose move differs from no-count basic strategy, flagged by `is_deviation`) owns the cutoff
+/// **inclusively**, and the base run gets the **strict** sign at the same integer. So for a stand
+/// deviation at the cutoff `c` — base run `[.., c-1]`, deviation run `[c, ..]` — the base reads `H < c`
+/// and the deviation `S ≥ c`, agreeing with the count the conditioned chart switches at and matching the
+/// published index (16-v-T: `H < 0 / S ≥ 0`, the Illustrious-18 index of 0). The technical overlap (both
+/// runs nominally touch `c`) is harmless — the true count is an approximation.
+pub(super) fn fmt_tc_range(
+    lo: i16,
+    hi: i16,
+    wmin: i16,
+    wmax: i16,
+    axis: &str,
+    is_deviation: bool,
+) -> String {
+    // A finite lower edge at `lo` sits on the boundary `(lo-1, lo)`; a finite upper edge at `hi` on
+    // `(hi, hi+1)`. The deviation owns the boundary integer it is adjacent to (`≥ lo` / `≤ hi`); the base
+    // run cedes it and reads strictly past the deviation's integer (`> lo-1` / `< hi+1`).
+    let lower_bound = |lo: i16| {
+        if is_deviation {
+            format!("\u{2265} {lo:+}")
+        } else {
+            format!("> {:+}", lo - 1)
+        }
+    };
+    let upper_bound = |hi: i16| {
+        if is_deviation {
+            format!("\u{2264} {hi:+}")
+        } else {
+            format!("< {:+}", hi + 1)
+        }
+    };
+    match (lo <= wmin, hi >= wmax) {
+        (true, true) => format!("any {axis}"),
+        (true, false) => format!("{axis} {}", upper_bound(hi)),
+        (false, true) => format!("{axis} {}", lower_bound(lo)),
+        (false, false) => format!("{axis} {}, {}", lower_bound(lo), upper_bound(hi)),
     }
 }
 
@@ -1123,5 +1199,43 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// True-count runs report complementary plays at a single shared cutoff: the deviation run owns it
+    /// inclusively, the base run reads strictly past it. Window `[-9, 9]`, so an edge-touching run is
+    /// open-ended. A stand-deviation flipping at +3 (base Hit `[-9,2]`, deviation Stand `[3,9]`): the base
+    /// reads `< +3`, the deviation `≥ +3` — both anchored on +3, matching the conditioned-chart cutoff.
+    #[test]
+    fn fmt_tc_range_shares_positive_cutoff() {
+        assert_eq!(fmt_tc_range(-9, 2, -9, 9, "TC", false), "TC < +3");
+        assert_eq!(fmt_tc_range(3, 9, -9, 9, "TC", true), "TC \u{2265} +3");
+    }
+
+    /// The 16-v-T pivot case: the crossover sits between TC -1 and 0, basic strategy is Hit, and the
+    /// deviation (Stand) owns 0. Base Hit `[-9,-1]` reads `< 0`; deviation Stand `[0,9]` reads `≥ 0` —
+    /// the published Illustrious-18 index of 0, *not* anchored on the negative edge.
+    #[test]
+    fn fmt_tc_range_pivot_deviation_owns_zero() {
+        assert_eq!(fmt_tc_range(-9, -1, -9, 9, "TC", false), "TC < +0");
+        assert_eq!(fmt_tc_range(0, 9, -9, 9, "TC", true), "TC \u{2265} +0");
+    }
+
+    /// A negative-count deviation: base Stand `[-1,9]` reads `> -2`, deviation Hit `[-9,-2]` reads
+    /// `≤ -2` — the deviation owns its cutoff on the low side.
+    #[test]
+    fn fmt_tc_range_negative_deviation() {
+        assert_eq!(fmt_tc_range(-9, -2, -9, 9, "TC", true), "TC \u{2264} -2");
+        assert_eq!(fmt_tc_range(-1, 9, -9, 9, "TC", false), "TC > -2");
+    }
+
+    /// A run spanning the whole window has no count dependence.
+    #[test]
+    fn fmt_tc_range_any() {
+        assert_eq!(fmt_tc_range(-9, 9, -9, 9, "TC", false), "any TC");
     }
 }

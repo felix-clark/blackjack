@@ -29,13 +29,15 @@ use rand::Rng;
 use rand::rngs::SmallRng;
 
 use crate::card::Card;
-use crate::count::{CountSystem, Ko};
+use crate::count::{CountKind, CountSystemId};
 use crate::dealer::DealerHand;
 use crate::diskcache;
 use crate::hand::{HandCategory, HandState, Move, best_move, categorize, pair_rank};
 use crate::rules::Ruleset;
 use crate::shoe::{CardCol, InfiniteDeck, Shoe};
-use crate::simulation::{build_evs_with_splits, dealer_natural_prob, pair_split_evs_for, resolve_ev};
+use crate::simulation::{
+    build_evs_with_splits, dealer_natural_prob, pair_split_evs_for, resolve_ev,
+};
 
 use super::column::ColumnSummary;
 use super::config::ShoeChoice;
@@ -172,8 +174,11 @@ pub(super) struct DecisionMark {
     pub(super) chosen: Move,
     pub(super) simple: RefPlay,
     pub(super) basic: RefPlay,
-    /// The count-index deviation at the current running count, or `None` on the infinite deck / until the
-    /// index report is cached — the harness renders it as "n/a" meanwhile.
+    /// The **index-sensitive basic strategy** play: the index's named deviation where it has one, else
+    /// plain basic — present whenever index *data* exists for this decision (a counted game with the
+    /// up-card's report cached), and `None` where it does not (infinite deck / drill / report not yet
+    /// filled), which the harness renders as "n/a". This is the play the indexed reference is scored
+    /// against on *every* available decision, not just the deviations (see [`RefScore::indexed`]).
     pub(super) indexed: Option<RefPlay>,
     pub(super) optimal: RefPlay,
     /// EV of the move actually chosen (so `ev_chosen - optimal.ev` is the mistake cost, ≤ 0).
@@ -185,6 +190,10 @@ pub(super) struct DecisionMark {
     /// telescopes the total onto the player's actual-policy value. Reference EV totals take only the
     /// opening EV. Agreement stats, by contrast, count *every* decision.
     pub(super) opening: bool,
+    /// Whether this round is **counted** — a finite shoe with counting live (not the infinite deck, not a
+    /// drill). The indexed reference is a meaningful strategy only here, so this gates whether its EV
+    /// population takes the round (see [`RefScore::indexed`]). The all-round references ignore it.
+    pub(super) counted: bool,
 }
 
 /// One reference yardstick's running scoreboard, plus the rule for pulling its play out of a graded
@@ -196,14 +205,24 @@ pub(super) struct RefScore {
     /// Display label ("Simple", "Basic", "Indexed", "Optimal").
     pub(super) label: &'static str,
     /// Whether this reference is defined on *every* decision and round. True for simple/basic/optimal;
-    /// false for **indexed**, which is count-only — n/a on the infinite deck and until the index report
-    /// is cached — so it covers a subset of decisions/rounds and carries its own denominators. An
-    /// all-round reference also collects no-decision naturals and accrues downstream-mistake regret,
-    /// keeping its [`Self::player_ev`] equal to [`TrainStats::ev_player`]; indexed does neither (it tracks
-    /// count *deviations*, so it stays opening-decision-only).
+    /// false for **indexed**, whose population is instead *conditional* (see [`Self::indexed`]). An
+    /// all-round reference collects no-decision naturals and accrues downstream-decision regret (against
+    /// its *own* play, see [`Self::player_ev`]) unconditionally.
     all_round: bool,
-    /// Pull this reference's recommended play out of a graded decision, or `None` where it is undefined
-    /// (only indexed ever is — see [`Self::all_round`]).
+    /// Whether this is the **indexed** row — *index-sensitive basic strategy* (play basic, plus the
+    /// indices) — scored with two decoupled populations. Its *agreement* covers every decision where index
+    /// data exists ([`Self::get`] returns `Some`), graded against the index-sensitive play (the deviation
+    /// where the index names one, else plain basic) — so it is the same scale as the other references, not
+    /// a deviations-only subset, just leaving out decisions with missing data (cold/uncounted). Its *EV*
+    /// covers the full **counted** population like an all-round reference — every counted round (naturals
+    /// included), valuing each by that same index-sensitive play. That makes its EV directly comparable to
+    /// Basic's (same rounds, same natural windfall) rather than biased low by excluding the no-decision
+    /// naturals. On an uncounted round (infinite deck / drill, `mark.counted == false`) it accrues nothing
+    /// and stays n/a.
+    indexed: bool,
+    /// Pull this reference's recommended play out of a graded decision, or `None` where it is undefined.
+    /// For indexed this is the index-sensitive play when index data exists (deviation-or-basic), `None`
+    /// where it is missing (see [`Self::indexed`]).
     get: fn(&DecisionMark) -> Option<RefPlay>,
 
     /// Decisions matching this reference, over [`Self::decisions`] — the decisions where it was defined.
@@ -212,18 +231,24 @@ pub(super) struct RefScore {
     /// Cumulative opening (reference) EV over [`Self::rounds`], the rounds this reference covers.
     pub(super) ev: f64,
     pub(super) rounds: u32,
-    /// The player's own cumulative EV over exactly the rounds this reference covers, so the EV gap is
-    /// simply `player_ev - ev`. For an all-round reference this tracks [`TrainStats::ev_player`]; for
-    /// indexed it is the opening-only player EV over the count-deviation rounds.
+    /// The player's cumulative EV measured *against this reference's own policy* over the rounds it
+    /// covers, so the EV gap is simply `player_ev - ev`. It takes the chosen opening EV plus each
+    /// downstream decision's regret versus **this reference's** play at that node (`ev_chosen - play.ev`),
+    /// so a player who matches the reference on every decision has `player_ev == ev` and a zero gap. This
+    /// is the per-reference counterpart of the global [`TrainStats::ev_player`], which instead measures
+    /// downstream regret against optimal; the two coincide only for the Optimal reference. For indexed it
+    /// is taken over the full counted population (see [`Self::indexed`]), valuing each round by the
+    /// deviation play where one is defined and the basic play otherwise.
     pub(super) player_ev: f64,
 }
 
 impl RefScore {
     /// The reference table the trainer scores against, in display order (weakest to strongest).
     fn all() -> Vec<RefScore> {
-        let mk = |label, all_round, get: fn(&DecisionMark) -> Option<RefPlay>| RefScore {
+        let mk = |label, all_round, indexed, get: fn(&DecisionMark) -> Option<RefPlay>| RefScore {
             label,
             all_round,
+            indexed,
             get,
             agree: 0,
             decisions: 0,
@@ -232,10 +257,10 @@ impl RefScore {
             player_ev: 0.0,
         };
         vec![
-            mk("Simple", true, |m| Some(m.simple)),
-            mk("Basic", true, |m| Some(m.basic)),
-            mk("Indexed", false, |m| m.indexed),
-            mk("Optimal", true, |m| Some(m.optimal)),
+            mk("Simple", true, false, |m| Some(m.simple)),
+            mk("Basic", true, false, |m| Some(m.basic)),
+            mk("Indexed", false, true, |m| m.indexed),
+            mk("Optimal", true, false, |m| Some(m.optimal)),
         ]
     }
 
@@ -253,33 +278,51 @@ impl RefScore {
     /// Fold one graded decision into this reference. `None` from the extractor (indexed only) means the
     /// reference is undefined here and nothing accrues.
     fn grade(&mut self, mark: &DecisionMark) {
-        let Some(play) = (self.get)(mark) else {
-            return;
-        };
+        // The reference's own play at this node: the deviation play for indexed (`None` where the index
+        // gave none), the fixed play for the others (always `Some`).
+        let play = (self.get)(mark);
         // Agreement counts *every* decision where the reference was defined — this is where later-street
-        // and per-arm mistakes surface.
-        self.decisions += 1;
-        if mark.chosen == play.mv {
-            self.agree += 1;
+        // and per-arm mistakes surface. Indexed is defined only at its deviation decisions, so its
+        // agreement column stays scoped to "did you play the deviations right".
+        if let Some(play) = play {
+            self.decisions += 1;
+            if mark.chosen == play.mv {
+                self.agree += 1;
+            }
         }
+        // EV population: the all-round references cover every round; indexed covers the full *counted*
+        // population (so its EV is comparable to Basic's — same rounds, same natural windfall — rather
+        // than biased low by excluding no-decision naturals), valuing each round by the deviation play
+        // where one is defined and the basic play otherwise ("play basic, plus the indices"). An
+        // uncounted round (infinite deck / drill) accrues nothing, leaving indexed n/a.
+        if !(self.all_round || (self.indexed && mark.counted)) {
+            return;
+        }
+        let valued = play.unwrap_or(mark.basic);
         if mark.opening {
             // The opening decision seeds the round: the reference takes its opening EV, the player takes
             // the chosen EV (which values the whole round under optimal continuation).
             self.rounds += 1;
-            self.ev += play.ev;
+            self.ev += valued.ev;
             self.player_ev += mark.ev_chosen;
-        } else if self.all_round {
-            // A *downstream* mistake's regret (`ev_chosen - optimal.ev` ≤ 0) is pure player loss versus an
-            // all-round reference, which never acts past the opening — so it widens the gap there. Indexed
-            // stays opening-only and ignores it.
-            self.player_ev += mark.ev_chosen - mark.optimal.ev;
+        } else {
+            // A *downstream* decision's regret is charged against **this reference's own play** at the node
+            // (`ev_chosen - valued.ev`), not against optimal — so a player who matches the reference on
+            // every decision shows exactly zero gap to it (the invariant the agreement column already
+            // implies). Measuring it against optimal instead would charge the player for the reference's
+            // *own* downstream suboptimality (e.g. basic's composition-blind plays losing to the exact
+            // optimal), producing the contradiction of a negative gap at 100% agreement. For the Optimal
+            // reference `valued.ev` is `mark.optimal.ev`, so its gap is unchanged (total regret vs optimal).
+            self.player_ev += mark.ev_chosen - valued.ev;
         }
     }
 
     /// Fold a no-decision natural round. The player and every all-round reference settle it identically;
-    /// indexed abstains (it tracks count deviations, and a natural offers none).
-    fn settle_natural(&mut self, ev: f64) {
-        if self.all_round {
+    /// indexed settles it too on a `counted` round (it shares the same full population for EV — a natural
+    /// is policy-independent, so excluding it would bias indexed's EV below basic by the natural windfall),
+    /// but abstains on an uncounted round where it is n/a entirely.
+    fn settle_natural(&mut self, ev: f64, counted: bool) {
+        if self.all_round || (self.indexed && counted) {
             self.rounds += 1;
             self.ev += ev;
             self.player_ev += ev;
@@ -307,11 +350,11 @@ pub(super) struct TrainStats {
     pub(super) refs: Vec<RefScore>,
 
     /// The player's own cumulative expected units over *all* rounds — the "You" headline. It carries the
-    /// opening EV, every downstream-mistake regret, and the folded no-decision naturals. A good counter
-    /// runs it above simple/basic and below optimal, and `ev_player / rounds` tracks the table edge. Each
-    /// reference's gap is this same value restricted to the rounds that reference covers, minus the
-    /// reference's EV — tracked per reference as [`RefScore::player_ev`] so [`RefScore::gap`] is a plain
-    /// subtraction even for the subset-covering indexed reference.
+    /// opening EV, every downstream-mistake regret **versus optimal**, and the folded no-decision
+    /// naturals, so `ev_player / rounds` tracks the table edge under the player's actual policy. A good
+    /// counter runs it above simple/basic and below optimal. Each reference's *gap* is instead measured
+    /// against that reference's own policy ([`RefScore::player_ev`] − [`RefScore::ev`]), so matching a
+    /// reference zeroes its gap; this headline coincides with [`RefScore::player_ev`] only for Optimal.
     pub(super) ev_player: f64,
 
     /// Cumulative net units actually won/lost across settled rounds.
@@ -363,7 +406,7 @@ impl TrainShoe {
         }
     }
 
-    /// The [`ShoeChoice`] this shoe corresponds to, so [`Training::sync_shoe`] can tell when the
+    /// The [`ShoeChoice`] this shoe corresponds to, so [`Training::sync`] can tell when the
     /// selection changed under it.
     fn choice(&self) -> ShoeChoice {
         match self {
@@ -457,8 +500,14 @@ pub(super) struct Training {
     /// The trainer's live draw source: a finite, counted, depleting shoe or a non-depleting infinite
     /// deck (a pure basic-strategy drill — see [`TrainShoe`]).
     pub(super) shoe: TrainShoe,
-    /// The *true* KO external running count of every card revealed so far — the value the count quiz
-    /// grades against. Reset to the system IRC on a reshuffle.
+    /// The counting system the trainer tracks under, mirrored from the strategy tab's count modal (KO or
+    /// Hi-Lo). It drives the card→count map ([`reveal`](Self::reveal)), the fresh-shoe IRC
+    /// ([`initial_count`]), and which system tag the indexed reference looks its report up under
+    /// ([`indexed_move`](Self::indexed_move)). A change resyncs the trainer (see [`sync`](Self::sync)),
+    /// since a running count is meaningless across systems.
+    pub(super) system: CountSystemId,
+    /// The *true* external running count (under [`system`](Self::system)) of every card revealed so far —
+    /// the value the count quiz grades against. Reset to the system IRC on a reshuffle.
     pub(super) running_count: i16,
     pub(super) phase: Phase,
     /// The dealer's cards: `[up, hole, ..draws]`. The hole card (index 1) stays hidden — and uncounted
@@ -534,13 +583,14 @@ pub(super) struct Training {
 }
 
 impl Training {
-    pub(super) fn new(shoe: ShoeChoice) -> Self {
+    pub(super) fn new(shoe: ShoeChoice, system: CountSystemId) -> Self {
         let shoe = TrainShoe::from_choice(shoe);
-        let running_count = initial_count(&shoe);
+        let running_count = initial_count(&shoe, system);
         let (eval_tx, eval_rx) = mpsc::channel();
         let rng = rand::make_rng();
         Self {
             shoe,
+            system,
             running_count,
             phase: Phase::Ready,
             dealer: Vec::new(),
@@ -582,8 +632,7 @@ impl Training {
     /// [`Training::needs_shuffle`]).
     pub(super) fn reset_shoe(&mut self) {
         self.shoe.reset();
-        // TODO: The counting system should derive from the setting in the strategy tab.
-        self.running_count = initial_count(&self.shoe);
+        self.running_count = initial_count(&self.shoe, self.system);
     }
 
     /// Whether the shoe has passed its dealing penetration and should be reshuffled before the next deal
@@ -605,7 +654,7 @@ impl Training {
     /// the infinite deck, which has no count.
     pub(super) fn reveal(&mut self, card: Card) {
         if self.shoe.is_finite() {
-            self.running_count += Ko::map(&card);
+            self.running_count += self.system.map(&card);
         }
     }
 
@@ -634,11 +683,13 @@ impl Training {
         self.is_finite() && !self.drilling
     }
 
-    /// Re-point the live shoe at the currently selected [`ShoeChoice`] if its deck count changed (e.g.
-    /// the rules modal switched decks), abandoning any round dealt from the old shoe. Called when the
-    /// training tab is entered.
-    pub(super) fn sync_shoe(&mut self, shoe: ShoeChoice) {
-        if shoe != self.shoe.choice() {
+    /// Re-point the live shoe and counting system at the strategy tab's current selection if either
+    /// changed (e.g. the rules modal switched decks, or the count modal switched KO↔Hi-Lo), abandoning
+    /// any round dealt from the old shoe. Called when the training tab is entered. A system switch
+    /// resets too: a running count carried under one system is meaningless under the other.
+    pub(super) fn sync(&mut self, shoe: ShoeChoice, system: CountSystemId) {
+        if shoe != self.shoe.choice() || system != self.system {
+            self.system = system;
             self.reset_to(shoe);
         }
     }
@@ -653,10 +704,10 @@ impl Training {
 
     /// Point the live shoe at `shoe` as a fresh full shoe, reset the running count, abandon any
     /// in-progress round, and drop any decision grade still in flight (it was computed for the old shoe).
-    /// Shared by [`sync_shoe`](Self::sync_shoe) (deck switched) and [`on_rules_changed`](Self::on_rules_changed).
+    /// Shared by [`sync`](Self::sync) (deck or system switched) and [`on_rules_changed`](Self::on_rules_changed).
     fn reset_to(&mut self, shoe: ShoeChoice) {
         self.shoe = TrainShoe::from_choice(shoe);
-        self.running_count = initial_count(&self.shoe);
+        self.running_count = initial_count(&self.shoe, self.system);
         self.phase = Phase::Ready;
         self.hands.clear();
         self.dealer.clear();
@@ -738,7 +789,7 @@ impl Training {
         for _ in 0..10_000 {
             // Fresh shoe per attempt so a rejected deal doesn't deplete the next one.
             self.shoe.reset();
-            self.running_count = initial_count(&self.shoe);
+            self.running_count = initial_count(&self.shoe, self.system);
             let opening = vec![self.draw(), self.draw(), self.draw(), self.draw()];
             let hand = CardCol::from_hand(&[opening[0], opening[2]]);
             if self.drill.accepts(&hand) {
@@ -1099,10 +1150,14 @@ impl Training {
     /// reference settle the round identically — the same value lands in each. `indexed` is left out: it
     /// tracks count *deviations*, and a natural offers none.
     fn fold_no_decision(&mut self, ev: f64) {
+        // A counted round (finite shoe, counting live — not the infinite deck, not a drill) is one the
+        // indexed reference's EV population covers; an uncounted natural leaves indexed n/a (see
+        // [`RefScore::settle_natural`]). The same gate [`indexed_move`] uses.
+        let counted = matches!(self.shoe, TrainShoe::Finite { .. }) && !self.drilling;
         let s = &mut self.stats;
         s.ev_player += ev;
         for r in &mut s.refs {
-            r.settle_natural(ev);
+            r.settle_natural(ev, counted);
         }
     }
 
@@ -1146,6 +1201,8 @@ impl Training {
         // The round's opening decision: the first move, on the lone pristine two-card hand before any
         // hit/split/double. Only these feed the per-round EV totals (see [`DecisionMark::opening`]).
         let opening = self.active == 0 && self.hands.len() == 1 && self.hands[0].cards.len() == 2;
+        // The index-sensitive play and whether index data exists for this decision (see [`indexed_move`]).
+        let (index_deviation, index_available) = self.indexed_move(&hand, up, rules);
 
         // A ruleset change invalidates the memoized basic summaries and any grade still in flight (it was
         // computed under the old rules), so drop both before issuing this job's `seq`.
@@ -1171,15 +1228,20 @@ impl Training {
                 .into_iter()
                 .filter(|&m| self.allowed_move(m, rules))
                 .collect(),
-            // Count-index deviation at the current running count (always `None` on the infinite deck —
-            // see [`indexed_move`]); a cheap disk-cache lookup, resolved here on the UI thread.
-            indexed: self.indexed_move(&hand, up, rules),
+            // Count-index play at the current count and whether index data exists for this decision at
+            // all (a cheap disk-cache lookup, resolved here on the UI thread; see [`indexed_move`]). The
+            // deviation is `None` where the index names no special play (⇒ the worker uses basic).
+            indexed: index_deviation,
+            index_available,
             // The round-start shoe for the finite live solve; `None` on the infinite deck, which routes
             // `run_eval` to the basic-EV (== optimal) path instead.
             finite_shoe: self.reconstruct_solver_shoe(&hand, up),
             // Reuse the memoized basic summary if we have it; otherwise the worker solves and echoes it.
             basic_summary: self.basic.get(&up).cloned(),
             opening,
+            // A counted round (finite shoe, counting live — not a drill) is one the indexed reference's EV
+            // population covers; the same gate [`indexed_move`] uses.
+            counted: matches!(self.shoe, TrainShoe::Finite { .. }) && !self.drilling,
             hand,
         };
         self.eval_seq += 1;
@@ -1210,36 +1272,70 @@ impl Training {
         Some(solver_shoe)
     }
 
-    /// The count-index deviation move for the active hand at the player's current running count, read
-    /// from the **disk-cached** [`IndexReport`] the strategy tab fills in the background (so this never
-    /// triggers the heavy count-conditioned solve itself — a cold up-card simply returns `None`).
+    /// The count-index play for the active hand at the player's current count, read from the
+    /// **disk-cached** [`IndexReport`] the strategy tab fills in the background (so this never triggers the
+    /// heavy count-conditioned solve itself). Returns `(deviation, available)`:
     ///
-    /// The report's ladders are indexed by the external running count under the Wizard-of-Odds
-    /// convention (the count *includes* the up-card and the hand), which is exactly what
-    /// [`running_count`](Self::running_count) tracks. The headline ladder (`primary`) assumes a fresh
-    /// two-card hand; if its play is a start-only move (double/split/surrender) the live hand can no
-    /// longer make — already hit, or not a pair — we drop to the Hit/Stand `fallback` ladder, mirroring
-    /// the popup's "if can't …" logic.
-    fn indexed_move(&self, hand: &CardCol, up: Card, rules: &Ruleset) -> Option<Move> {
-        // A drill is a fresh-shoe basic-strategy frame with no running count, so there is no count
-        // deviation to reference — the feedback panel shows "indexed — n/a".
-        if self.drilling {
-            return None;
-        }
-        // The index is a finite-shoe, count-conditioned object: the infinite deck has no count, so no
-        // index deviation exists there. Keyed by the concrete deck count (the trainer's `n_decks`), it
-        // shares the exact disk cache the strategy tab populates for a `Decks(n)` selection.
+    /// - `available` is whether index *data* exists for this decision at all — a counted game (finite
+    ///   shoe, not a drill) whose up-card report is cached. The indexed reference is "index-sensitive basic
+    ///   strategy", defined on *every* such decision (the caller falls its play back to basic where the
+    ///   index names no deviation), so this — not the presence of a deviation — is the gate on whether the
+    ///   decision is scored at all. Cold/uncounted decisions (`false`) are left out as missing data.
+    /// - `deviation` is the index's named play when it has one for this hand (else `None`, ⇒ the caller
+    ///   uses basic). The report's ladders are indexed by the external running count under the
+    ///   Wizard-of-Odds convention (the count *includes* the up-card and the hand), which is exactly what
+    ///   [`running_count`](Self::running_count) tracks. The headline ladder (`primary`) assumes a fresh
+    ///   two-card hand; if its play is a start-only move (double/split/surrender) the live hand can no
+    ///   longer make — already hit, or not a pair — we drop to the Hit/Stand `fallback` ladder, mirroring
+    ///   the popup's "if can't …" logic. A category the report carries no ladder for yields `None` here
+    ///   (index-sensitive basic strategy plays it as plain basic), but the decision is still available.
+    fn indexed_move(&self, hand: &CardCol, up: Card, rules: &Ruleset) -> (Option<Move>, bool) {
+        // A drill is a fresh-shoe basic-strategy frame with no running count, and the infinite deck has no
+        // count at all: no index data, so the decision is unavailable (the panel shows "indexed — n/a").
         let TrainShoe::Finite { n_decks, .. } = &self.shoe else {
-            return None;
+            return (None, false);
         };
-        let key: IndexKey = (up, ShoeChoice::Decks(*n_decks), *rules);
-        let report = diskcache::load::<_, IndexReport>("index", &key)?;
-        let ci = report.cats.get(&categorize(hand))?;
-        let primary = run_move(&ci.primary, self.running_count)?;
-        if self.allowed_move(primary, rules) {
-            Some(primary)
-        } else {
-            run_move(&ci.fallback, self.running_count)
+        if self.drilling {
+            return (None, false);
+        }
+        // Tag the key with the *current* system so the trainer shares the exact persisted report the
+        // strategy tab keys its index under (a HiLo report can never be served for a KO basis, or vice
+        // versa). A cold up-card (report not yet filled) is unavailable until the background solve lands.
+        let key: IndexKey = (up, ShoeChoice::Decks(*n_decks), *rules, self.system.kind());
+        let Some(report) = diskcache::load::<_, IndexReport>("index", &key) else {
+            return (None, false);
+        };
+        // Data is available; the named deviation (if any) for this hand, else `None` ⇒ basic.
+        let deviation = (|| {
+            let ci = report.cats.get(&categorize(hand))?;
+            // The ladders are indexed on the system's own count axis — the running count for KO, the
+            // integer true count for Hi-Lo — so read the player's position on that axis (see
+            // [`index_axis_value`]).
+            let axis = self.index_axis_value()?;
+            let primary = run_move(&ci.primary, axis)?;
+            if self.allowed_move(primary, rules) {
+                Some(primary)
+            } else {
+                run_move(&ci.fallback, axis)
+            }
+        })();
+        (deviation, true)
+    }
+
+    /// The player's position on the index ladder's count axis under the current [`system`](Self::system).
+    /// For a running-count system (KO) the ladders are indexed by the running count directly, so this is
+    /// just [`running_count`](Self::running_count). For a true-count system (Hi-Lo) they are indexed by the
+    /// **floor-bucketed integer true count** (matching the index sweep's `[ext, ext+1)` slices), so it
+    /// converts: `floor(running_count ÷ decks remaining)`, the same `TC = running ÷ decks-remaining` the
+    /// strategy tab uses. `None` only when no decks remain to divide by (unreachable — the shoe reshuffles
+    /// well before depletion — but the infinite-deck path that has no count returns `None` here too).
+    fn index_axis_value(&self) -> Option<i16> {
+        match self.system.kind() {
+            CountKind::Running => Some(self.running_count),
+            CountKind::TrueCount => {
+                let decks = self.decks_remaining()?;
+                (decks > 0.0).then(|| (self.running_count as f64 / decks).floor() as i16)
+            }
         }
     }
 
@@ -1286,8 +1382,12 @@ struct EvalJob {
     /// The moves legal on the live hand (computed on the UI thread), so the basic reference is the best
     /// of *these* by the chart EVs rather than the unconditional two-card headline.
     allowed: Vec<Move>,
-    /// The count-index deviation, already resolved on the UI thread (a cheap disk-cache lookup).
+    /// The count-index deviation for this hand (`None` ⇒ the index names no special play, so the worker
+    /// uses basic), already resolved on the UI thread (a cheap disk-cache lookup).
     indexed: Option<Move>,
+    /// Whether index *data* exists for this decision (counted game with the up-card's report cached). The
+    /// indexed reference is scored — agreement and EV — only when this holds; otherwise it is missing data.
+    index_available: bool,
     /// The round-start shoe for the finite live solve; `None` on the infinite deck (whose optimal play is
     /// the composition-independent basic play, taken from `basic_summary`).
     finite_shoe: Option<CardCol>,
@@ -1298,6 +1398,9 @@ struct EvalJob {
     /// Whether this is the round's opening decision (drives the per-round EV totals; see
     /// [`DecisionMark::opening`]). Resolved on the UI thread from the live hand state.
     opening: bool,
+    /// Whether this round is counted (finite shoe, counting live — not infinite deck, not a drill), gating
+    /// the indexed reference's EV population (see [`DecisionMark::counted`]).
+    counted: bool,
 }
 
 /// A finished decision grade streamed back from an eval worker (see [`Training::drain_evals`]).
@@ -1361,10 +1464,16 @@ fn run_eval(job: EvalJob) -> EvalResult {
             chosen: job.chosen,
             simple: play(simple),
             basic: play(basic),
-            indexed: job.indexed.map(play),
+            // Index-sensitive basic strategy: the named deviation where the index has one, else plain
+            // basic — but only where index data exists (`index_available`); a cold/uncounted decision is
+            // missing data and stays out of both the agreement and EV columns (`None`).
+            indexed: job
+                .index_available
+                .then(|| play(job.indexed.unwrap_or(basic))),
             optimal: play(optimal),
             ev_chosen,
             opening: job.opening,
+            counted: job.counted,
         }
     });
 
@@ -1398,12 +1507,13 @@ fn finite_move_evs(
     Some(tree.get(hand)?.1.clone())
 }
 
-/// The KO running count a fresh shoe starts at: the system's initial count for a finite `n`-deck shoe,
-/// and a meaningless `0` on the infinite deck (which has no count). Shared by the constructor and the
-/// reshuffle/sync paths so the three stay in step.
-fn initial_count(shoe: &TrainShoe) -> i16 {
+/// The running count a fresh shoe starts at under `system`: the system's initial count (IRC) for a
+/// finite `n`-deck shoe (`4 − 4n` for KO, `0` for the balanced Hi-Lo), and a meaningless `0` on the
+/// infinite deck (which has no count). Shared by the constructor and the reshuffle/sync paths so the
+/// three stay in step.
+fn initial_count(shoe: &TrainShoe, system: CountSystemId) -> i16 {
     match shoe {
-        TrainShoe::Finite { n_decks, .. } => Ko::starting_count(*n_decks),
+        TrainShoe::Finite { n_decks, .. } => system.starting_count(*n_decks),
         TrainShoe::Infinite => 0,
     }
 }

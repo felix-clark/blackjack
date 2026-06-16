@@ -11,7 +11,7 @@ use std::{array, io, thread};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 use crate::card::Card;
-use crate::count::CountCmp;
+use crate::count::{CountCmp, CountKind, CountSystemId};
 use crate::hand::HandCategory;
 use crate::reach::CellInfo;
 use crate::rules::Ruleset;
@@ -87,8 +87,10 @@ pub(super) struct App {
     /// Columns whose index report is being solved in the background, so the scheduler doesn't respawn a
     /// column already in flight. Cleared per key when its *complete* report lands.
     index_pending: HashSet<IndexKey>,
-    /// The `(shoe, rules)` the cached index reports are for; a change invalidates them (counts don't).
-    index_basis: Option<(ShoeChoice, Ruleset)>,
+    /// The `(shoe, rules, counting system)` the cached index reports are for; a change invalidates them.
+    /// The count *value* is not part of it (the index is value-independent), but the *system* is (KO and
+    /// Hi-Lo give different indices).
+    index_basis: Option<(ShoeChoice, Ruleset, CountKind)>,
     /// Bumped when `index_basis` changes, stamped on background reports so stale ones are dropped.
     index_epoch: u64,
     index_tx: Sender<IndexResult>,
@@ -102,10 +104,12 @@ impl App {
         let count = CountSetting {
             external: 0,
             cmp: CountCmp::Eq,
+            // Default to KO; the count modal's System field switches to Hi-Lo.
+            system: CountSystemId::Ko,
         };
         Self {
             tab: Tab::Strategy,
-            training: Training::new(ShoeChoice::Infinite),
+            training: Training::new(ShoeChoice::Infinite, count.system),
             rules: Ruleset::default(),
             shoe: ShoeChoice::Infinite,
             count_on: false,
@@ -151,9 +155,11 @@ impl App {
     pub(super) fn recompute(&mut self) {
         self.epoch += 1;
         self.epoch_key = (self.shoe, self.rules, self.effective_count());
-        // Count-index reports are count-*independent*, so only a shoe/rules change invalidates them
-        // (a count tweak keeps them). Bumping `index_epoch` drops any in-flight worker for the old basis.
-        let basis = (self.shoe, self.rules);
+        // Count-index reports are independent of the count *value*, but they DO depend on the counting
+        // *system* (KO vs Hi-Lo give different indices), so the basis is `(shoe, rules, system)`: a count
+        // value tweak keeps them, a system switch refills them. Bumping `index_epoch` drops any in-flight
+        // worker for the old basis.
+        let basis = (self.shoe, self.rules, self.count.system.kind());
         if self.index_basis != Some(basis) {
             self.index_basis = Some(basis);
             self.index_epoch += 1;
@@ -208,7 +214,10 @@ impl App {
     /// the index is shown on the base chart either way.
     pub(super) fn index_key(&self, up: Card) -> Option<IndexKey> {
         match self.shoe {
-            ShoeChoice::Decks(_) => Some((up, self.shoe, self.rules)),
+            // The index thresholds are a property of the counting system (its card→value map), so the
+            // system tags the key — a HiLo index can never be served for a KO basis. Count-*independent*
+            // still (the player's count value isn't in the key), so it survives a count tweak.
+            ShoeChoice::Decks(_) => Some((up, self.shoe, self.rules, self.count.system.kind())),
             ShoeChoice::Infinite => None,
         }
     }
@@ -229,7 +238,7 @@ impl App {
                 break;
             }
             let up = UP_CARDS[col];
-            let key = (up, self.shoe, self.rules);
+            let key = (up, self.shoe, self.rules, self.count.system.kind());
             let done = self.index_cache.get(&key).is_some_and(|r| r.complete);
             if done || self.index_pending.contains(&key) {
                 continue;
@@ -268,7 +277,10 @@ impl App {
     /// it tracks the common running-count range instead of a fixed window around zero. (Flips out in the
     /// occurrence tails are suppressed here but still shown in the popup.)
     pub(super) fn index_dependent(&self, cat: HandCategory, up: Card) -> bool {
-        let Some(report) = self.index_key(up).and_then(|key| self.index_cache.get(&key)) else {
+        let Some(report) = self
+            .index_key(up)
+            .and_then(|key| self.index_cache.get(&key))
+        else {
             return false;
         };
         report
@@ -277,11 +289,12 @@ impl App {
             .is_some_and(|ci| ci.count_dependent_in_band(report.mark_lo, report.mark_hi))
     }
 
-    /// Switch the active top-level view. Entering the training tab re-points its live shoe at the
-    /// currently selected deck count if it changed under it (e.g. via the rules modal).
+    /// Switch the active top-level view. Entering the training tab re-points its live shoe and counting
+    /// system at the current selection if either changed under it (e.g. the rules modal switched decks,
+    /// or the count modal switched KO↔Hi-Lo).
     pub(super) fn set_tab(&mut self, tab: Tab) {
         if tab == Tab::Training {
-            self.training.sync_shoe(self.shoe);
+            self.training.sync(self.shoe, self.count.system);
         }
         self.tab = tab;
     }
@@ -311,6 +324,19 @@ impl App {
         for col in &self.columns {
             let col = col.as_ref()?;
             edge += col.p_up * col.edge.value();
+        }
+        Some(edge)
+    }
+
+    /// The overall player edge under **basic-strategy** play (each hand played by its chart cell's
+    /// headline rather than the per-composition optimum), the companion to [`total_edge`](Self::total_edge).
+    /// It is always at most `total_edge`; the gap is the cost of following the table. `None` until every
+    /// column is solved.
+    pub(super) fn total_bs_edge(&self) -> Option<f64> {
+        let mut edge = 0.0;
+        for col in &self.columns {
+            let col = col.as_ref()?;
+            edge += col.p_up * col.bs_edge.value();
         }
         Some(edge)
     }

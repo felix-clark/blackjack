@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
 use crate::dealer::{DealerOutcome, dealer_outcome_probs};
-use crate::hand::{HandCategory, HandState, Move, categorize};
+use crate::hand::{HandCategory, HandState, Move, best_move, categorize};
 use crate::rules::Ruleset;
 use crate::shoe::{CardCol, N_RANKS, Shoe};
 use crate::split::split_move_ev;
@@ -618,6 +618,121 @@ pub(crate) fn edge_term(ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>) -
     }
 }
 
+/// The strategy table's recommended move at a *specific node*: the highest-`table`-ranked move that is
+/// actually legal here (`legal` = the node's stored move→EV map, whose keys are exactly its available
+/// moves). This is what makes the fallback faithful to a printed chart rather than to optimal play:
+/// when a start-only move (Surrender/Double) heads the cell but the hand is now multi-card, we drop to
+/// the *table's* next preference among `Hit`/`Stand` — e.g. Hard 17 vs Ace, charted Surrender, falls to
+/// **Stand** (the table's runner-up), never to Hit, even though Hit might edge it on some composition.
+/// Falls back to the node's own argmax only if the table carries no legal move for it (degenerate).
+fn table_move(table_evs: Option<&HashMap<Move, f64>>, legal: &HashMap<Move, f64>) -> Move {
+    if let Some(t) = table_evs {
+        let best = legal
+            .keys()
+            .filter_map(|m| t.get(m).map(|&v| (*m, v)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        if let Some((m, _)) = best {
+            return m;
+        }
+    }
+    best_move(legal)
+}
+
+/// The **basic-strategy value** of every hand in `ev_tree`: the EV of playing the strategy `table` at
+/// *every* decision point, not merely the first. `table` maps each [`HandCategory`] to its consolidated
+/// per-move EVs (the chart cell's `move_evs`); [`table_move`] turns that into the recommendation legal
+/// at each node. The recommendation's value is read straight off the tree for the terminal moves
+/// (`Stand`/`Double`/`Surrender`/`Split` — each already a complete continuation), but a **`Hit` recurses
+/// into this same BS value** of its children rather than the optimal Hit EV `build_evs` stored. That one
+/// branch is the whole difference from [`edge_term`]'s optimal play: under the table you keep consulting
+/// the table after every hit, so a multi-card total is played by *its* row, not re-optimised.
+///
+/// Hands are visited in descending total so every `Hit` child (a strictly larger total) has its BS value
+/// ready — the same dependency order as [`build_evs`]'s `21→2` sweep. `shoe` is the full shoe with the
+/// up-card still present (this removes it), matching `build_evs`/[`reach_weights`].
+///
+/// *Split caveat (documented):* a charted `Split` reads the split solver's stored EV, whose arms are
+/// played optimally, not table-recursively — the one place the "table at every node" rule is relaxed,
+/// inherited from the independent-arms split model the chart already uses. Measured (2026-06, all
+/// up-cards × charted-split pairs, occurrence-weighted): playing the arms by basic strategy instead
+/// would lower the overall edge by only ~+0.0002% on a 6-deck shoe (≈8% of the ~0.002% optimal-vs-BS
+/// gap there, invisible at the footer's 3 decimals), rising to ~+0.0016% single-deck — a pure
+/// finite-shoe composition effect that vanishes as decks grow (at 6 decks all but 2,2 and 8,8 are
+/// exactly zero). Below the independent-arms approximation already in every split EV, so not worth a
+/// second strategy-driven split pass.
+pub(crate) fn bs_value_tree<S: Shoe + Clone + Eq + Hash>(
+    mut shoe: S,
+    up_card: Card,
+    rules: &Ruleset,
+    ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
+    table: &HashMap<HandCategory, HashMap<Move, f64>>,
+) -> HashMap<CardCol, f64> {
+    shoe.draw(&up_card);
+    let shoe = shoe;
+    let basis = Basis::new(up_card, rules);
+
+    // Children (larger total) before parents: a Hit grows the total by ≥1, so descending-total order
+    // guarantees every Hit child's BS value is computed before the hand that hits into it.
+    let mut hands: Vec<&CardCol> = ev_tree.keys().collect();
+    hands.sort_by_key(|h| std::cmp::Reverse(h.hard_count()));
+
+    // Fold over descending-total order, accumulating into the BS-value map: each hand's Hit value
+    // reads its children's already-folded values, so the accumulator must be threaded, not collected.
+    hands.into_iter().fold(
+        HashMap::with_capacity(ev_tree.len()),
+        |mut bs, hand| {
+            let move_ev = &ev_tree[hand].1;
+            let mv = table_move(table.get(&categorize(hand)), move_ev);
+            let value = if mv == Move::Hit {
+                // Replay the hit on the table's continuation: the child's BS value, not its optimal one.
+                let shoe_here = shoe.remove_hand(hand);
+                basis
+                    .draw_probs(&shoe_here)
+                    .iter()
+                    .map(|&(c, p_c)| {
+                        let mut child = *hand;
+                        child.insert(c);
+                        p_c * bs.get(&child).copied().unwrap_or_else(|| {
+                            assert!(HandState::from(&child) == HandState::Bust);
+                            -1.0
+                        })
+                    })
+                    .sum()
+            } else {
+                // Terminal moves carry a complete continuation already — read the stored EV.
+                move_ev[&mv]
+            };
+            bs.insert(*hand, value);
+            bs
+        },
+    )
+}
+
+/// Like [`edge_term`], but reading each starting hand's value from a [`bs_value_tree`] — i.e. the
+/// two-card-root edge under table play at *every* decision rather than the per-composition optimum.
+/// Same weighting and dealer-natural-deficit bookkeeping as [`edge_term`] (so the two are directly
+/// comparable); the gap between them is the EV cost of following the chart. `bs_values` must come from
+/// [`bs_value_tree`] on this same `ev_tree`.
+pub(crate) fn bs_edge_term(
+    ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
+    bs_values: &HashMap<CardCol, f64>,
+) -> EdgeTerm {
+    let mut weighted_ev = 0.0;
+    let mut weight = 0.0;
+    for (hand, (w, _)) in ev_tree.iter() {
+        if hand.len() != 2 {
+            continue;
+        }
+        let ev = bs_values.get(hand).copied().unwrap_or(0.0);
+        weight += *w;
+        weighted_ev += *w * ev;
+    }
+    EdgeTerm {
+        weighted_ev,
+        weight,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Regression guard pinning the verified general (non-split) solver output. Split-specific tests
@@ -694,6 +809,53 @@ mod tests {
         assert_eq!(vs_ace[&HandCategory::Hard(15)], Move::Surrender, "H15 vs A");
         assert_eq!(vs_ace[&HandCategory::Hard(16)], Move::Surrender, "H16 vs A");
         assert_eq!(vs_ace[&HandCategory::Hard(17)], Move::Surrender, "H17 vs A");
+    }
+
+    /// The basic-strategy value pass plays the *table* at every node, not just the first decision.
+    /// Pins the user's canonical fallback: Hard 17 vs Ace charts as Surrender (a start-only move), so a
+    /// *multi-card* 17 — which can't surrender — must fall to the table's runner-up **Stand**, never to
+    /// Hit and never re-optimised. Also pins the headline invariant (a two-card root takes its charted
+    /// move's EV) and that the resulting two-card-root edge never beats optimal play.
+    #[test]
+    fn bs_value_follows_table_at_every_node() {
+        use crate::reach::{reach_weights, summarize_cells};
+        let up = Card::Ace;
+        let shoe = CardCol::from_decks(2);
+        let rules = ruleset_with(0);
+        let tree = build_evs(shoe, up, &rules);
+        let reach = reach_weights(shoe, up, &rules, &tree, true);
+        let summary = summarize_cells(&tree, &reach);
+        let table: HashMap<HandCategory, HashMap<Move, f64>> = summary
+            .iter()
+            .map(|(c, cell)| (*c, cell.move_evs.clone()))
+            .collect();
+        let bs = bs_value_tree(shoe, up, &rules, &tree, &table);
+
+        // Setup tell: the two-card H17-vs-A cell is charted Surrender (the H17 surrender corner).
+        assert_eq!(summary[&HandCategory::Hard(17)].headline, Move::Surrender);
+
+        // A three-card hard 17 can't surrender. The table's best *legal* move here is Stand (its
+        // runner-up), so its BS value is the stored Stand EV — not Hit, not a re-optimised argmax.
+        let multi17 = CardCol::from_hand(&[Card::Ten, Card::Pip(4), Card::Pip(3)]);
+        assert_eq!(categorize(&multi17), HandCategory::Hard(17));
+        let stand = tree[&multi17].1[&Move::Stand];
+        assert_close(bs[&multi17], stand, "multi-card H17 falls back to table Stand");
+
+        // The two-card root takes its charted (Surrender) value, and the edge never beats optimal.
+        let nat_free = |hand: &CardCol| hand.len() == 2 && !hand.is_nat21();
+        for (hand, (_, mv)) in tree.iter().filter(|(h, _)| nat_free(h)) {
+            let charted = table_move(table.get(&categorize(hand)), mv);
+            if charted != Move::Hit {
+                assert_close(bs[hand], mv[&charted], "two-card root = charted move EV");
+            }
+            let opt = mv.values().copied().fold(f64::NEG_INFINITY, f64::max);
+            assert!(bs[hand] <= opt + 1e-12, "BS value {} > optimal {opt}", bs[hand]);
+        }
+
+        assert!(
+            bs_edge_term(&tree, &bs).value() <= edge_term(&tree).value() + 1e-12,
+            "BS edge must not beat optimal edge"
+        );
     }
 
     /// The overall player edge (negative = house advantage) under optimal play, full default rules

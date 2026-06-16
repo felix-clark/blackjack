@@ -18,7 +18,7 @@ use crate::{
     shoe::{CardCol, N_RANKS, Shoe},
 };
 
-/// Shared memo from a pool's **count-class composition** (and its count condition) to the per-rank
+/// Shared memo from a pool's **count-class composition** (and its [`CountFrame`]) to the per-rank
 /// *value-scale* broadcast — the class-level half of the count-conditioned draw distribution (see
 /// [`CountW::value_scales`]). The expensive deconvolution + `(s,n)`-sum depends on the pool *only*
 /// through its class composition `(M_class)`, never the within-class rank breakdown; the breakdown
@@ -26,18 +26,105 @@ use crate::{
 /// distribution. So keying on class composition collapses every pool that is class-identical but
 /// rank-distinct (e.g. a dealer line that drew a 5 vs. a 6 — both KO +1) onto one deconvolution, on
 /// top of the exact-pool dedup it replaces. Every [`CountShoe`] cloned within one solve shares the
-/// same `Arc`. The condition is itself a function of the class composition given a fixed starting count
-/// (every removed card shifts the threshold by its value), but it is kept in the key for robustness
-/// across bands/solves.
+/// same `Arc`. The frame is kept in the key because a single shared cache can serve several frames — a
+/// count *band* (one deconvolution, many frames), and in particular a true-count band whose members
+/// differ only by their visible offset (same condition, distinct `vis_*`), which the condition alone
+/// would not distinguish.
 ///
 /// The class composition is encoded as `[u16; N_RANKS]` with each rank holding its *whole class's*
 /// pool count (`Σ_{r': v_{r'}=v_r} M_{r'}`, see [`CountW::class_counts`]) — a value identical across
 /// class-equivalent pools and distinct otherwise, so it is a faithful class-composition key.
-type DistCache = Arc<Mutex<HashMap<([u16; N_RANKS], CountCondition), [f64; N_RANKS]>>>;
+type DistCache = Arc<Mutex<HashMap<([u16; N_RANKS], CountFrame), [f64; N_RANKS]>>>;
+
+/// Which *family* a counting system belongs to — the one robust distinguisher the count-conditioning
+/// engine branches on, rather than sniffing the card→value map. A [`Running`](CountKind::Running)
+/// system (KO) is actioned on the raw integer running count; a [`TrueCount`](CountKind::TrueCount)
+/// system (Hi-Lo) is actioned on the *true count* = running count ÷ decks remaining, so its constraint
+/// is a joint inequality in `(running count, remaining-pool size)` rather than a threshold on the
+/// running count alone (see [`CountCondition`]). Carried in the count-dependent cache keys so two
+/// systems can never alias the same persisted solve.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub(crate) enum CountKind {
+    /// Actioned on the raw running count (KO). The condition is a threshold on the internal count `s`.
+    Running,
+    /// Actioned on the true count = running ÷ decks remaining (Hi-Lo). Necessarily *balanced*
+    /// (`full_shoe_count == 0`); the condition is a joint inequality in `(s, n)`.
+    TrueCount,
+}
+
+/// A concrete counting **system** selected at runtime, as opposed to its [`CountKind`] *family*. The
+/// generic [`CountSystem`] trait is the compile-time home of each system's behavior — its card→value
+/// [`map`](CountSystem::map), its IRC [`starting_count`](CountSystem::starting_count), and its
+/// [`KIND`](CountSystem::KIND); this enum is the runtime seam for the call sites (the trainer) that pick
+/// a system at runtime instead of monomorphizing on it. Every method here delegates to the underlying
+/// [`CountSystem`] impl, so a system *determines* its family ([`kind`](Self::kind)) and never the
+/// reverse — the inversion the family→system [`CountKind::representative_system`] default deliberately
+/// isolates.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub(crate) enum CountSystemId {
+    /// The unbalanced knock-out running count ([`Ko`]).
+    Ko,
+    /// The balanced Hi-Lo true count ([`HiLo`]).
+    HiLo,
+}
+
+/// Run `$body` monomorphized over the concrete [`CountSystem`] a runtime [`CountSystemId`] names. A
+/// runtime enum value cannot *be* a compile-time type, so a generic call (`solve_counted::<S>(..)`)
+/// has to recover the type through a variant→type `match` somewhere — this macro is the single place
+/// that `match` lives. `dispatch_system!(id, S => expr)` binds the type `S` to [`Ko`]/[`HiLo`] in turn
+/// and evaluates `expr` in each arm. Adding a counting system means adding one arm here and nowhere
+/// else; the call sites stay system-agnostic.
+macro_rules! dispatch_system {
+    ($id:expr, $S:ident => $body:expr) => {
+        match $id {
+            $crate::count::CountSystemId::Ko => {
+                type $S = $crate::count::Ko;
+                $body
+            }
+            $crate::count::CountSystemId::HiLo => {
+                type $S = $crate::count::HiLo;
+                $body
+            }
+        }
+    };
+}
+pub(crate) use dispatch_system;
+
+impl CountSystemId {
+    /// The family this system is actioned under ([`CountSystem::KIND`]) — running vs. true count. Read
+    /// straight off the system, the direction the type system already enforces at compile time.
+    pub(crate) fn kind(self) -> CountKind {
+        dispatch_system!(self, S => S::KIND)
+    }
+
+    /// The count value of `card` under this system ([`CountSystem::map`]).
+    pub(crate) fn map(self, card: &Card) -> i16 {
+        dispatch_system!(self, S => S::map(card))
+    }
+
+    /// The initial running count (IRC) a fresh `n`-deck shoe starts at under this system
+    /// ([`CountSystem::starting_count`]).
+    pub(crate) fn starting_count(self, n_decks: u8) -> i16 {
+        dispatch_system!(self, S => S::starting_count(n_decks))
+    }
+
+    /// Short display name: `KO` or `Hi-Lo`.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            CountSystemId::Ko => "KO",
+            CountSystemId::HiLo => "Hi-Lo",
+        }
+    }
+}
 
 // NOTE: If this ends up not needing to be anything more than a mapping, we can ditch the trait
 // formalism and just pass in an arbitrary function Card -> i8 to CountState.
 pub(crate) trait CountSystem {
+    /// Which count family this system belongs to. [`Running`](CountKind::Running) systems (KO) are
+    /// actioned on the raw running count; [`TrueCount`](CountKind::TrueCount) systems (Hi-Lo) on the
+    /// true count. The engine branches on this rather than inspecting [`map`](CountSystem::map).
+    const KIND: CountKind;
+
     /// The initial running count the *player* starts from (the system's IRC). Zero for balanced
     /// counts, so the default is implemented. Unbalanced systems (e.g. KO) offset by deck count.
     fn starting_count(_n_decks: u8) -> i16 {
@@ -88,37 +175,90 @@ pub(crate) trait CountSystem {
     }
 }
 
-/// A condition the player imposes on the **internal** running count of the unseen pool (the count of
-/// the cards still in the shoe). The solver conditions every draw distribution on this. As cards are
-/// drawn the target shifts by the drawn card's value — see [`CountCondition::shifted`] — so the same
-/// condition threaded down the tree stays the player's "all visible cards counted" constraint.
+/// Cards per deck — the true-count normalizer (`TC = cards_per_deck · external / n`).
+const CARDS_PER_DECK: i16 = 52;
+
+/// The fixed-point denominator a true-count `cutoff` is expressed in: `cutoff` is in units of
+/// `1/TC_HALF_UNITS` true counts, so the resolution is `1/TC_HALF_UNITS` (a half with the default `2`).
+/// Bumping it finer keeps everything integer; the index sweep steps in whole true counts
+/// (`TC_HALF_UNITS` of these units). The cross-multiplied predicate factor is `CARDS_PER_DECK ·
+/// TC_HALF_UNITS` (see [`CountFrame::accepts`]).
+pub(crate) const TC_HALF_UNITS: i16 = 2;
+
+/// A **pure constraint** on a `(running count, pool size)` pair — the player's count condition with no
+/// bookkeeping of its own. The evaluation pair, and the decision-point anchoring of the entered count,
+/// are the [`CountFrame`]'s job; a `CountCondition` is just the literal inequality, kept `Copy`/`Eq`/
+/// `Hash` for use as a cache key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum CountCondition {
-    /// The internal running count equals exactly this value.
+    /// The internal running count equals exactly this value. (Running-count systems only.)
     Eq(i16),
-    /// The internal running count is at least this value.
+    /// The internal running count is at least this value. (Running-count systems only.)
     Ge(i16),
-    /// The internal running count is at most this value.
+    /// The internal running count is at most this value. (Running-count systems only.)
     Le(i16),
+    /// **True-count** constraint `TC ≥ cutoff/2`. True-count systems are necessarily **balanced**
+    /// (`full_shoe_count == 0`, hence pivot 0), so the true count of a pool with internal running count
+    /// `s` and size `n` is `−52·s/n`, and `TC ≥ cutoff/2` cross-multiplies (division-free) to
+    /// `−104·s ≥ cutoff·n`. `cutoff` is in **half-TC units** (denominator 2) so a fractional threshold
+    /// like `TC ≥ 1.5` is `cutoff = 3`, keeping the predicate integer (a literal `f64` could not be a
+    /// cache key).
+    TrueGe { cutoff: i16 },
+    /// **True-count** constraint `TC ≤ cutoff/2`; the `≤` mirror of [`TrueGe`](CountCondition::TrueGe).
+    TrueLe { cutoff: i16 },
 }
 
-impl CountCondition {
-    /// Whether an internal running count `s` satisfies the condition.
-    pub(crate) fn accepts(&self, s: i16) -> bool {
-        match self {
-            CountCondition::Eq(c) => s == *c,
-            CountCondition::Ge(c) => s >= *c,
-            CountCondition::Le(c) => s <= *c,
+/// A [`CountCondition`] together with the **decision-point anchor** it is evaluated at: the round's
+/// visible cards (`vis_sum` = their count value, `vis_cards` = how many) that the player's entered count
+/// already includes, under the Wizard-of-Odds convention. This is the per-shoe frame the solver carries
+/// — the condition stays a pure inequality; the visible-card adjustment lives here and is applied to the
+/// `(s, n)` pair *before* the condition is tested, never folded into the condition itself.
+///
+/// For a running count the visible shift is already baked into the entered value (`external − map(U) −
+/// k`), so `vis = (0, 0)`; only a true count, whose `TC` depends on the pool size, needs to drop the
+/// reconstructed root pool to the decision point before testing. Built by [`cond_for_frame`] (per-frame,
+/// WoO) or [`CountFrame::pre_round`] (`vis = (0, 0)`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct CountFrame {
+    cond: CountCondition,
+    vis_sum: i16,
+    vis_cards: u16,
+}
+
+impl CountFrame {
+    /// A frame with no visible offset: the constraint is tested at the reconstructed pool directly. This
+    /// is every running-count frame (the shift is in the entered value) and any pre-round true count.
+    fn pre_round(cond: CountCondition) -> Self {
+        Self {
+            cond,
+            vis_sum: 0,
+            vis_cards: 0,
         }
     }
 
-    /// The condition on the *remaining* pool after a card of count value `v` is drawn. Removing a
-    /// `+v` card from a pool of count `s` leaves count `s − v`, so every threshold shifts by `−v`.
-    pub(crate) fn shifted(&self, v: i16) -> CountCondition {
-        match self {
-            CountCondition::Eq(c) => CountCondition::Eq(c - v),
-            CountCondition::Ge(c) => CountCondition::Ge(c - v),
-            CountCondition::Le(c) => CountCondition::Le(c - v),
+    /// Whether the reconstructed **root** pair `(root_s, root_n)` = (internal running count, pool size)
+    /// satisfies this frame. The visible cards are dropped first — the decision-point unseen pool is
+    /// `(root_s − vis_sum, root_n − vis_cards)` — then the pure [`CountCondition`] is tested on it.
+    /// Running-count conditions test the count alone (ignoring the size, so the visible-card *count* is
+    /// immaterial — a running-count frame carries no visible offset anyway). True-count conditions test
+    /// the joint integer inequality (computed in `i32`: the `−104·s` and `cutoff·n` terms can exceed
+    /// `i16` on a big shoe); a non-positive decision-point size admits no mass.
+    fn accepts(&self, root_s: i32, root_n: i32) -> bool {
+        let s = root_s - self.vis_sum as i32;
+        let n = root_n - self.vis_cards as i32;
+        match self.cond {
+            CountCondition::Eq(c) => s == c as i32,
+            CountCondition::Ge(c) => s >= c as i32,
+            CountCondition::Le(c) => s <= c as i32,
+            // −(CARDS_PER_DECK·TC_HALF_UNITS)·s ⋛ cutoff·n is `TC ⋛ cutoff/TC_HALF_UNITS` cross-multiplied.
+            CountCondition::TrueGe { cutoff } => {
+                let f = (CARDS_PER_DECK * TC_HALF_UNITS) as i32;
+                n > 0 && -f * s >= cutoff as i32 * n
+            }
+            CountCondition::TrueLe { cutoff } => {
+                let f = (CARDS_PER_DECK * TC_HALF_UNITS) as i32;
+                n > 0 && -f * s <= cutoff as i32 * n
+            }
         }
     }
 }
@@ -186,6 +326,8 @@ pub(crate) enum CountCmp {
 pub(crate) struct Ko {}
 
 impl CountSystem for Ko {
+    const KIND: CountKind = CountKind::Running;
+
     /// The initial running count for this system
     fn starting_count(n_decks: u8) -> i16 {
         4 - 4 * n_decks as i16
@@ -196,6 +338,26 @@ impl CountSystem for Ko {
             Card::Ace | Card::Ten => -1,
             Card::Pip(r) => {
                 if r <= &7 {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+}
+
+/// The balanced Hi-Lo system
+pub(crate) struct HiLo {}
+
+impl CountSystem for HiLo {
+    const KIND: CountKind = CountKind::TrueCount;
+
+    fn map(card: &Card) -> i16 {
+        match card {
+            Card::Ace | Card::Ten => -1,
+            Card::Pip(r) => {
+                if r <= &6 {
                     1
                 } else {
                     0
@@ -230,10 +392,18 @@ pub(crate) struct CountShoe {
     /// construction). Cloning is cheap (`Arc`-shared `w`); the table is materialized to the current pool
     /// only when [`sync_table`](Self::sync_table) runs on a cache miss.
     dp: CountW,
-    cond: CountCondition,
+    frame: CountFrame,
     pen: Penetration,
+    /// The **root** pool's size and internal running count — the full shoe at construction, before any
+    /// draw. The [`frame`](Self::frame) is anchored relative to this root, so reconstructing it from the
+    /// (depleted) current [`pool`](Self::pool) needs the drawn totals `(root_internal − pool_internal,
+    /// root_size − pool_size)`, which [`recompute`](Self::recompute) passes to
+    /// [`CountW::value_scales`]. Fixed at construction; a solve never mixes shoes built from different
+    /// roots, so these are excluded from `Eq`/`Hash` (solve-invariant, like the deck size itself).
+    root_size: u16,
+    root_internal: i16,
     /// The count-conditioned next-card distribution, cached so `draw_prob`/`all_draw_probs` are O(1);
-    /// recomputed once per `draw` (which is when the pool/condition change).
+    /// recomputed once per `draw` (which is when the pool changes).
     dist: [f64; N_RANKS],
     /// When set (via [`CountShoe::mean_field_view`], used by the split solver) the shoe behaves as a
     /// plain **finite** deck whose composition `dp.deck` is the *count-tilted expected remaining pool*:
@@ -246,16 +416,16 @@ pub(crate) struct CountShoe {
     /// resolution — total `n · mf_scale` units — so the sub-card count tilt survives rounding; drawing
     /// a card removes `mf_scale` units, keeping depletion exactly `1/n`. See [`expected_composition`].
     mf_scale: u16,
-    /// When this shoe is one member of a **count band** (a sweep of external running counts solved
-    /// together for the chart's count-index thresholds), the conditions of *all* band members at the
-    /// current pool, with `cond == band_conds[band_idx]`. Empty for an ordinary single-count solve.
-    /// On a draw-distribution cache miss the whole band is filled from one deconvolution (see
-    /// [`CountW::draw_dist_band`]), so sibling members sharing this shoe's `dist_cache` pay the
-    /// expensive work once. Shifts in lockstep with `cond` as cards are drawn; excluded from
-    /// `Eq`/`Hash` (it is a cache-warming hint, not part of the value the shoe represents — `cond`
+    /// When this shoe is one member of a **count band** (a sweep solved together for the chart's
+    /// count-index thresholds), the frames of *all* band members at the current pool, with
+    /// `frame == band_frames[band_idx]`. Empty for an ordinary single-count solve. On a draw-distribution
+    /// cache miss the whole band is filled from one deconvolution (see [`CountW::draw_dist_band`]), so
+    /// sibling members sharing this shoe's `dist_cache` pay the expensive work once. Like `frame`, each
+    /// entry is fixed (the draw bookkeeping lives in the root reconstruction, not the frame); excluded
+    /// from `Eq`/`Hash` (it is a cache-warming hint, not part of the value the shoe represents — `frame`
     /// already pins that).
-    band_conds: Vec<CountCondition>,
-    /// This member's index into `band_conds` (0 when not banded).
+    band_frames: Vec<CountFrame>,
+    /// This member's index into `band_frames` (0 when not banded).
     band_idx: usize,
     /// Shared `(pool, condition) → draw distribution` memo (see [`DistCache`]). Excluded from
     /// `Eq`/`Hash`/`PartialEq` — it is a pure cache, identical-keyed shoes share it, and it never
@@ -274,7 +444,7 @@ impl PartialEq for CountShoe {
         };
         a == b
             && self.dp.value_of_rank == other.dp.value_of_rank
-            && self.cond == other.cond
+            && self.frame == other.frame
             && self.pen == other.pen
             && self.mean_field == other.mean_field
             && self.mf_scale == other.mf_scale
@@ -290,7 +460,7 @@ impl std::hash::Hash for CountShoe {
         };
         deck.hash(h);
         self.dp.value_of_rank.hash(h);
-        self.cond.hash(h);
+        self.frame.hash(h);
         self.pen.hash(h);
         self.mean_field.hash(h);
         self.mf_scale.hash(h);
@@ -314,20 +484,138 @@ pub(crate) fn cond_from_external<S: CountSystem>(
     }
 }
 
+/// The unseen pool's [`CountCondition`] for the player's entered count `value` compared with `cmp`,
+/// dispatched on the system's [`CountKind`]. This is the system-agnostic entry: a
+/// [`Running`](CountKind::Running) system reads `value` as the external **running** count (delegating
+/// to [`cond_from_external`]); a [`TrueCount`](CountKind::TrueCount) system reads it as the external
+/// **true** count and builds the joint `(s, n)` inequality directly (no inversion — the [`TrueGe`]/
+/// [`TrueLe`] predicates are already phrased in the player's external TC; true-count systems are
+/// balanced, so pivot 0 is baked in).
+///
+/// True counts are **inequality-only** ([`CountCmp::Eq`] is rejected): an exact true count is a
+/// measure-zero event over the `(s, n)` lattice, so only `≥`/`≤` are meaningful. `value` is in
+/// **half-TC units** (so `TC ≥ 1.5` is `value = 3`), keeping the whole predicate division-free and the
+/// shoe `Eq`/`Hash`. This is the **pre-round** condition; the per-frame Wizard-of-Odds [`CountFrame`]
+/// that anchors the TC at the decision point is [`cond_for_frame`].
+///
+/// [`TrueGe`]: CountCondition::TrueGe
+/// [`TrueLe`]: CountCondition::TrueLe
+///
+/// Test-only: production builds frames through [`cond_for_frame`] (which adds the decision-point
+/// offset); this pre-round-only entry survives as a cross-check convenience.
+#[cfg(test)]
+pub(crate) fn cond_from_count<S: CountSystem>(
+    n_decks: u8,
+    value: i16,
+    cmp: CountCmp,
+) -> CountCondition {
+    match S::KIND {
+        CountKind::Running => cond_from_external::<S>(n_decks, value, cmp),
+        CountKind::TrueCount => {
+            assert_balanced::<S>(n_decks);
+            true_cond(cmp, value)
+        }
+    }
+}
+
+/// The per-frame [`CountFrame`] under the **Wizard-of-Odds** convention that the entered count includes
+/// this round's visible cards (the up-card `up` plus a player hand of count value `k`). It is what the
+/// 5-frame chart/index merge ([`merge_count_frames`](crate::tui::merge_count_frames)) builds, reading
+/// each hand from the frame matching its own count value.
+///
+/// - [`Running`](CountKind::Running): the player's external running count `value` minus the round's
+///   visible count `map(up) + k`, then the existing internal inversion ([`cond_from_external`]). This is
+///   exactly the prior KO behavior (`external − map(U) − k`), with no visible offset on the frame.
+/// - [`TrueCount`](CountKind::TrueCount): a pure [`TrueGe`](CountCondition::TrueGe)/
+///   [`TrueLe`](CountCondition::TrueLe) on the half-unit `value`, paired with `vis_sum = map(up) + k`
+///   and the caller's `vis_cards`, so [`CountFrame::accepts`] drops the root pool to the decision point
+///   before testing `TC ⋛ value/2`.
+///
+/// `vis_cards` is supplied by the caller (3 for an up-card + 2-card hand; 1 for the insurance decision,
+/// which sees only the up-card).
+pub(crate) fn cond_for_frame<S: CountSystem>(
+    n_decks: u8,
+    value: i16,
+    cmp: CountCmp,
+    up: Card,
+    k: i16,
+    vis_cards: u16,
+) -> CountFrame {
+    let vis_sum = S::map(&up) + k;
+    match S::KIND {
+        CountKind::Running => {
+            CountFrame::pre_round(cond_from_external::<S>(n_decks, value - vis_sum, cmp))
+        }
+        CountKind::TrueCount => {
+            assert_balanced::<S>(n_decks);
+            CountFrame {
+                cond: true_cond(cmp, value),
+                vis_sum,
+                vis_cards,
+            }
+        }
+    }
+}
+
+/// Build a true-count [`CountCondition`] from a half-unit `cutoff`, rejecting [`CountCmp::Eq`] (true
+/// counts are inequality-only). Shared by [`cond_from_count`] and [`cond_for_frame`].
+fn true_cond(cmp: CountCmp, cutoff: i16) -> CountCondition {
+    match cmp {
+        CountCmp::Ge => CountCondition::TrueGe { cutoff },
+        CountCmp::Le => CountCondition::TrueLe { cutoff },
+        CountCmp::Eq => panic!(
+            "true-count systems are inequality-only; CountCmp::Eq is not supported (use Ge/Le)"
+        ),
+    }
+}
+
+/// Assert (debug-only) that `S` is a balanced system. The `True*` predicate hardcodes pivot 0 — the
+/// player's true count is `−52·s/n` only when the full shoe count is 0, which every standard true-count
+/// system (Hi-Lo, etc.) satisfies.
+fn assert_balanced<S: CountSystem>(n_decks: u8) {
+    debug_assert_eq!(
+        S::pivot(n_decks),
+        0,
+        "TrueCount systems must be balanced (pivot 0); the True* predicate assumes it"
+    );
+}
+
+/// The internal running count of `deck` under `value_of_rank` — `Σ_r v_r · M_r`, the count value of all
+/// cards in the pool. Used to derive the cards-drawn totals for the root reconstruction (see
+/// [`CountShoe::recompute`]).
+fn internal_count(deck: &CardCol, value_of_rank: &[i16; N_RANKS]) -> i16 {
+    (0..N_RANKS)
+        .map(|r| value_of_rank[r] * deck.get_count_i(r) as i16)
+        .sum()
+}
+
 impl CountShoe {
-    /// A shoe of `n_decks` under counting system `S`, conditioned on `cond` over the *internal*
-    /// running count, with penetration prior `pen`. The caller converts a player's external running
-    /// count to the internal condition via [`CountSystem::external_to_internal`].
+    /// A shoe of `n_decks` under counting system `S`, conditioned on the pure `cond` over the *internal*
+    /// running count (no visible offset — the pre-round frame), with penetration prior `pen`. The caller
+    /// converts a player's external running count to the internal condition via
+    /// [`CountSystem::external_to_internal`]. Production builds shoes through [`framed`](Self::framed)
+    /// (a `CountFrame`) or [`band_external`](Self::band_external); this pure-condition convenience is
+    /// used only by the cross-check tests.
+    #[cfg(test)]
     pub(crate) fn new<S: CountSystem>(n_decks: u8, cond: CountCondition, pen: Penetration) -> Self {
+        Self::framed::<S>(n_decks, CountFrame::pre_round(cond), pen)
+    }
+
+    /// A shoe conditioned on a [`CountFrame`] — a constraint plus its decision-point visible offset (the
+    /// Wizard-of-Odds per-frame entry, built by [`cond_for_frame`]). [`new`](Self::new) is this with a
+    /// pre-round (offset-free) frame.
+    pub(crate) fn framed<S: CountSystem>(n_decks: u8, frame: CountFrame, pen: Penetration) -> Self {
         let value_of_rank = std::array::from_fn(|r| S::map(&Card::from_rank_index(r)));
         let dp = CountW::build(value_of_rank, CardCol::from_decks(n_decks));
-        let dist = dp.draw_dist(cond, pen);
-        Self::from_parts(dp, cond, pen, dist)
+        let dist = dp.draw_dist(frame, pen);
+        Self::from_parts(dp, frame, pen, dist)
     }
 
     /// Build from the player's *external* running count and a comparison, converting to the deck's
     /// internal count condition. The conversion inverts inequalities: a player count `≥ C` means the
     /// unseen pool's internal count is `≤ pivot − C` (more cards seen pushes the deck the other way).
+    /// Test-only: production conditions through [`cond_for_frame`] + [`framed`](Self::framed).
+    #[cfg(test)]
     pub(crate) fn from_external<S: CountSystem>(
         n_decks: u8,
         external: i16,
@@ -341,39 +629,55 @@ impl CountShoe {
         )
     }
 
-    /// A **band** of shoes, one per external running count in `externals`, that share a single
-    /// [`CountW`] build *and* one draw-distribution cache. The shared cache plus each member carrying
-    /// the whole `band_conds` list means the expensive per-pool deconvolution is computed once for the
-    /// entire band (every member's distribution extracted from one deconvolution — see
-    /// [`CountW::draw_dist_band`]) rather than once per member. Solve the first member to completion to
-    /// warm the cache; the remaining members are then nearly free (pure cache hits). Used by the TUI to
-    /// sweep the count axis for a column's count-index thresholds.
-    pub(crate) fn band<S: CountSystem>(
+    /// Build from the player's entered count `value` and comparison, dispatched on the system's
+    /// [`CountKind`] via [`cond_from_count`]: a running-count system reads `value` as the external
+    /// running count (identical to [`from_external`](Self::from_external)), a true-count system reads it
+    /// as the external true count and conditions on the joint `(s, n)` inequality. Test-only: production
+    /// routes the selector through [`cond_for_frame`] + [`framed`](Self::framed) (per-frame, WoO).
+    #[cfg(test)]
+    pub(crate) fn from_count<S: CountSystem>(
         n_decks: u8,
-        externals: &[i16],
+        value: i16,
         cmp: CountCmp,
         pen: Penetration,
+    ) -> Self {
+        Self::new::<S>(n_decks, cond_from_count::<S>(n_decks, value, cmp), pen)
+    }
+
+    /// A **band** of shoes, one per [`CountFrame`] in `frames`, that share a single [`CountW`] build
+    /// *and* one draw-distribution cache. The shared cache plus each member carrying the whole
+    /// `band_frames` list means the expensive per-pool deconvolution is computed once for the entire band
+    /// (every member's distribution extracted from one deconvolution — see [`CountW::draw_dist_band`])
+    /// rather than once per member. Solve the first member to completion to warm the cache; the remaining
+    /// members are then nearly free (pure cache hits). Used by the TUI to sweep the count axis for a
+    /// column's count-index thresholds — for a running count the frames are distinct conditions
+    /// (different counts); for a true count they may share a condition and differ only by visible offset.
+    pub(crate) fn band<S: CountSystem>(
+        n_decks: u8,
+        frames: &[CountFrame],
+        pen: Penetration,
     ) -> Vec<Self> {
-        let conds: Vec<CountCondition> = externals
-            .iter()
-            .map(|&e| cond_from_external::<S>(n_decks, e, cmp))
-            .collect();
         let value_of_rank = std::array::from_fn(|r| S::map(&Card::from_rank_index(r)));
         let dp = CountW::build(value_of_rank, CardCol::from_decks(n_decks));
+        // `dp.deck` is the undepleted root, shared by every band member.
+        let root_size = dp.deck.len() as u16;
+        let root_internal = internal_count(&dp.deck, &dp.value_of_rank);
         let cache: DistCache = Arc::new(Mutex::new(HashMap::new()));
-        conds
+        frames
             .iter()
             .enumerate()
-            .map(|(band_idx, &cond)| {
+            .map(|(band_idx, &frame)| {
                 let mut shoe = Self {
                     pool: dp.deck,
                     dp: dp.clone(),
-                    cond,
+                    frame,
                     pen,
+                    root_size,
+                    root_internal,
                     dist: [0.0; N_RANKS],
                     mean_field: false,
                     mf_scale: 0,
-                    band_conds: conds.clone(),
+                    band_frames: frames.to_vec(),
                     band_idx,
                     dist_cache: cache.clone(),
                 };
@@ -381,6 +685,22 @@ impl CountShoe {
                 shoe
             })
             .collect()
+    }
+
+    /// A [`band`](Self::band) over external **running** counts — the convenience the KO count-index
+    /// sweep uses: one pre-round frame per count in `externals`, each the unseen-pool condition for that
+    /// external count compared with `cmp` (see [`cond_from_external`]).
+    pub(crate) fn band_external<S: CountSystem>(
+        n_decks: u8,
+        externals: &[i16],
+        cmp: CountCmp,
+        pen: Penetration,
+    ) -> Vec<Self> {
+        let frames: Vec<CountFrame> = externals
+            .iter()
+            .map(|&e| CountFrame::pre_round(cond_from_external::<S>(n_decks, e, cmp)))
+            .collect();
+        Self::band::<S>(n_decks, &frames, pen)
     }
 
     /// The occurrence distribution over **external** running counts for a full `n_decks` shoe under
@@ -425,21 +745,62 @@ impl CountShoe {
         out
     }
 
-    fn from_parts(
-        dp: CountW,
-        cond: CountCondition,
+    /// The occurrence distribution over **integer true counts** for a full `n_decks` shoe under
+    /// penetration prior `pen`: each `(t, P(t))` is how often a deciding player holds a true count whose
+    /// floor is `t`, summing to 1 and ascending in `t`. Floor-bucketed so the suffix sum `Σ_{t≥c} P(t)`
+    /// is *exactly* `P(TC ≥ c)` for integer `c` — the tail mass the count-index slice search weights by
+    /// (see [`super::tui::index`]). Pivot 0 (true-count systems are balanced), so `TC = −52·s/n`; the
+    /// `n = 0` term has no true count and is skipped. Cheap — one `CountW` build, no solving.
+    pub(crate) fn true_count_distribution<S: CountSystem>(
+        n_decks: u8,
         pen: Penetration,
-        dist: [f64; N_RANKS],
-    ) -> Self {
+    ) -> Vec<(i16, f64)> {
+        debug_assert_eq!(
+            S::pivot(n_decks),
+            0,
+            "true-count occurrence assumes a balanced system"
+        );
+        let value_of_rank = std::array::from_fn(|r| S::map(&Card::from_rank_index(r)));
+        let dp = CountW::build(value_of_rank, CardCol::from_decks(n_decks));
+        let big_n = dp.n_max;
+        let mut acc: HashMap<i16, f64> = HashMap::new();
+        let mut total = 0.0;
+        for n in 1..=big_n {
+            let w = pen.weight(n, big_n);
+            if w == 0.0 {
+                continue;
+            }
+            for s in dp.s_min..=dp.s_max {
+                let p = dp.at(s, n);
+                if p == 0.0 {
+                    continue;
+                }
+                // External true count = −(cards/deck)·s/n (pivot 0); floor-bucket to an integer.
+                let tc = -(CARDS_PER_DECK as f64) * s as f64 / n as f64;
+                *acc.entry(tc.floor() as i16).or_insert(0.0) += w * p;
+                total += w * p;
+            }
+        }
+        let mut out: Vec<(i16, f64)> = acc.into_iter().map(|(t, m)| (t, m / total)).collect();
+        out.sort_by_key(|&(t, _)| t);
+        out
+    }
+
+    fn from_parts(dp: CountW, frame: CountFrame, pen: Penetration, dist: [f64; N_RANKS]) -> Self {
+        // `dp.deck` is still the undepleted root here (no draw has happened yet).
+        let root_size = dp.deck.len() as u16;
+        let root_internal = internal_count(&dp.deck, &dp.value_of_rank);
         Self {
             pool: dp.deck,
             dp,
-            cond,
+            frame,
             pen,
+            root_size,
+            root_internal,
             dist,
             mean_field: false,
             mf_scale: 0,
-            band_conds: Vec::new(),
+            band_frames: Vec::new(),
             band_idx: 0,
             dist_cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -489,24 +850,29 @@ impl CountShoe {
         self.pool
     }
 
+    /// The `(drawn_sum, drawn_cards)` offsets [`recompute`](Self::recompute) derives from the root — the
+    /// count-value sum and number of cards drawn since construction. Test accessor for
+    /// `true_count_shoe_tracks_drawn_offsets`.
+    #[cfg(test)]
+    fn drawn(&self) -> (i16, u16) {
+        (
+            self.root_internal - internal_count(&self.pool, &self.dp.value_of_rank),
+            self.root_size - self.pool.len() as u16,
+        )
+    }
+
     /// Deplete the pool by one card *without* recomputing the cached distribution — used to batch a
-    /// whole-hand removal before a single recompute. Only the *current pool* (and the count condition /
-    /// penetration prior) are updated here — both `O(1)`; the expensive `CountW` table is left
-    /// untouched and synced lazily later (see [`sync_table`]). The condition shifts by the card's value
-    /// (so the running-count constraint follows the card down the tree) and the penetration prior ages.
+    /// whole-hand removal before a single recompute. Only the *current pool* and the penetration prior
+    /// are updated here — both `O(1)`; the expensive `CountW` table is left untouched and synced lazily
+    /// later (see [`sync_table`]). The count condition is **not** touched: it is anchored at the root and
+    /// reconstructed against the depleted pool in [`recompute`](Self::recompute), so depletion only has
+    /// to move the pool and age the prior.
     ///
     /// [`sync_table`]: Self::sync_table
     fn deplete(&mut self, card: &Card) {
-        let v = self.dp.value_of_rank[card.rank_index()];
         // One card off the current pool (per-rank saturating subtraction). NOT `remove_rank`, which
         // clears the whole rank.
         self.pool = self.pool - CardCol::from_hand(&[*card]);
-        self.cond = self.cond.shifted(v);
-        // Band members shift in lockstep, so `cond == band_conds[band_idx]` is preserved as the
-        // running-count constraint follows the card down the tree.
-        for c in self.band_conds.iter_mut() {
-            *c = c.shifted(v);
-        }
         self.pen = self.pen.after_draw();
     }
 
@@ -535,16 +901,25 @@ impl CountShoe {
     /// table is first [`sync_table`](Self::sync_table)'d down to the current pool; on a **hit** the table
     /// is never touched.
     fn recompute(&mut self) {
+        // The frame is anchored relative to the root pool; reconstruct that root from the current
+        // (depleted) pool by the cards drawn since construction. `value_scales` adds these to each table
+        // `(s, n)` before testing the frame. Both are functions of the pool (hence of `class_counts`), so
+        // the cache key `(class_counts, frame)` still fully determines the result — no extra key
+        // dimension (the frame's visible offset is fixed at construction, also part of the key).
+        let drawn_cards = self.root_size - self.pool.len() as u16;
+        let drawn_sum = self.root_internal - internal_count(&self.pool, &self.dp.value_of_rank);
         let class_counts = self.dp.class_counts_of(&self.pool);
-        let key = (class_counts, self.cond);
+        let key = (class_counts, self.frame);
         if let Some(&scales) = self.dist_cache.lock().unwrap().get(&key) {
             self.dist = self.dp.dist_from_scales_with(&self.pool, &scales);
             return;
         }
         // Miss: the deconvolution genuinely needs the table at the current pool.
         self.sync_table();
-        if self.band_conds.len() <= 1 {
-            let scales = self.dp.value_scales(self.cond, self.pen);
+        if self.band_frames.len() <= 1 {
+            let scales = self
+                .dp
+                .value_scales(self.frame, self.pen, drawn_sum, drawn_cards);
             self.dist_cache.lock().unwrap().insert(key, scales);
             self.dist = self.dp.dist_from_scales_with(&self.pool, &scales);
             return;
@@ -552,12 +927,14 @@ impl CountShoe {
         // Banded: one deconvolution serves the whole band. Fill every member's value scales for this
         // class composition so sibling solves sharing `dist_cache` hit them instead of re-deconvolving
         // (the band is filled atomically — all present or none — so the early cache check above is a
-        // sound guard).
-        let scales = self.dp.value_scales_band(&self.band_conds, self.pen);
+        // sound guard). Every member shares the same `(drawn_sum, drawn_cards)` — same pool.
+        let scales = self
+            .dp
+            .value_scales_band(&self.band_frames, self.pen, drawn_sum, drawn_cards);
         {
             let mut cache = self.dist_cache.lock().unwrap();
-            for (c, sc) in self.band_conds.iter().zip(scales.iter()) {
-                cache.insert((class_counts, *c), *sc);
+            for (f, sc) in self.band_frames.iter().zip(scales.iter()) {
+                cache.insert((class_counts, *f), *sc);
             }
         }
         self.dist = self
@@ -948,8 +1325,22 @@ impl CountW {
     /// composition (a momentarily-absent rank must not change it). [`dist_from_scales`] folds in the
     /// rank-level `m_r` to recover the distribution.
     ///
+    /// `drawn_sum`/`drawn_cards` are the count-value sum and card count drawn since the **decision
+    /// point** (`0` for a freshly built table). The condition is anchored at the root, so each table
+    /// `(s, n)` is lifted to the root pair `(s + drawn_sum, n + drawn_cards)` before the condition is
+    /// tested — see [`CountCondition::accepts`]. The penetration prior, by contrast, weights the
+    /// *current* `n` (how deep we now are), exactly as before. For a running count this is identical to
+    /// shifting the threshold by `−drawn_sum`, so KO is byte-for-byte unchanged; the `0, 0` call in
+    /// [`draw_dist`](Self::draw_dist) makes the oracle cross-checks literal as well.
+    ///
     /// [`dist_from_scales`]: Self::dist_from_scales
-    fn value_scales(&self, cond: CountCondition, pen: Penetration) -> [f64; N_RANKS] {
+    fn value_scales(
+        &self,
+        frame: CountFrame,
+        pen: Penetration,
+        drawn_sum: i16,
+        drawn_cards: u16,
+    ) -> [f64; N_RANKS] {
         let big_n = self.n_max;
         let mut out = [0.0; N_RANKS];
         let mut seen_values: Vec<i16> = Vec::new();
@@ -971,16 +1362,20 @@ impl CountW {
                 let p_v = self.deconv(v);
                 let mut s_v = 0.0;
                 for s in self.s_min..=self.s_max {
-                    if !cond.accepts(s) {
+                    let sh = s - v;
+                    if sh < self.s_min || sh > self.s_max {
                         continue;
                     }
                     for n in 1..=big_n {
-                        let w_n = pen.weight(n, big_n);
-                        if w_n == 0.0 {
+                        // Lift this table `(s, n)` to the root pair and test the frame there. The
+                        // acceptance is per-`(s, n)`: a true-count frame admits `s` only at the pool
+                        // sizes whose decision-point true count clears the cutoff, so the filter lives
+                        // inside the `n` loop (a running-count frame ignores `n`, so KO is unchanged).
+                        if !frame.accepts((s + drawn_sum) as i32, (n + drawn_cards) as i32) {
                             continue;
                         }
-                        let sh = s - v;
-                        if sh < self.s_min || sh > self.s_max {
+                        let w_n = pen.weight(n, big_n);
+                        if w_n == 0.0 {
                             continue;
                         }
                         let pval = p_v[(sh - self.s_min) as usize * self.n_span + (n - 1) as usize];
@@ -1027,32 +1422,38 @@ impl CountW {
         acc
     }
 
-    /// Next-card draw distribution conditioned on `cond` over the running count, under penetration
+    /// Next-card draw distribution conditioned on `frame` over the running count, under penetration
     /// prior `pen`. The class-level [`value_scales`](Self::value_scales) (cached across class-equivalent
     /// pools) folded together with the rank-level `m_r` by [`dist_from_scales`](Self::dist_from_scales);
     /// kept as a single entry point for the oracle cross-checks.
-    fn draw_dist(&self, cond: CountCondition, pen: Penetration) -> [f64; N_RANKS] {
-        self.dist_from_scales(&self.value_scales(cond, pen))
+    fn draw_dist(&self, frame: CountFrame, pen: Penetration) -> [f64; N_RANKS] {
+        // No draws since this table was built — the frame is tested literally on the table `(s, n)`.
+        self.dist_from_scales(&self.value_scales(frame, pen, 0, 0))
     }
 
-    /// [`value_scales`] for a whole **band** of conditions at once, sharing the expensive work.
+    /// [`value_scales`] for a whole **band** of frames at once, sharing the expensive work.
     ///
-    /// The condition only enters through the `cond.accepts(s)` filter on the running count `s`; the
-    /// `O(cells)` deconvolution `p_v` and the `n`-sum over the penetration prior are both
-    /// condition-*independent*. So for a band of conditions over the *same* pool we deconvolve each
-    /// present value once and the per-`s` `n`-sum once, then distribute that mass to whichever band
-    /// members admit `s`. Returns one value-scale broadcast per `cond`, in order — equal to calling
-    /// [`value_scales`] per condition (same terms, only the `n`-sum regrouped per-`s` so float
-    /// summation order differs in the last bits), at a fraction of the cost. This is what lets the
-    /// solver sweep a count band (the chart's count-index thresholds) while paying the dominant
-    /// deconvolution only once.
+    /// The frame only enters through the `frame.accepts(s, n)` filter; the `O(cells)` deconvolution
+    /// `p_v` and the per-`(s, n)` term `w_n · p_v` are both frame-*independent*. So for a band of frames
+    /// over the *same* pool we deconvolve each present value once, then distribute each `(s, n)` term to
+    /// whichever band members admit it. Returns one value-scale broadcast per `frame`, in order — equal
+    /// to calling [`value_scales`] per frame (same terms, only the summation regrouped per-`(s, n)` so
+    /// float order differs in the last bits), at a fraction of the cost (a running-count band admits `s`
+    /// independently of `n`, recovering the one-sum-per-`s` cost). This is what lets the solver sweep a
+    /// count band (the chart's count-index thresholds) while paying the dominant deconvolution only once.
     ///
     /// [`value_scales`]: Self::value_scales
-    fn value_scales_band(&self, conds: &[CountCondition], pen: Penetration) -> Vec<[f64; N_RANKS]> {
+    fn value_scales_band(
+        &self,
+        frames: &[CountFrame],
+        pen: Penetration,
+        drawn_sum: i16,
+        drawn_cards: u16,
+    ) -> Vec<[f64; N_RANKS]> {
         let big_n = self.n_max;
-        let mut outs = vec![[0.0; N_RANKS]; conds.len()];
+        let mut outs = vec![[0.0; N_RANKS]; frames.len()];
         let mut seen_values: Vec<i16> = Vec::new();
-        // Per distinct present value, the `s_v` scale for each band member (parallel to `conds`).
+        // Per distinct present value, the `s_v` scale for each band member (parallel to `frames`).
         let mut scales_of_value: Vec<Vec<f64>> = Vec::new();
         for r in 0..N_RANKS {
             let v = self.value_of_rank[r];
@@ -1066,29 +1467,31 @@ impl CountW {
                 pos
             } else {
                 let p_v = self.deconv(v);
-                let mut sv = vec![0.0; conds.len()];
+                let mut sv = vec![0.0; frames.len()];
                 for s in self.s_min..=self.s_max {
                     let sh = s - v;
                     if sh < self.s_min || sh > self.s_max {
                         continue;
                     }
-                    // The `n`-sum is condition-independent; compute it once per `s` and hand it to
-                    // every member whose condition admits `s`.
-                    let mut nsum = 0.0;
+                    // The deconvolution `p_v` and the `(w_n · pval)` term are frame-independent; the
+                    // *admission* is not (a true-count frame admits a given `s` only at some pool sizes
+                    // `n`), so each term is distributed per-`(s, n)` to whichever members accept it. For
+                    // a running-count band `accepts` ignores `n`, so this reduces to the old "one
+                    // `n`-sum per `s`, handed to every admitting member" — same terms, only the
+                    // summation regrouped (last-bit float differences against per-frame `value_scales`).
                     for n in 1..=big_n {
                         let w_n = pen.weight(n, big_n);
                         if w_n == 0.0 {
                             continue;
                         }
                         let pval = p_v[(sh - self.s_min) as usize * self.n_span + (n - 1) as usize];
-                        if pval != 0.0 {
-                            nsum += w_n * pval;
+                        if pval == 0.0 {
+                            continue;
                         }
-                    }
-                    if nsum != 0.0 {
-                        for (ci, cond) in conds.iter().enumerate() {
-                            if cond.accepts(s) {
-                                sv[ci] += nsum;
+                        let term = w_n * pval;
+                        for (ci, frame) in frames.iter().enumerate() {
+                            if frame.accepts((s + drawn_sum) as i32, (n + drawn_cards) as i32) {
+                                sv[ci] += term;
                             }
                         }
                     }
@@ -1112,8 +1515,8 @@ impl CountW {
     /// [`draw_dist`]: Self::draw_dist
     /// [`value_scales_band`]: Self::value_scales_band
     #[cfg(test)]
-    fn draw_dist_band(&self, conds: &[CountCondition], pen: Penetration) -> Vec<[f64; N_RANKS]> {
-        self.value_scales_band(conds, pen)
+    fn draw_dist_band(&self, frames: &[CountFrame], pen: Penetration) -> Vec<[f64; N_RANKS]> {
+        self.value_scales_band(frames, pen, 0, 0)
             .iter()
             .map(|sc| self.dist_from_scales(sc))
             .collect()
@@ -1198,7 +1601,7 @@ mod tests {
                     CountCondition::Le(5),
                     CountCondition::Eq(10_000), // wildly out of range → unreachable
                 ] {
-                    let dist = cw.draw_dist(cond, pen);
+                    let dist = cw.draw_dist(CountFrame::pre_round(cond), pen);
                     let sum: f64 = dist.iter().sum();
                     assert!(
                         dist.iter().all(|p| p.is_finite() && *p >= -1e-12),
@@ -1232,12 +1635,13 @@ mod tests {
             CountCondition::Le(4),
             CountCondition::Eq(9_999), // unreachable → all-zero on both paths
         ];
+        let frames: Vec<CountFrame> = conds.iter().map(|&c| CountFrame::pre_round(c)).collect();
         for n in [1u8, 2u8] {
             let mut cw = CountW::build(val, CardCol::from_decks(n));
             for step in 0..5 {
-                let band = cw.draw_dist_band(&conds, pen);
+                let band = cw.draw_dist_band(&frames, pen);
                 for (i, &cond) in conds.iter().enumerate() {
-                    let single = cw.draw_dist(cond, pen);
+                    let single = cw.draw_dist(CountFrame::pre_round(cond), pen);
                     for r in 0..N_RANKS {
                         assert!(
                             (band[i][r] - single[r]).abs() < 1e-12,
@@ -1266,7 +1670,11 @@ mod tests {
         let externals = [-4i16, -1, 0, 2, 5];
         let hand = CardCol::from_hand(&[Card::Ten, Card::Pip(6), Card::Pip(5)]);
         for n in [1u8, 2u8] {
-            let band = CountShoe::band::<Ko>(n, &externals, CountCmp::Eq, pen);
+            let frames: Vec<CountFrame> = externals
+                .iter()
+                .map(|&e| CountFrame::pre_round(cond_from_external::<Ko>(n, e, CountCmp::Eq)))
+                .collect();
+            let band = CountShoe::band::<Ko>(n, &frames, pen);
             for (k, &ext) in externals.iter().enumerate() {
                 let single = CountShoe::from_external::<Ko>(n, ext, CountCmp::Eq, pen);
                 let b = band[k].remove_hand(&hand);
@@ -1700,6 +2108,7 @@ mod tests {
     fn balanced_system_pivots_at_zero() {
         struct HiLo;
         impl CountSystem for HiLo {
+            const KIND: CountKind = CountKind::TrueCount;
             fn map(card: &Card) -> i16 {
                 match card {
                     Card::Ace | Card::Ten => -1,
@@ -1714,6 +2123,201 @@ mod tests {
             assert_eq!(HiLo::internal_to_external(n, 7), -7);
             assert_eq!(HiLo::external_to_internal(n, -7), 7);
         }
+    }
+
+    /// The production [`HiLo`] is a balanced true-count system; KO is a running-count one. The engine
+    /// branches on [`CountSystem::KIND`], so pin both classifications (and Hi-Lo's balance, which the
+    /// true-count math assumes).
+    #[test]
+    fn count_kinds_are_classified() {
+        assert_eq!(HiLo::KIND, CountKind::TrueCount);
+        assert_eq!(Ko::KIND, CountKind::Running);
+        for n in [1u8, 2, 6, 8] {
+            assert_eq!(
+                HiLo::full_shoe_count(n),
+                0,
+                "a true-count system must be balanced"
+            );
+            assert_eq!(HiLo::pivot(n), 0);
+        }
+    }
+
+    /// [`cond_from_count`] dispatches on the system kind: a running system delegates to
+    /// [`cond_from_external`] (inverting the inequality into internal-count space); a true-count system
+    /// builds the `True*` joint condition directly (no inversion — already in the player's TC frame).
+    /// True counts are inequality-only.
+    #[test]
+    fn cond_from_count_dispatches_on_kind() {
+        // Running (KO): identical to the running-count path.
+        for cmp in [CountCmp::Eq, CountCmp::Ge, CountCmp::Le] {
+            assert_eq!(
+                cond_from_count::<Ko>(6, 3, cmp),
+                cond_from_external::<Ko>(6, 3, cmp),
+            );
+        }
+        // True count (Hi-Lo): the half-unit cutoff carried verbatim (no inversion). `cond_from_count` is
+        // the pre-round pure condition; the decision-point visible offset is `cond_for_frame`'s job.
+        assert_eq!(
+            cond_from_count::<HiLo>(6, 2, CountCmp::Ge),
+            CountCondition::TrueGe { cutoff: 2 },
+        );
+        assert_eq!(
+            cond_from_count::<HiLo>(6, -1, CountCmp::Le),
+            CountCondition::TrueLe { cutoff: -1 },
+        );
+    }
+
+    /// [`cond_for_frame`] is the Wizard-of-Odds per-frame entry. For a running count it reproduces the
+    /// `external − map(U) − k` shift the chart/index merge has always used; for a true count it sets the
+    /// visible offset `vis_sum = map(U) + k` (and the caller's `vis_cards`) so the TC is anchored at the
+    /// decision point. `vis = (0, 0)` (an up-card and `k` that cancel, with no visible cards) recovers
+    /// the pre-round [`cond_from_count`].
+    #[test]
+    fn cond_for_frame_matches_running_shift_and_true_offset() {
+        // Running (KO): a pre-round frame whose condition is the explicit external shift.
+        for cmp in [CountCmp::Ge, CountCmp::Le] {
+            for &up in &[Card::Pip(6), Card::Ten, Card::Ace] {
+                for k in -2i16..=2 {
+                    assert_eq!(
+                        cond_for_frame::<Ko>(6, 5, cmp, up, k, 3),
+                        CountFrame::pre_round(cond_from_external::<Ko>(
+                            6,
+                            5 - Ko::map(&up) - k,
+                            cmp
+                        )),
+                        "KO frame must equal the external shift (up={up:?} k={k})",
+                    );
+                }
+            }
+        }
+        // True count (Hi-Lo): the pure half-unit cutoff paired with the decision-point visible offset.
+        assert_eq!(
+            cond_for_frame::<HiLo>(6, 3, CountCmp::Ge, Card::Ten, 1, 3),
+            CountFrame {
+                cond: CountCondition::TrueGe { cutoff: 3 },
+                vis_sum: HiLo::map(&Card::Ten) + 1, // map(T) = −1 ⇒ 0
+                vis_cards: 3,
+            },
+        );
+    }
+
+    /// Exact equality on a true count is a measure-zero event over the `(s, n)` lattice, so it is
+    /// rejected at construction.
+    #[test]
+    #[should_panic(expected = "inequality-only")]
+    fn true_count_eq_is_rejected() {
+        let _ = cond_from_count::<HiLo>(6, 2, CountCmp::Eq);
+    }
+
+    /// [`CountFrame::accepts`] matches the floating-point **decision-point** true count
+    /// `TC = −52·(s − vis_sum)/(n − vis_cards)` against the half-unit cutoff `cutoff/2` (away from exact
+    /// boundaries, where the cross-multiplied integer form is the authority and float rounding could
+    /// disagree). The visible offset is applied here, before the pure condition is tested — so the sweep
+    /// ranges over the cutoff, the reconstructed root pair, *and* the visible offset. A non-positive
+    /// decision-point size admits nothing.
+    #[test]
+    fn true_count_accepts_matches_float_reference() {
+        for cutoff in -3i16..=3 {
+            for (vis_sum, vis_cards) in [(0i16, 0u16), (1, 3), (-2, 3), (0, 1)] {
+                let ge = CountFrame {
+                    cond: CountCondition::TrueGe { cutoff },
+                    vis_sum,
+                    vis_cards,
+                };
+                let le = CountFrame {
+                    cond: CountCondition::TrueLe { cutoff },
+                    vis_sum,
+                    vis_cards,
+                };
+                for s in -10i32..=10 {
+                    for n in 1i32..=20 {
+                        let n_dp = n - vis_cards as i32;
+                        if n_dp <= 0 {
+                            assert!(
+                                !ge.accepts(s, n),
+                                "Ge must admit nothing at non-positive dp size"
+                            );
+                            assert!(
+                                !le.accepts(s, n),
+                                "Le must admit nothing at non-positive dp size"
+                            );
+                            continue;
+                        }
+                        // Balanced ⇒ pivot 0; decision-point TC = −52·(s − vis_sum)/n_dp, compared to
+                        // the half-unit cutoff cutoff/2.
+                        let tc = -52.0 * (s - vis_sum as i32) as f64 / n_dp as f64;
+                        let thr = cutoff as f64 / 2.0;
+                        if (tc - thr).abs() <= 1e-9 {
+                            continue; // on the boundary: integer form is exact, float may round
+                        }
+                        assert_eq!(
+                            ge.accepts(s, n),
+                            tc > thr,
+                            "Ge s={s} n={n} vis=({vis_sum},{vis_cards})"
+                        );
+                        assert_eq!(
+                            le.accepts(s, n),
+                            tc < thr,
+                            "Le s={s} n={n} vis=({vis_sum},{vis_cards})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `CountShoe` must track the value-sum and card-count drawn since construction — the offsets
+    /// [`CountShoe::recompute`] adds to each table `(s, n)` to reconstruct the **root** pair the
+    /// condition is anchored on. This is what replaced the old per-draw `shifted` threading. Drawing a
+    /// mixed hand and checking the offsets against a manual tally pins the reconstruction at the shoe
+    /// boundary (the `accepts` predicate itself is pinned by `true_count_accepts_matches_float_reference`).
+    #[test]
+    fn true_count_shoe_tracks_drawn_offsets() {
+        use crate::shoe::Shoe;
+        let pen = Penetration::FlatPastPercent(25);
+        let mut shoe = CountShoe::from_count::<HiLo>(2, 1, CountCmp::Ge, pen);
+        assert_eq!(shoe.drawn(), (0, 0), "a fresh shoe has drawn nothing");
+        let hand = [Card::Pip(5), Card::Ten, Card::Ace, Card::Pip(8)];
+        let mut exp_sum = 0i16;
+        for (i, c) in hand.iter().enumerate() {
+            shoe.draw(c);
+            exp_sum += HiLo::map(c); // +1, −1, −1, 0
+            assert_eq!(
+                shoe.drawn(),
+                (exp_sum, (i + 1) as u16),
+                "after drawing {c:?} (#{}) the offsets must equal the running tally",
+                i + 1
+            );
+        }
+    }
+
+    /// End-to-end wiring of the true-count condition into the [`CountShoe`] draw distribution, pinned to
+    /// the full deck (the only admissible pool, count 0): `TC ≥ 0` admits it and the distribution must
+    /// equal the plain finite deck's; `TC ≥ 1` (cutoff `2` half-units) cannot be met by a count-0 pool,
+    /// so no count-consistent mass remains. Mirrors [`count_shoe_matches_finite_deck_when_fully_known`]
+    /// for the `True*` path, without a full solve.
+    #[test]
+    fn true_count_full_deck_pin_gates_on_cutoff() {
+        let finite = CardCol::from_decks(1);
+        let full = finite.len() as u16;
+
+        let admit =
+            CountShoe::from_count::<HiLo>(1, 0, CountCmp::Ge, Penetration::CardsRemaining(full));
+        for r in 0..N_RANKS {
+            let card = Card::from_rank_index(r);
+            let (got, want) = (admit.draw_prob(&card), finite.draw_prob(&card));
+            assert!(
+                (got - want).abs() < 1e-12,
+                "TC≥0 over the full deck must match the finite deck: rank {r} {got} vs {want}"
+            );
+        }
+
+        let reject =
+            CountShoe::from_count::<HiLo>(1, 2, CountCmp::Ge, Penetration::CardsRemaining(full));
+        let mass: f64 = (0..N_RANKS)
+            .map(|r| reject.draw_prob(&Card::from_rank_index(r)))
+            .sum();
+        assert_eq!(mass, 0.0, "TC≥1 over a count-0 pool must leave no mass");
     }
 
     /// A [`CountShoe`] that *knows* the whole deck — conditioned on the full deck's own count with the
@@ -1808,7 +2412,10 @@ mod tests {
         let state = CountState::from_decks::<Ko>(1);
         for c in [-2i16, 0, 2, 4] {
             let oracle: Vec<f64> = state.all_draw_probs_given_c(c).map(|(_, p)| p).collect();
-            let got = cw.draw_dist(CountCondition::Eq(c), Penetration::FlatPastPercent(25));
+            let got = cw.draw_dist(
+                CountFrame::pre_round(CountCondition::Eq(c)),
+                Penetration::FlatPastPercent(25),
+            );
             for (r, (&o, g)) in oracle.iter().zip(got).enumerate() {
                 assert!(
                     (o - g).abs() < 1e-9,
@@ -1830,8 +2437,9 @@ mod tests {
         }
         let fresh = CountW::build(val, CardCol::from_decks(1) - CardCol::from_hand(&removed));
         for c in [-3i16, 0, 3] {
-            let a = cw.draw_dist(CountCondition::Eq(c), Penetration::FlatPastPercent(25));
-            let b = fresh.draw_dist(CountCondition::Eq(c), Penetration::FlatPastPercent(25));
+            let pen = Penetration::FlatPastPercent(25);
+            let a = cw.draw_dist(CountFrame::pre_round(CountCondition::Eq(c)), pen);
+            let b = fresh.draw_dist(CountFrame::pre_round(CountCondition::Eq(c)), pen);
             for (r, (x, y)) in a.iter().zip(b).enumerate() {
                 assert!(
                     (x - y).abs() < 1e-9,

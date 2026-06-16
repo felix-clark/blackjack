@@ -8,13 +8,14 @@ use std::hash::Hash;
 use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
-use crate::count::{CountCmp, CountShoe, CountSystem, Ko};
+use crate::count::{CountCmp, CountShoe, CountSystem, cond_for_frame};
 use crate::hand::{HandCategory, Move};
 use crate::reach::{CellInfo, reach_weights, summarize_cells};
 use crate::rules::Ruleset;
 use crate::shoe::{CardCol, Shoe};
 use crate::simulation::{
-    EdgeTerm, build_evs, build_evs_with_splits, edge_term, pair_split_evs_for, splittable_pairs,
+    EdgeTerm, bs_edge_term, bs_value_tree, build_evs, build_evs_with_splits, edge_term,
+    pair_split_evs_for, splittable_pairs,
 };
 
 use super::config::COUNT_PENETRATION;
@@ -31,7 +32,11 @@ pub(super) struct Column {
     pub(super) summary: ColumnSummary,
     /// Draw probability of this up-card from the full shoe — its weight in the overall edge.
     pub(super) p_up: f64,
+    /// Two-card-root edge under composition-dependent **optimal** play (per-hand argmax).
     pub(super) edge: EdgeTerm,
+    /// Two-card-root edge under **basic-strategy** play: each hand scored by the move its category's
+    /// chart cell prescribes ([`summary`](Self::summary)'s headlines), not the per-hand optimum.
+    pub(super) bs_edge: EdgeTerm,
 }
 
 /// A finished worker result: one solved column, tagged with the epoch it was computed for.
@@ -55,11 +60,24 @@ pub(super) fn solve_on<S: Shoe + Clone + Eq + Hash + Sync>(
 ) -> Column {
     let tree = build_evs(shoe.clone(), up_card, rules);
     let weights = reach_weights(shoe.clone(), up_card, rules, &tree, true);
+    let summary = summarize_cells(&tree, &weights);
+    let bs_values = bs_value_tree(shoe.clone(), up_card, rules, &tree, &cell_table(&summary));
     Column {
-        summary: summarize_cells(&tree, &weights),
         p_up: shoe.draw_prob(&up_card),
         edge: edge_term(&tree),
+        bs_edge: bs_edge_term(&tree, &bs_values),
+        summary,
     }
+}
+
+/// The per-category consolidated move EVs the basic-strategy value pass ranks moves by — the chart
+/// cell's [`CellInfo::move_evs`](crate::reach::CellInfo::move_evs), packaged as the plain map
+/// [`bs_value_tree`](crate::simulation::bs_value_tree) consumes.
+fn cell_table(summary: &ColumnSummary) -> HashMap<HandCategory, HashMap<Move, f64>> {
+    summary
+        .iter()
+        .map(|(cat, cell)| (*cat, cell.move_evs.clone()))
+        .collect()
 }
 
 /// One solved EV tree — a per-frame product the count-conditioned solves merge into a display column.
@@ -71,11 +89,16 @@ pub(super) type ReachMap = HashMap<CardCol, f64>;
 /// count value lies in `[-2, 2]`; longer hands clamp into it (see [`merge_count_frames`]).
 pub(super) const COUNT_GROUPS: std::ops::RangeInclusive<i16> = -2..=2;
 
-/// The KO running-count value of a whole hand: the sum of its cards' count values. A two-card hand
-/// spans `[-2, 2]`; longer hands (multi-card breakdown members) can exceed that and are clamped into the
-/// solved range.
-fn hand_count_value(hand: &CardCol) -> i16 {
-    hand.iter().map(|(c, n)| Ko::map(&c) * n as i16).sum()
+/// The visible-card count at a player decision point under the Wizard-of-Odds convention: the up-card
+/// plus the player's two-card starting hand. The entered count includes exactly these, so a true-count
+/// frame drops the unseen pool by this many cards before testing (see [`cond_for_frame`]).
+pub(super) const VIS_CARDS: u16 = 3;
+
+/// The running-count value of a whole hand under system `S`: the sum of its cards' count values. A
+/// two-card hand spans `[-2, 2]` (every system maps a card to `{-1, 0, +1}`); longer hands (multi-card
+/// breakdown members) can exceed that and are clamped into the solved range.
+fn hand_count_value<S: CountSystem>(hand: &CardCol) -> i16 {
+    hand.iter().map(|(c, n)| S::map(&c) * n as i16).sum()
 }
 
 /// Assemble the merged display tree/reach the chart consolidation reads, under the Wizard-of-Odds count
@@ -85,7 +108,7 @@ fn hand_count_value(hand: &CardCol) -> i16 {
 /// frame — the chart drives it with five `build_evs` calls, the count-index sweep with band shoes at the
 /// correspondingly shifted counts. Every per-frame tree enumerates the same hand set (the count tilts
 /// probabilities, not which ranks the pool holds), so the hand list is taken from group `0`.
-pub(super) fn merge_count_frames<'a>(
+pub(super) fn merge_count_frames<'a, S: CountSystem>(
     tree_for: impl Fn(i16) -> &'a Tree,
     reach_for: impl Fn(i16) -> &'a ReachMap,
 ) -> (Tree, ReachMap) {
@@ -93,7 +116,7 @@ pub(super) fn merge_count_frames<'a>(
     let mut merged_tree = Tree::new();
     let mut merged_reach = ReachMap::new();
     for hand in tree_for(0).keys().copied().collect::<Vec<_>>() {
-        let k = hand_count_value(&hand).clamp(lo, hi);
+        let k = hand_count_value::<S>(&hand).clamp(lo, hi);
         if let Some(entry) = tree_for(k).get(&hand) {
             merged_tree.insert(hand, entry.clone());
             if let Some(&r) = reach_for(k).get(&hand) {
@@ -135,24 +158,23 @@ pub(super) fn merge_count_frames<'a>(
 /// matching its count value `2·map(r)`, so its split is solved on that frame's shoe alone (see the
 /// `split_evs` step below). That keeps the count solve close to the cost of a single uncounted one
 /// plus the four extra cheap DP passes, rather than ~5× it.
-pub(super) fn solve_counted(
+pub(super) fn solve_counted<S: CountSystem>(
     n_decks: u8,
-    external: i16,
+    value: i16,
     cmp: CountCmp,
     up_card: Card,
     rules: &Ruleset,
 ) -> Column {
-    let mu = Ko::map(&up_card);
+    let mu = S::map(&up_card);
     let (lo, hi) = (*COUNT_GROUPS.start(), *COUNT_GROUPS.end());
 
-    // One frame shoe per count group `k`: the entered running count, anchored *before* this round's
-    // cards, that lands a hand of count value `k` at exactly `external` (see above).
+    // One frame shoe per count group `k`, built by [`cond_for_frame`] under system `S` so a hand of
+    // count value `k` is read at exactly the entered count `value` (decision-point anchored — for a
+    // running count via the `external − map(U) − k` shift, for a true count via the visible offset).
     let shoes: HashMap<i16, CountShoe> = COUNT_GROUPS
         .map(|k| {
-            (
-                k,
-                CountShoe::from_external::<Ko>(n_decks, external - mu - k, cmp, COUNT_PENETRATION),
-            )
+            let frame = cond_for_frame::<S>(n_decks, value, cmp, up_card, k, VIS_CARDS);
+            (k, CountShoe::framed::<S>(n_decks, frame, COUNT_PENETRATION))
         })
         .collect();
 
@@ -165,7 +187,7 @@ pub(super) fn solve_counted(
     deck.draw(&up_card);
     let pairs = splittable_pairs(&deck);
     let split_evs = pair_split_evs_for(&pairs, up_card, rules, |pair| {
-        let k = hand_count_value(pair).clamp(lo, hi);
+        let k = hand_count_value::<S>(pair).clamp(lo, hi);
         shoes[&k].clone()
     });
 
@@ -180,7 +202,7 @@ pub(super) fn solve_counted(
     for k in COUNT_GROUPS {
         let frame_splits: HashMap<CardCol, f64> = split_evs
             .iter()
-            .filter(|(pair, _)| hand_count_value(pair).clamp(lo, hi) == k)
+            .filter(|(pair, _)| hand_count_value::<S>(pair).clamp(lo, hi) == k)
             .map(|(&pair, &ev)| (pair, ev))
             .collect();
         let shoe = &shoes[&k];
@@ -196,10 +218,22 @@ pub(super) fn solve_counted(
         reaches.insert(k, reach);
     }
 
-    let (merged_tree, merged_reach) = merge_count_frames(|k| &trees[&k], |k| &reaches[&k]);
+    let (merged_tree, merged_reach) = merge_count_frames::<S>(|k| &trees[&k], |k| &reaches[&k]);
+    let summary = summarize_cells(&merged_tree, &merged_reach);
+    // The basic-strategy edge follows the displayed chart at every node, valued on the same pre-round
+    // frame (`k = -map(U)`, shoe `shoes[&-mu]`) the optimal edge uses, so the two are comparable.
+    let bs_values = bs_value_tree(
+        shoes[&-mu].clone(),
+        up_card,
+        rules,
+        &trees[&-mu],
+        &cell_table(&summary),
+    );
+    let bs_edge = bs_edge_term(&trees[&-mu], &bs_values);
     Column {
-        summary: summarize_cells(&merged_tree, &merged_reach),
+        summary,
         p_up,
         edge,
+        bs_edge,
     }
 }
