@@ -372,7 +372,14 @@ impl App {
         )));
 
         let height = lines.len() as u16 + 2;
-        let area = centered_rect(width, height, f.area());
+        // Side-by-side layout centers over the whole frame; the vertical stack hugs the left (panes are
+        // PANE_WIDTH wide with empty space to their right), so park the popup beside them instead of on
+        // top of the tables.
+        let area = if f.area().width >= 3 * PANE_WIDTH {
+            centered_rect(width, height, f.area())
+        } else {
+            popup_beside_panes(width, height, f.area())
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
@@ -1196,6 +1203,21 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let h = height.min(area.height);
     Rect {
         x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// Place a popup just to the right of the left-aligned pane column (used in the vertical stack, where
+/// the panes occupy `PANE_WIDTH` on the left and the rest of the row is empty). Sits one column past the
+/// panes, vertically centered, clamped so it never runs off the right edge.
+fn popup_beside_panes(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = (area.x + PANE_WIDTH + 1).min(area.x + area.width - w);
+    Rect {
+        x,
         y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
