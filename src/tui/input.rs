@@ -4,7 +4,7 @@
 
 use ratatui::crossterm::event::KeyCode;
 
-use crate::count::{CountCmp, CountKind, CountSystemId, TC_HALF_UNITS};
+use crate::count::{CountCmp, CountKind, TC_HALF_UNITS};
 use crate::hand::Move;
 use crate::rules::{BjPayout, PeekRule, PeekSurrender, SplitAces};
 
@@ -330,13 +330,11 @@ impl App {
     /// constraint (incl. `none` = counting off), or step the entered count value.
     fn edit_count(&mut self, delta: i32) {
         match self.count_sel {
-            // System: KO ⇄ Hi-Lo. Switching to a true-count system drops an `==` constraint (true
-            // counts are inequality-only).
+            // System: cycle through `CountSystemId::ALL` in the `delta` direction (KO → Hi-Lo →
+            // Ace-Five → wrap). Switching to a true-count system drops an `==` constraint (true counts
+            // are inequality-only).
             0 => {
-                self.count.system = match self.count.system {
-                    CountSystemId::Ko => CountSystemId::HiLo,
-                    CountSystemId::HiLo => CountSystemId::Ko,
-                };
+                self.count.system = self.count.system.cycle(delta);
                 if self.count.system.kind() == CountKind::TrueCount
                     && self.count.cmp == CountCmp::Eq
                 {

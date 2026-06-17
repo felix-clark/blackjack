@@ -1,5 +1,12 @@
 //! Definitions and systems of counting
 //!
+//! The concrete counting **systems** (the [`CountSystem`] trait, [`Ko`]/[`HiLo`]/[`AceFive`], and the
+//! runtime [`CountSystemId`] seam) live in the [`system`] submodule and are re-exported here, so the
+//! rest of the crate keeps importing them from `crate::count`. This file owns the **conditioning
+//! vocabulary** the solver acts on: the [`CountCondition`]/[`CountFrame`] constraints, the
+//! [`Penetration`] prior, the [`CountCmp`] comparator, and the `cond_*` constructors that turn a
+//! player's entered count into a constraint over the unseen pool.
+//!
 //! NOTE: I think that we might be able to do each "count" independently if we focus on the
 //! "pre-deal" count, i.e. the count before the player's initial hand and the dealer's card are
 //! shown. The realistic count would include the up-cards as well, so building a count-dependent
@@ -10,146 +17,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{card::Card, shoe::CardCol};
+use crate::card::Card;
 
-/// Which *family* a counting system belongs to — the one robust distinguisher the count-conditioning
-/// engine branches on, rather than sniffing the card→value map. A [`Running`](CountKind::Running)
-/// system (KO) is actioned on the raw integer running count; a [`TrueCount`](CountKind::TrueCount)
-/// system (Hi-Lo) is actioned on the *true count* = running count ÷ decks remaining, so its constraint
-/// is a joint inequality in `(running count, remaining-pool size)` rather than a threshold on the
-/// running count alone (see [`CountCondition`]). Carried in the count-dependent cache keys so two
-/// systems can never alias the same persisted solve.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-pub(crate) enum CountKind {
-    /// Actioned on the raw running count (KO). The condition is a threshold on the internal count `s`.
-    Running,
-    /// Actioned on the true count = running ÷ decks remaining (Hi-Lo). Necessarily *balanced*
-    /// (`full_shoe_count == 0`); the condition is a joint inequality in `(s, n)`.
-    TrueCount,
-}
-
-/// A concrete counting **system** selected at runtime, as opposed to its [`CountKind`] *family*. The
-/// generic [`CountSystem`] trait is the compile-time home of each system's behavior — its card→value
-/// [`map`](CountSystem::map), its IRC [`starting_count`](CountSystem::starting_count), and its
-/// [`KIND`](CountSystem::KIND); this enum is the runtime seam for the call sites (the trainer) that pick
-/// a system at runtime instead of monomorphizing on it. Every method here delegates to the underlying
-/// [`CountSystem`] impl, so a system *determines* its family ([`kind`](Self::kind)) and never the
-/// reverse — the inversion the family→system [`CountKind::representative_system`] default deliberately
-/// isolates.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-pub(crate) enum CountSystemId {
-    /// The unbalanced knock-out running count ([`Ko`]).
-    Ko,
-    /// The balanced Hi-Lo true count ([`HiLo`]).
-    HiLo,
-}
-
-/// Run `$body` monomorphized over the concrete [`CountSystem`] a runtime [`CountSystemId`] names. A
-/// runtime enum value cannot *be* a compile-time type, so a generic call (`solve_counted::<S>(..)`)
-/// has to recover the type through a variant→type `match` somewhere — this macro is the single place
-/// that `match` lives. `dispatch_system!(id, S => expr)` binds the type `S` to [`Ko`]/[`HiLo`] in turn
-/// and evaluates `expr` in each arm. Adding a counting system means adding one arm here and nowhere
-/// else; the call sites stay system-agnostic.
-macro_rules! dispatch_system {
-    ($id:expr, $S:ident => $body:expr) => {
-        match $id {
-            $crate::count::CountSystemId::Ko => {
-                type $S = $crate::count::Ko;
-                $body
-            }
-            $crate::count::CountSystemId::HiLo => {
-                type $S = $crate::count::HiLo;
-                $body
-            }
-        }
-    };
-}
-pub(crate) use dispatch_system;
-
-impl CountSystemId {
-    /// The family this system is actioned under ([`CountSystem::KIND`]) — running vs. true count. Read
-    /// straight off the system, the direction the type system already enforces at compile time.
-    pub(crate) fn kind(self) -> CountKind {
-        dispatch_system!(self, S => S::KIND)
-    }
-
-    /// The count value of `card` under this system ([`CountSystem::map`]).
-    pub(crate) fn map(self, card: &Card) -> i16 {
-        dispatch_system!(self, S => S::map(card))
-    }
-
-    /// The initial running count (IRC) a fresh `n`-deck shoe starts at under this system
-    /// ([`CountSystem::starting_count`]).
-    pub(crate) fn starting_count(self, n_decks: u8) -> i16 {
-        dispatch_system!(self, S => S::starting_count(n_decks))
-    }
-
-    /// Short display name: `KO` or `Hi-Lo`.
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            CountSystemId::Ko => "KO",
-            CountSystemId::HiLo => "Hi-Lo",
-        }
-    }
-}
-
-// NOTE: If this ends up not needing to be anything more than a mapping, we can ditch the trait
-// formalism and just pass in an arbitrary function Card -> i8 to CountState.
-pub(crate) trait CountSystem {
-    /// Which count family this system belongs to. [`Running`](CountKind::Running) systems (KO) are
-    /// actioned on the raw running count; [`TrueCount`](CountKind::TrueCount) systems (Hi-Lo) on the
-    /// true count. The engine branches on this rather than inspecting [`map`](CountSystem::map).
-    const KIND: CountKind;
-
-    /// The initial running count the *player* starts from (the system's IRC). Zero for balanced
-    /// counts, so the default is implemented. Unbalanced systems (e.g. KO) offset by deck count.
-    fn starting_count(_n_decks: u8) -> i16 {
-        0
-    }
-
-    /// The mapping from card to count.
-    /// NOTE: i16 is used because the space is necessary for total counts, and it's easier to
-    /// maintain the per-card counts as well.
-    /// NOTE: We could also implement this as an array of i8s, of length 10, corresponding to the
-    /// internal CardCol array. This would probably optimize.
-    fn map(card: &Card) -> i16;
-
-    /// Total count value of a full `n`-deck shoe, `F = Σ_r v_r · f_r`. Zero for balanced systems
-    /// (every `+v` rank is matched by a `−v` rank); `+4n` for KO.
-    fn full_shoe_count(n_decks: u8) -> i16 {
-        CardCol::from_decks(n_decks)
-            .iter()
-            .map(|(card, quant)| Self::map(&card) * quant as i16)
-            .sum()
-    }
-
-    /// The system's **pivot constant** `P = starting_count(n) + full_shoe_count(n)`. This is the
-    /// one number the internal⇄external conversion turns on: `external = P − internal`. (KO: `4`;
-    /// any balanced system: `0`.)
-    fn pivot(n_decks: u8) -> i16 {
-        Self::starting_count(n_decks) + Self::full_shoe_count(n_decks)
-    }
-
-    /// Convert the player's *external* running count to the deck's *internal* count. This is the
-    /// bridge the solver needs: the DP conditions on the internal count, while the player only ever
-    /// knows the external one. [`CountShoe::from_external`] (the TUI's entry point) routes through
-    /// here, so it is the one production home of the conversion. Inverse of [`internal_to_external`].
-    ///
-    /// [`internal_to_external`]: CountSystem::internal_to_external
-    fn external_to_internal(n_decks: u8, external: i16) -> i16 {
-        Self::pivot(n_decks) - external
-    }
-
-    /// Convert the deck's *internal* running count (count value of the cards still in the shoe) to
-    /// the *external* running count the player tallies. Inverse of [`external_to_internal`]; only the
-    /// conversion round-trip cross-checks need this direction, hence `#[cfg(test)]`.
-    ///
-    /// [`external_to_internal`]: CountSystem::external_to_internal
-    #[cfg(test)]
-    fn internal_to_external(n_decks: u8, internal: i16) -> i16 {
-        Self::pivot(n_decks) - internal
-    }
-}
+mod system;
+pub(crate) use system::{
+    AceFive, CountKind, CountSystem, CountSystemId, HiLo, Ko, dispatch_system,
+};
 
 /// Cards per deck — the true-count normalizer (`TC = cards_per_deck · external / n`).
 pub(crate) const CARDS_PER_DECK: i16 = 52;
@@ -298,55 +171,11 @@ pub(crate) enum CountCmp {
     Le,
 }
 
-/// The unbalanced knock-out system
-pub(crate) struct Ko {}
-
-impl CountSystem for Ko {
-    const KIND: CountKind = CountKind::Running;
-
-    /// The initial running count for this system
-    fn starting_count(n_decks: u8) -> i16 {
-        4 - 4 * n_decks as i16
-    }
-
-    fn map(card: &Card) -> i16 {
-        match card {
-            Card::Ace | Card::Ten => -1,
-            Card::Pip(r) => {
-                if r <= &7 {
-                    1
-                } else {
-                    0
-                }
-            }
-        }
-    }
-}
-
-/// The balanced Hi-Lo system
-pub(crate) struct HiLo {}
-
-impl CountSystem for HiLo {
-    const KIND: CountKind = CountKind::TrueCount;
-
-    fn map(card: &Card) -> i16 {
-        match card {
-            Card::Ace | Card::Ten => -1,
-            Card::Pip(r) => {
-                if r <= &6 {
-                    1
-                } else {
-                    0
-                }
-            }
-        }
-    }
-}
-
 /// The unseen pool's [`CountCondition`] for a player external running count `external` compared with
 /// `cmp`, under system `S` and `n_decks`. The conversion inverts inequalities: a player count `≥ C`
 /// means the unseen pool's internal count is `≤ pivot − C` (more high cards seen tilts the deck the
-/// other way). Shared by [`CountShoe::from_external`] and [`CountShoe::band`].
+/// other way). Shared by [`CountShoe::from_external`](crate::countshoe::CountShoe) and
+/// [`CountShoe::band`](crate::countshoe::CountShoe).
 pub(crate) fn cond_from_external<S: CountSystem>(
     n_decks: u8,
     external: i16,
