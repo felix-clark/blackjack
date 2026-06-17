@@ -2,6 +2,8 @@
 //! the small formatting helpers they share. Extends `impl App` (defined in [`super::app`]);
 //! [`render`](App::render) is the entry point the [`event_loop`](App::event_loop) draws each frame.
 
+use std::collections::HashMap;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -141,20 +143,31 @@ impl App {
                     None => ("\u{00b7}".to_string(), Style::default().fg(Color::DarkGray)),
                     Some(col) => match col.summary.get(&cat) {
                         Some(cell) => {
-                            // The headline move, with a one-char suffix in the 3-wide cell: `*` when the
-                            // play varies by composition at this count (takes priority — a composition-
-                            // dependent cell has two near-tied EVs, so it is essentially always count-
-                            // dependent too, and `*` is the stronger signal), else `°` when the play flips
-                            // with the running count in the notable window. The popup carries both. The
-                            // leading space keeps the letter centered (" H*" / " H°"); a bare letter
-                            // centers to " H " on its own.
+                            // The headline move (one letter, or a two-letter fallback label like
+                            // "DS"/"RP", see `move_label`) plus a one-char suffix in the 3-wide cell:
+                            // `*` when the play varies by composition at this count (takes priority —
+                            // a composition-dependent cell has two near-tied EVs, so it is essentially
+                            // always count-dependent too, and `*` is the stronger signal), else `°`
+                            // when the play flips with the running count in the notable window. The
+                            // popup carries both. A lone letter gets a leading space so it (and its
+                            // suffix) stays centered (" H " / " H*"); a two-letter label is left-shifted
+                            // by one so the suffix still fits the 3-wide column ("DS" / "DS*").
                             let mv = cell.headline;
-                            let text = if cell.composition_dependent {
-                                format!(" {mv}*")
+                            let core = move_label(mv, &cell.move_evs);
+                            let suffix = if cell.composition_dependent {
+                                "*"
                             } else if self.index_dependent(cat, upcard) {
-                                format!(" {mv}\u{00b0}")
+                                "\u{00b0}"
                             } else {
-                                format!("{mv}")
+                                ""
+                            };
+                            let text = if core.len() == 2 {
+                                format!("{core}{suffix}")
+                            } else {
+                                format!(
+                                    "{}{core}{suffix}",
+                                    if suffix.is_empty() { "" } else { " " }
+                                )
                             };
                             (text, Style::default().fg(move_color(mv)))
                         }
@@ -1160,6 +1173,27 @@ fn pack_hand_labels(hands: &[CardCol], budget: usize) -> (String, usize) {
         shown += 1;
     }
     (labels[..shown].join(" "), labels.len() - shown)
+}
+
+/// The chart cell's letter(s) for a headline move. A start-only headline (Double or Surrender) that
+/// would fall through to something other than Hit gets a second letter naming that fallback — "DS"
+/// (double if allowed, else stand), "RP" (surrender if allowed, else split) — so the cell reads
+/// correctly once the top-level move is gone (a later decision, or a ruleset that omits it). Hit is
+/// the unwritten default, so a fallback of Hit (and any non-start-only headline) stays a lone letter.
+fn move_label(headline: Move, move_evs: &HashMap<Move, f64>) -> String {
+    let fallback = matches!(headline, Move::Double | Move::Surrender)
+        .then(|| {
+            move_evs
+                .iter()
+                .filter(|&(&mv, _)| mv != headline)
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(&mv, _)| mv)
+        })
+        .flatten();
+    match fallback {
+        Some(fb) if fb != Move::Hit => format!("{headline}{fb}"),
+        _ => format!("{headline}"),
+    }
 }
 
 fn move_name(mv: Move) -> &'static str {
