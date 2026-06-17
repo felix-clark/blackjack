@@ -952,8 +952,15 @@ pub(super) fn compute_edge_key_count(n: u8, kind: CountKind, rules: &Ruleset) ->
 /// This is exact whenever `tail(c)` is the same occurrence-weighted average over the tail that `dist`
 /// describes (the engine guarantees this: `true_count_distribution`'s suffix sum *is* `P(TC ≥ c)`). The
 /// banded value is monotone increasing in `c`, so a single ascending scan finds the first non-negative
-/// band — the genuine turnover count, free of the tail's upward bias. `tail` is evaluated once per
-/// integer in `lo..=hi` (each a heavy conditioned solve for the edge; cheap for insurance).
+/// band — the genuine turnover count, free of the tail's upward bias.
+///
+/// Because of that monotonicity, the **highest** band carrying any occurrence mass is the most
+/// favorable band there is, so it is probed first: if even that band stays negative the crossing cannot
+/// exist and the answer is `None` after a single band evaluation — a count system that never reaches an
+/// advantage (or one whose statistic carries no leverage here) skips the whole O(window) scan of heavy
+/// solves. `tail` is otherwise evaluated once per integer in `lo..=hi` (each a heavy conditioned solve
+/// for the edge; cheap for insurance); the short-circuit probe is memoized so it is never recomputed by
+/// the scan in the crossing case.
 pub(super) fn banded_crossing(
     lo: i16,
     hi: i16,
@@ -963,9 +970,33 @@ pub(super) fn banded_crossing(
     if hi <= lo {
         return None;
     }
-    let mut cur = tail(lo);
+    // Memoize `tail` over the window so the top-band short-circuit below — which evaluates a band the
+    // ascending scan also reaches — never pays for any count twice, preserving the once-per-integer
+    // contract.
+    let mut memo: Vec<Option<f64>> = vec![None; (hi - lo + 1) as usize];
+    let mut tail_at = |c: i16| -> f64 {
+        let slot = &mut memo[(c - lo) as usize];
+        match *slot {
+            Some(v) => v,
+            None => {
+                let v = tail(c);
+                *slot = Some(v);
+                v
+            }
+        }
+    };
+    // Probe the highest mass-carrying band first; monotonicity makes a negative result here conclusive.
+    // `?` also returns `None` when no band carries mass — the same answer the scan would reach.
+    let top = (lo..hi)
+        .rev()
+        .find(|&c| tail_mass(dist, c) - tail_mass(dist, c + 1) > 1e-12)?;
+    let (sc, sc1) = (tail_mass(dist, top), tail_mass(dist, top + 1));
+    if (sc * tail_at(top) - sc1 * tail_at(top + 1)) / (sc - sc1) < 0.0 {
+        return None;
+    }
+    let mut cur = tail_at(lo);
     for c in lo..hi {
-        let next = tail(c + 1);
+        let next = tail_at(c + 1);
         let (sc, sc1) = (tail_mass(dist, c), tail_mass(dist, c + 1));
         let w = sc - sc1; // occurrence mass of band `c` itself
         if w > 1e-12 {
