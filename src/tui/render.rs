@@ -1175,13 +1175,18 @@ fn pack_hand_labels(hands: &[CardCol], budget: usize) -> (String, usize) {
     (labels[..shown].join(" "), labels.len() - shown)
 }
 
-/// The chart cell's letter(s) for a headline move. A start-only headline (Double or Surrender) that
-/// would fall through to something other than Hit gets a second letter naming that fallback — "DS"
-/// (double if allowed, else stand), "RP" (surrender if allowed, else split) — so the cell reads
-/// correctly once the top-level move is gone (a later decision, or a ruleset that omits it). Hit is
-/// the unwritten default, so a fallback of Hit (and any non-start-only headline) stays a lone letter.
+/// When false, a fallback of Hit is left implicit (a lone "D"/"R") rather than spelled out as
+/// "DH"/"RH"; Hit is the unwritten chart default, so suppressing it keeps the grid quieter. Flip to
+/// `true` to always show the fallback letter. See [`move_label`].
+const SHOW_HIT_FALLBACK: bool = false;
+
+/// The chart cell's letter(s) for a headline move. A start-only headline (Double or Surrender) gets
+/// a second letter naming the move it falls through to once the top-level option is gone (a later
+/// decision, or a ruleset that omits it) — "DS" (double if allowed, else stand), "RP" (surrender,
+/// else split), and so on. A Hit fallback is suppressed unless [`SHOW_HIT_FALLBACK`] is set; every
+/// other headline stays a lone letter.
 fn move_label(headline: Move, move_evs: &HashMap<Move, f64>) -> String {
-    let fallback = matches!(headline, Move::Double | Move::Surrender)
+    match matches!(headline, Move::Double | Move::Surrender)
         .then(|| {
             move_evs
                 .iter()
@@ -1189,9 +1194,9 @@ fn move_label(headline: Move, move_evs: &HashMap<Move, f64>) -> String {
                 .max_by(|a, b| a.1.total_cmp(b.1))
                 .map(|(&mv, _)| mv)
         })
-        .flatten();
-    match fallback {
-        Some(fb) if fb != Move::Hit => format!("{headline}{fb}"),
+        .flatten()
+    {
+        Some(fb) if SHOW_HIT_FALLBACK || fb != Move::Hit => format!("{headline}{fb}"),
         _ => format!("{headline}"),
     }
 }
