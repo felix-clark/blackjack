@@ -51,7 +51,7 @@ The only place `ratatui` is used. Organised into top-level `Tab`s — **strategy
 
 - `config` — the solve configuration (`ShoeChoice`, `CountSetting`) and the per-column solve entry; this is where a plain `CardCol` is swapped for a `CountShoe` when a count is active.
 - `column` — a solved up-card `Column` and the generic `solve_on`.
-- `index` — the count-index subsystem (the running counts at which a cell's play flips).
+- `index` — the count-index subsystem (the running counts at which a cell's play flips), and the footer "+EV from count" key counts (the lowest count at which the player edge / insurance turn positive, found by per-band marginal differencing — `banded_crossing`).
 - `training` — the training-tab model and game-simulation loop.
 - `app` — the `App` state, the async solve lifecycle (one worker thread per up-card, results streamed over an `mpsc` channel and tagged with a monotonic `epoch` so a rules/deck/count change discards stale results), and the event loop.
 - `input` — keyboard input and the modal field editors.

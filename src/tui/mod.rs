@@ -18,16 +18,16 @@
 //!
 //! The interface is organised into top-level [`Tab`]s: the **strategy** tab (the chart described above)
 //! and a **training** tab ([`training`]) — a hand-by-hand blackjack drill against the live shoe for
-//! practising basic strategy, count-indexed deviations, and the running count. The training tab's game
-//! engine is left as a documented seam; the harness (tab switch, layout, rendering, key routing) is wired
-//! up around it.
+//! practising basic strategy, count-indexed deviations, and the running count. The game engine (deal,
+//! player moves, dealer play, scoring, reshuffle) plays full rounds against the live shoe; dealing from a
+//! count-target shoe instead of a fresh one remains the seam for a future at-a-given-count drill mode.
 //!
 //! ## Module map
 //!
 //! - [`config`] — the solve configuration (`ShoeChoice`, `CountSetting`) and the per-column solve entry.
 //! - [`column`] — a solved up-card column (`Column`) and the generic `solve_on`.
 //! - [`index`] — the count-index subsystem (the running counts at which a cell's play flips).
-//! - [`training`] — the training-tab model and the (stubbed) game-simulation seam.
+//! - [`training`] — the training-tab model and the hand-by-hand game-simulation loop.
 //! - [`app`] — the [`App`] state, the async solve lifecycle, and the event loop.
 //! - [`input`] — keyboard input and the modal field editors.
 //! - [`render`] — all drawing.

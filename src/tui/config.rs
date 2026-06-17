@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
 use crate::count::{
-    CountCmp, CountKind, CountSystem, CountSystemId, HiLo, Ko, Penetration, TC_HALF_UNITS,
-    cond_for_frame, dispatch_system,
+    CountCmp, CountKind, CountSystem, CountSystemId, Penetration, TC_HALF_UNITS, cond_for_frame,
+    dispatch_system,
 };
 use crate::countshoe::CountShoe;
 use crate::diskcache;
@@ -184,10 +184,13 @@ impl ShoeChoice {
     /// is a property of the shoe and the system), so it is computed once per recompute.
     ///
     /// Cheap: insurance EV is `3·P(Ten under) − 1`, a single count-conditioned [`Shoe::draw_prob`] read
-    /// (no EV solve), and it is monotone increasing in the count — so a single ascending scan over the
-    /// occurrence-distribution support returns the first count that pays. For Hi-Lo (no exact-count
-    /// conditioning) the threshold is read on the one-sided `TC ≥ c` tail the count-index uses, scanning
-    /// only the non-negative side where the advantage appears.
+    /// (no EV solve). It is found the same way the edge key count is — the **per-band marginal** crossing,
+    /// reconstructed by differencing the inequality-conditioned (`count ≥ c`) insurance EVs against the
+    /// occurrence masses ([`banded_crossing`]). For a running count an integer count is already exact, so
+    /// the differencing reproduces the exact-count crossing; for a true count (measure-zero) it is the
+    /// only route. The marginal is what the decision turns on — the naive `≥ c` tail crossing reads low
+    /// (a misleading +EV at e.g. `TC ≥ 0`, reflecting the time really spent well above 0). Both families
+    /// share this one pathway; only the occurrence axis and the half-unit cutoff scaling differ.
     ///
     /// [`Shoe::draw_prob`]: crate::shoe::Shoe::draw_prob
     pub(super) fn insurance_key_count(self, system: CountSystemId) -> Option<i16> {
@@ -196,38 +199,26 @@ impl ShoeChoice {
         };
         let up = Card::Ace;
         let pen = COUNT_PENETRATION;
-        match system.kind() {
-            CountKind::Running => {
-                // Scan only the realistically-reachable counts (same occurrence-window trim the edge
-                // key-count uses). The raw distribution's extreme low-mass tails condition on an almost
-                // empty pool, whose exact-count draw distribution is degenerate and gives a spurious
-                // crossing — so trimming them is what keeps this a genuine threshold.
-                let dist = CountShoe::external_count_distribution::<Ko>(n, pen);
-                let (lo, hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
-                dist.iter()
-                    .filter(|&&(c, _)| (lo..=hi).contains(&c))
-                    .find_map(|&(c, _)| {
-                        let shoe = count_shoe_for_insurance::<Ko>(n, c, CountCmp::Eq, up, pen);
-                        (insurance_after_up(shoe, up) > 0.0).then_some(c)
-                    })
-            }
-            CountKind::TrueCount => {
-                // A true count is measure-zero, so (unlike KO's exact `Eq` counts) there is no marginal
-                // insurance EV to read off directly. Recover it the same way the edge key count does:
-                // difference the inequality-conditioned `TC ≥ c` insurance EVs against the occurrence
-                // masses ([`banded_crossing`]). Insurance EV is affine in `P(Ten)`, so differencing the
-                // tail EVs yields the exact per-band marginal — the count at which insurance *itself*
-                // turns positive, not the `≥ c` tail (which reads low, e.g. a misleading +EV at TC ≥ 0
-                // that really reflects the time spent well above 0).
-                let dist = CountShoe::true_count_distribution::<HiLo>(n, pen);
-                let (lo, hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
-                banded_crossing(lo, hi, &dist, |c| {
-                    let cutoff = TC_HALF_UNITS * c;
-                    let shoe = count_shoe_for_insurance::<HiLo>(n, cutoff, CountCmp::Ge, up, pen);
-                    insurance_after_up(shoe, up)
-                })
-            }
-        }
+        // The occurrence axis the bands live on (the running count itself, or the integer true count),
+        // and whether the entered count is stored in half-units (true counts) or raw (running counts).
+        let (dist, half_units) = match system.kind() {
+            CountKind::Running => (
+                dispatch_system!(system, S => CountShoe::external_count_distribution::<S>(n, pen)),
+                false,
+            ),
+            CountKind::TrueCount => (
+                dispatch_system!(system, S => CountShoe::true_count_distribution::<S>(n, pen)),
+                true,
+            ),
+        };
+        let (lo, hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
+        banded_crossing(lo, hi, &dist, |c| {
+            let value = if half_units { TC_HALF_UNITS * c } else { c };
+            dispatch_system!(system, S => insurance_after_up(
+                count_shoe_for_insurance::<S>(n, value, CountCmp::Ge, up, pen),
+                up,
+            ))
+        })
     }
 }
 
@@ -273,18 +264,20 @@ pub(super) const SPLIT_OPTIONS: [u8; 7] = [0, 1, 2, 3, 4, 6, 8];
 mod tests {
     use super::*;
 
-    /// The insurance key counts land on their canonical published indices. KO is a running-count system,
-    /// so its key count is a genuine **exact-count** crossing; single deck pins to the textbook "take
-    /// insurance at running count ≥ +3", confirming both the `≥ 1/3 tens` crossing and the
-    /// occurrence-window trim that drops the degenerate extreme-count tails (without it the scan walks off
-    /// into nonsense like RC −138).
+    /// The insurance key counts land on their canonical published indices. Both families now go through
+    /// the one [`banded_crossing`] pathway (the per-band marginal crossing). For KO the integer running
+    /// counts are already exact, so the differencing reproduces the genuine exact-count crossing — single
+    /// deck pins to the textbook "take insurance at running count ≥ +3" (confirming both the `≥ 1/3 tens`
+    /// crossing and the occurrence-window trim that drops the degenerate extreme-count tails, without
+    /// which the scan walks off into nonsense like RC −138).
     ///
-    /// Hi-Lo is a true count (measure-zero, no exact-count conditioning), so its key count is the
-    /// **per-band marginal** crossing recovered by differencing the `TC ≥ c` tails against the occurrence
-    /// masses ([`banded_crossing`]). Multi-deck pins to the Illustrious-18 insurance index of +3 — the
+    /// For Hi-Lo (a true count: measure-zero, no exact-count conditioning) the same differencing is the
+    /// *only* route to the marginal. Multi-deck pins to the Illustrious-18 insurance index of +3 — the
     /// value the naive `≥ c` tail crossing badly under-reported (it returned a meaningless +0, "take
-    /// insurance off the top"). `#[ignore]`: builds a count shoe per scanned count; run `--release
-    /// --ignored`. (No EV solve, so far cheaper than the count-conditioned chart tests, but still seconds.)
+    /// insurance off the top"). That KO and Hi-Lo both hit their published indices through the shared
+    /// pathway is the regression guard on the unification. `#[ignore]`: builds a count shoe per scanned
+    /// count; run `--release --ignored`. (No EV solve, so far cheaper than the count-conditioned chart
+    /// tests, but still seconds.)
     #[test]
     #[ignore]
     fn insurance_key_counts_match_published_indices() {
@@ -296,7 +289,7 @@ mod tests {
         assert_eq!(
             ShoeChoice::Decks(6).insurance_key_count(CountSystemId::HiLo),
             Some(3),
-            "six-deck Hi-Lo insurance index is the Illustrious-18 +3"
+            "six-deck Hi-Lo insurance index is +3"
         );
     }
 }

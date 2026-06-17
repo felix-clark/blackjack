@@ -625,7 +625,7 @@ impl Training {
         }
     }
 
-    // ----- Provided primitives (not the simulation; the stubs below build on these) -----------------
+    // ----- Shoe/count primitives the game-simulation methods below build on -------------------------
 
     /// Rebuild the shoe to a full `n_decks` and reset the running count to the KO initial count. This is
     /// the reshuffle; the simulation should call it whenever penetration is reached (see
