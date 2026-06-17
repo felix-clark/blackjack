@@ -302,6 +302,12 @@ pub(crate) struct CellInfo {
     pub(crate) move_evs: HashMap<Move, f64>,
     /// The chart's recommended move (argmax of `move_evs`).
     pub(crate) headline: Move,
+    /// The cell's game-time decision-reaching mass: `P(player faces this decision)`, summed over the
+    /// decision population (the two-card members, or all members for the multi-card-only categories).
+    /// This is the same population `move_evs` is pooled over, so it doubles as the hand-frequency
+    /// weight when ranking cells (e.g. the count-index leverage score in [`crate::tui`]). A two-card
+    /// seed across a full chart sums to ~1 over all cells.
+    pub(crate) reach_mass: f64,
     /// The EV-optimal move genuinely varies across reachable compositions — not merely because a
     /// start-only move is unavailable to the longer hands (that legality difference is excluded).
     pub(crate) composition_dependent: bool,
@@ -402,6 +408,7 @@ fn cell_info(
 
     let move_evs = pooled_move_evs(decision, ev_tree, reach);
     let headline = best_move(&move_evs);
+    let reach_mass = decision.iter().map(|h| reach_of(h, reach)).sum();
     let composition_dependent = composition_dependent(members, ev_tree, reach);
 
     // Breakdown: every reachable composition under its own best legal move. Fall back to the
@@ -439,6 +446,7 @@ fn cell_info(
     CellInfo {
         move_evs,
         headline,
+        reach_mass,
         composition_dependent,
         breakdown,
     }

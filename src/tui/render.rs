@@ -17,6 +17,7 @@ use crate::shoe::CardCol;
 
 use super::app::{App, Mode};
 use super::config::ShoeChoice;
+use super::index::INDEX_LEVERAGE_CUTOFF;
 use super::training::{Phase, Training};
 use super::{MOVE_ORDER, PANES, Pane, Tab, UP_CARDS};
 
@@ -346,6 +347,44 @@ impl App {
                     ))),
                     Some(ci) => {
                         let (wmin, wmax) = (report.lo, report.hi);
+                        // Leverage: the occurrence-weighted EV this deviation earns per round, as a
+                        // percentage of one bet (values run ~0.001%..0.5%). Printed directly above the
+                        // ladder it scores, and only when that ladder actually *has* an index to play (a
+                        // flip in the window) — a constant "any" run has no deviation to weigh, so its
+                        // leverage (~0) is noise. Position identifies which ladder it belongs to, so the
+                        // line needs no "headline"/"backup" label. Highlighted and flagged `°` (mirroring
+                        // the chart marker) when it clears the cutoff.
+                        let lev_line = |lev: f64, indent: usize| {
+                            let hot = lev >= INDEX_LEVERAGE_CUTOFF;
+                            let pad = " ".repeat(indent);
+                            Line::from(Span::styled(
+                                format!(
+                                    "{pad}leverage {:.3}%{}",
+                                    lev * 100.0,
+                                    if hot { "  \u{00b0}" } else { "" }
+                                ),
+                                Style::default().fg(if hot {
+                                    Color::Yellow
+                                } else {
+                                    Color::DarkGray
+                                }),
+                            ))
+                        };
+                        // A flip lives in a ladder iff it coalesces to more than one run (a single run is
+                        // the move held across the whole window — no count dependence to display).
+                        let primary_has_index = ci.primary.len() >= 2;
+                        let fallback_has_index = ci.fallback.len() >= 2;
+                        // The commonly-held count band line is intentionally omitted: with the band now
+                        // calibrated by occurrence mass it is the same `mark_lo..mark_hi` on every popup,
+                        // so repeating it per-cell adds clutter without telling the reader anything new.
+                        // Re-enable here if the band ever becomes cell-specific.
+                        // lines.push(Line::from(Span::styled(
+                        //     format!("  common {axis}: {}..{}", report.mark_lo, report.mark_hi),
+                        //     Style::default().fg(Color::DarkGray),
+                        // )));
+                        if primary_has_index {
+                            lines.push(lev_line(ci.leverage, 2));
+                        }
                         for &(mv, lo, hi) in &ci.primary {
                             lines
                                 .push(rc_run_line(mv, lo, hi, wmin, wmax, here, axis, ci.basic, 2));
@@ -361,6 +400,11 @@ impl App {
                                 label,
                                 Style::default().fg(Color::DarkGray),
                             )));
+                            // Backup H/S leverage sits inside the fallback menu, indented with its runs,
+                            // and only when that ladder itself has a flip to play.
+                            if fallback_has_index {
+                                lines.push(lev_line(ci.fallback_leverage, 4));
+                            }
                             for &(mv, lo, hi) in &ci.fallback {
                                 lines.push(rc_run_line(
                                     mv,

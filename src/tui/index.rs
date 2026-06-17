@@ -10,11 +10,13 @@ use std::sync::mpsc::Sender;
 use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
-use crate::count::{CountCmp, CountKind, CountSystem, HiLo, Ko, TC_HALF_UNITS};
+use crate::count::{
+    CountCmp, CountCondition, CountFrame, CountKind, CountSystem, HiLo, Ko, TC_HALF_UNITS,
+};
 use crate::countshoe::CountShoe;
 use crate::diskcache;
 use crate::hand::{HandCategory, Move};
-use crate::reach::{reach_weights, summarize_cells};
+use crate::reach::{CellInfo, reach_weights, summarize_cells};
 use crate::rules::Ruleset;
 use crate::shoe::Shoe;
 use crate::simulation::build_evs;
@@ -107,6 +109,35 @@ const INDEX_MARKER_TAIL_MASS: f64 = 0.10;
 /// outside it are suppressed on the chart but still shown in full in the always-exhaustive popup.
 const INDEX_MARKER_PIVOT_MARGIN: i16 = 5;
 
+/// Leverage cutoff for the chart `°` count-index marker: a cell is marked when *either* of its
+/// [`leverage`](CategoryIndex::leverage) (headline) or [`fallback_leverage`](CategoryIndex::fallback_leverage)
+/// (the Hit/Stand backup behind a start-only headline) clears this — the occurrence-weighted EV the
+/// deviation earns per round, `Σ_c P(up|c)·P(hold|c)·ΔEV(c)·P(c)`. Expressed in EV-per-round
+/// units (one bet = 1.0), so it is a genuine importance threshold rather than the old "is the flip in a
+/// common count range" test: a deviation that flips inside the common band but barely changes EV no
+/// longer earns a marker, while a high-EV one does. Purely a *display* filter (the count-conditioned
+/// solves are shared across all cells and forced by the seed grid either way, so this does not trim the
+/// index search) — tune it freely; one constant, no recompute.
+///
+/// Calibrated by [`tests::index_leverage_ranking`] at the multi-deck shoes most players use. At six
+/// decks `2.0e-5` marks the seven highest-leverage cells — 15vT, 16vT (both scored on their *backup*
+/// stand-vs-hit, since the surrender headline barely moves), 12v4, 14vT, 12v3, the 10,10-vs-6 split,
+/// and 11vA — deliberately tuned to surface only the major, memorize-first deviations rather than the
+/// long tail of fractional flips (the cutoff was raised from the original `1.0e-5`, which marked ~16
+/// cells, to keep the chart legible for a non-expert counter). Raising it further to `5.0e-5` would
+/// trim to the top four (15vT, 16vT, 12v4, 14vT) and is a reasonable choice if even seven is too busy;
+/// it still surfaces the headline plays on larger shoes while quieting the single-deck noise. Two ingredients
+/// make this list match the books where a pure headline-EV score did not: (1) **up-card frequency** —
+/// the per-column reach mass is conditional on the up-card, so without the count-conditioned `P(up|c)`
+/// weight ([`ColumnEval::up_cond`]) a Ten deviation (faced ~4× as often) tied an Ace one; (2)
+/// **backup-play leverage** — the memorize-worthy 16vT/15vT
+/// deviation is the H/S decision *behind* surrender, which the headline score alone scores at ~0. The
+/// leverage scale drops ~5× from one deck to six (single-deck play genuinely rewards far more
+/// deviations and faces a wider count spread), so a fixed EV bar legitimately marks many more cells on
+/// a single deck; that is expected, not a miscalibration. Eight decks is flatter still but close enough
+/// that its top handful clears the same bar.
+pub(super) const INDEX_LEVERAGE_CUTOFF: f64 = 2.0e-5;
+
 /// Whether a move is only available as the opening action on a two-card hand (so it disappears once the
 /// hand has been hit). These are exactly the headline moves a [`CategoryIndex`] gives a *fallback*
 /// Hit/Stand ladder for: "surrender below RC −1" is incomplete without "…and once you can't surrender,
@@ -117,13 +148,17 @@ fn is_start_only(mv: Move) -> bool {
 
 /// Whether an ascending `(move, lo, hi)` run list has a play change whose *flip point* — the running
 /// count at which the later move takes over, i.e. the `lo` of each run after the first — falls inside
-/// the inclusive band `[band_lo, band_hi]`. Used by the chart marker to ignore flips that only happen
-/// out in the occurrence tails. The band is generally asymmetric and off-zero (an unbalanced count's
-/// common range does not straddle 0), so it is passed explicitly rather than as a `±` half-width.
+/// the inclusive band `[band_lo, band_hi]`. The band is generally asymmetric and off-zero (an
+/// unbalanced count's common range does not straddle 0), so it is passed explicitly rather than as a
+/// `±` half-width.
 ///
 /// This keys on the boundary, not on which moves are *visible* in the band: a Hit→Stand index at the
 /// band's lower edge fires even though its Hit leg lives entirely below the band. Counting distinct
 /// in-band moves missed exactly that case — one leg of an in-band flip can sit just outside it.
+///
+/// The chart `°` marker now keys on [`CategoryIndex::is_leveraged`] (occurrence-weighted EV), not this
+/// rarity band; this remains as the band-coverage check the marker-band regression tests assert on.
+#[cfg(test)]
 fn flips_in_band(runs: &[(Move, i16, i16)], band_lo: i16, band_hi: i16) -> bool {
     runs.iter()
         .skip(1)
@@ -147,19 +182,49 @@ pub(super) struct CategoryIndex {
     pub(super) fallback: Vec<(Move, i16, i16)>,
     pub(super) basic: Option<Move>,
     pub(super) basic_fallback: Option<Move>,
+    /// The cell's **primary** count-index leverage: the EV the *headline* deviation earns per round,
+    /// weighting the gain over basic strategy by how often the player faces it — both the hand and the
+    /// up-card (`P(up) · P(hold hand | up) · Σ_c ΔEV(c)·P(c)`; see [`ColumnEval::leverage`]). Including
+    /// the up-card frequency is what makes leverage a genuine cross-column quantity — a deviation
+    /// against a Ten (faced four times as often as any other up-card) outranks the same-size deviation
+    /// against an Ace, matching published index-play rankings. This is one of the two axes the chart `°`
+    /// marker prioritizes by ([`is_leveraged`](Self::is_leveraged)). Filled by [`compute_index_report`];
+    /// `0` for a cell with no headline count-dependence.
+    pub(super) leverage: f64,
+    /// The cell's **fallback** (Hit-vs-Stand) leverage, computed identically but over the Hit/Stand
+    /// ladder behind a start-only headline move. For a cell whose basic play is Surrender (16vT, 15vT)
+    /// or Double (hard 10/11 vs a high card), the headline deviation is often worth little — the
+    /// surrender/double EV barely moves with the count — yet the *backup* "if you can't surrender,
+    /// stand at …" decision is one of the highest-leverage plays there is, and must be memorized. The
+    /// primary score alone misses it (it tracks only the headline), so this scores the H/S ladder
+    /// separately; the marker fires when *either* clears the cutoff. `0` when there is no start-only
+    /// headline (then the primary ladder already is the H/S decision).
+    pub(super) fallback_leverage: f64,
 }
 
 impl CategoryIndex {
     /// The cell's right play genuinely shifts with the running count within the *notable* band
-    /// `[band_lo, band_hi]` — what the chart `°` marker keys on: either the headline flips or there is a
-    /// Hit/Stand flip behind a start-only headline move, somewhere in the band. A ladder that is
-    /// constant across the band (its only flips are out in the occurrence tails) is treated as not
-    /// count-dependent *for display*; the popup still renders the whole ladder. The band is the
-    /// report's [`mark_lo`..=`mark_hi`](IndexReport), tracking the deck count and penetration (see
+    /// `[band_lo, band_hi]`: either the headline flips or there is a Hit/Stand flip behind a start-only
+    /// headline move, somewhere in the band. The chart `°` marker no longer keys on this (it uses
+    /// [`is_leveraged`](Self::is_leveraged) — occurrence-weighted EV); this stays as the band-coverage
+    /// check the marker-band regression tests assert. The band is the report's
+    /// [`mark_lo`..=`mark_hi`](IndexReport), tracking deck count and penetration (see
     /// [`INDEX_MARKER_TAIL_MASS`] and [`INDEX_MARKER_PIVOT_MARGIN`]).
+    #[cfg(test)]
     pub(super) fn count_dependent_in_band(&self, band_lo: i16, band_hi: i16) -> bool {
         flips_in_band(&self.primary, band_lo, band_hi)
             || flips_in_band(&self.fallback, band_lo, band_hi)
+    }
+
+    /// Whether this cell's count-index leverage clears `cutoff` — the cue the chart `°` marker keys on.
+    /// Either ladder qualifies: the [`primary`](Self::leverage) headline deviation *or* the
+    /// [`fallback`](Self::fallback_leverage) Hit/Stand decision behind a start-only headline (so 16vT's
+    /// "stand if you can't surrender" earns a marker even though its surrender headline barely moves).
+    /// Prioritizing by leverage (EV earned, occurrence-weighted) rather than mere in-band
+    /// count-dependence keeps the chart's markers on the handful of deviations that actually matter at a
+    /// glance; the popup still renders the full ladder for every cell regardless.
+    pub(super) fn is_leveraged(&self, cutoff: f64) -> bool {
+        self.leverage.max(self.fallback_leverage) >= cutoff
     }
 
     /// The distinct start-only moves the primary ladder recommends somewhere (so the popup can label the
@@ -333,6 +398,20 @@ struct ColumnEval {
     /// Per index-count `ext`: the per-`ext` chart summary read by the ladders (WoO-merged exact-count for
     /// Running; the one-sided `TC ≥/≤ ext` conditioned column for TrueCount).
     summaries: HashMap<i16, ColumnSummary>,
+    /// The occurrence distribution over the index-count axis (external running counts for Running,
+    /// integer true counts for TrueCount): ascending `(count, P(count))` summing to 1 — the exact prior
+    /// over which count a deciding player holds. [`leverage`](Self::leverage) occurrence-weights its
+    /// deviation-gain integral by this. It spans the full reachable axis (including the tails trimmed
+    /// off the solved `[lo, hi]` window), which the leverage integral folds in against the edge ΔEV.
+    occ: Vec<(i16, f64)>,
+    /// The count-conditioned up-card draw probability along the index-count axis: ascending
+    /// `(count, P(up | count))`, read straight from the shoe's own [`draw_prob`](Shoe::draw_prob)
+    /// (Running: the per-count band shoes; TrueCount: a one-shot band on the same one-sided tail the
+    /// summary uses). The dealer's up-card frequency shifts with the count — a low card is scarcer at a
+    /// high count — so [`leverage`](Self::leverage) weights each count's deviation gain by *this* rather
+    /// than by one fresh-shoe constant, discounting a high-count deviation on a card that is rare there.
+    /// Interpolated/clamped past its ends exactly like the ΔEV samples.
+    up_cond: Vec<(i16, f64)>,
 }
 
 impl ColumnEval {
@@ -389,6 +468,25 @@ impl ColumnEval {
         let (mut lo, mut hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
         lo = lo.min(mark_lo);
         hi = hi.max(mark_hi);
+        // Count-conditioned up-card frequency along the TC axis: one pre-round shoe per integer TC,
+        // conditioned on the same one-sided tail (`TC ≥ ext` / `TC ≤ ext`) the summary at `ext` uses, so
+        // the up-card weight matches the tail-averaged ΔEV. A shared `CountW` build with no EV solve —
+        // cheap (the same order as building the occurrence distribution above).
+        let frames: Vec<CountFrame> = (lo..=hi)
+            .map(|ext| {
+                let cutoff = TC_HALF_UNITS * ext;
+                let cond = if ext >= 0 {
+                    CountCondition::TrueGe { cutoff }
+                } else {
+                    CountCondition::TrueLe { cutoff }
+                };
+                CountFrame::pre_round(cond)
+            })
+            .collect();
+        let up_cond = (lo..=hi)
+            .zip(CountShoe::band::<HiLo>(n, &frames, COUNT_PENETRATION))
+            .map(|(ext, shoe)| (ext, shoe.draw_prob(&up)))
+            .collect();
         Some(Self {
             kind: CountKind::TrueCount,
             n,
@@ -400,6 +498,8 @@ impl ColumnEval {
             mark_hi: mark_hi.clamp(lo, hi),
             frames: HashMap::new(),
             summaries: HashMap::new(),
+            occ: dist,
+            up_cond,
         })
     }
 
@@ -428,6 +528,13 @@ impl ColumnEval {
         // Default the marker band to the full solved window; `new` narrows it to the occurrence-mass
         // band, while fixed-width test builds keep the whole window.
         let (mark_lo, mark_hi) = (externals[0], externals[externals.len() - 1]);
+        // The count-conditioned up-card frequency read straight off each exact-count band shoe (free —
+        // already built above), aligned with `externals`.
+        let up_cond = externals
+            .iter()
+            .zip(&usable)
+            .map(|(&e, shoe)| (e, shoe.draw_prob(&up)))
+            .collect();
         Some(Self {
             kind: CountKind::Running,
             n,
@@ -439,6 +546,8 @@ impl ColumnEval {
             mark_hi,
             frames: HashMap::new(),
             summaries: HashMap::new(),
+            occ: CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION),
+            up_cond,
         })
     }
 
@@ -559,15 +668,93 @@ impl ColumnEval {
         } else {
             Vec::new()
         };
-        // `basic`/`basic_fallback` are filled by the caller from the no-count base chart (they are not a
-        // function of the count window). Left `None` here.
+        // `basic`/`basic_fallback`/`leverage` are filled by the caller from the no-count base chart
+        // (they are not a function of the count window alone). Left at their defaults here.
         CategoryIndex {
             primary,
             fallback,
             basic: None,
             basic_fallback: None,
+            leverage: 0.0,
+            fallback_leverage: 0.0,
         }
     }
+
+    /// The count-integral of `cat`'s deviation gain over the occurrence distribution for one `ladder`:
+    /// `Σ_c P(up|c)·P(hold|c)·ΔEV(c)·P(c)`, where `ΔEV(c) = chosen_ev_c[ladder] − move_evs_c[basic]` is
+    /// the EV gained by playing the count-optimal move at count `c` instead of the no-count `basic` move
+    /// (≥ 0, and 0 wherever they agree), and `P(c)` is the exact occurrence probability of count `c`
+    /// ([`occ`](Self::occ)). For [`Ladder::Primary`] the count-optimal move is the headline; for
+    /// [`Ladder::HitStand`] it is the better of Hit/Stand (the backup once a start-only headline is
+    /// unavailable). `ΔEV` and the count-conditioned hold mass `P(hold|c)` (the cell's
+    /// [`reach_mass`](CellInfo::reach_mass) on the count-conditioned summary — the composition shifts
+    /// with the count, so how often a deciding player holds the hand does too) are both read off the
+    /// per-`ext` summaries the flip-finder already solved (so no extra count-conditioned solves) and
+    /// piecewise-linearly interpolated across the window, clamped flat past the sampled ends — so a
+    /// deviation that turns on near the high edge keeps earning over the tail above it. The
+    /// count-conditioned up-card frequency `P(up|c)` ([`up_cond`](Self::up_cond)) is folded in too —
+    /// discounting a deviation on a card that is scarce at the counts where it pays. Every frequency
+    /// factor is thus per-count; the caller multiplies in nothing further.
+    fn leverage(&self, cat: HandCategory, basic: Move, ladder: Ladder) -> f64 {
+        // ΔEV and count-conditioned hold mass at each ext we have a summary for (≥ the seed grid
+        // spanning the whole window). `hold` is keyed independent of the EVs being present, so the hold
+        // curve interpolates over the full sampled axis even where a `basic`/chosen EV is absent.
+        let mut pts: Vec<(i16, f64)> = Vec::new();
+        let mut hold: Vec<(i16, f64)> = Vec::new();
+        for (&ext, summ) in &self.summaries {
+            let Some(ci) = summ.get(&cat) else { continue };
+            hold.push((ext, ci.reach_mass));
+            if let (Some(best), Some(base)) = (chosen_ev(ci, ladder), ci.move_evs.get(&basic)) {
+                pts.push((ext, (best - base).max(0.0)));
+            }
+        }
+        if pts.len() < 2 {
+            return 0.0;
+        }
+        pts.sort_by_key(|&(ext, _)| ext);
+        hold.sort_by_key(|&(ext, _)| ext);
+        self.occ
+            .iter()
+            .map(|&(c, p)| {
+                p * interp_delta(&self.up_cond, c) * interp_delta(&hold, c) * interp_delta(&pts, c)
+            })
+            .sum()
+    }
+}
+
+/// The EV of the move `ladder` would pick in summary cell `ci`: the headline's EV for
+/// [`Ladder::Primary`], or the better of Hit/Stand for [`Ladder::HitStand`] (the backup decision).
+/// `None` when the needed EVs are absent from the cell.
+fn chosen_ev(ci: &CellInfo, ladder: Ladder) -> Option<f64> {
+    match ladder {
+        Ladder::Primary => ci.move_evs.get(&ci.headline).copied(),
+        Ladder::HitStand => {
+            let h = ci.move_evs.get(&Move::Hit).copied();
+            let s = ci.move_evs.get(&Move::Stand).copied();
+            match (h, s) {
+                (Some(h), Some(s)) => Some(h.max(s)),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+/// Piecewise-linear value of an ascending `(count, ΔEV)` sample list at integer count `x`, held flat at
+/// the nearest endpoint outside the sampled range. `pts` is non-empty and sorted ascending by count.
+fn interp_delta(pts: &[(i16, f64)], x: i16) -> f64 {
+    if x <= pts[0].0 {
+        return pts[0].1;
+    }
+    let last = pts.len() - 1;
+    if x >= pts[last].0 {
+        return pts[last].1;
+    }
+    let i = pts.partition_point(|&(c, _)| c <= x); // first sample strictly past x
+    let (x0, y0) = pts[i - 1];
+    let (x1, y1) = pts[i];
+    let t = (x - x0) as f64 / (x1 - x0) as f64;
+    y0 + t * (y1 - y0)
 }
 
 /// The no-count basic-strategy moves for a category's two ladders: the base-chart headline and its
@@ -630,15 +817,35 @@ pub(super) fn compute_index_report(
     let Some(mut eval) = ColumnEval::new(kind, n, up, rules) else {
         return;
     };
-    // The true-count display gives the *deviation* (a play differing from no-count basic strategy) the
-    // inclusive side of its cutoff, so a true-count report needs the basic-strategy moves. They come from
-    // the uncounted base column (system-independent, disk-cached — usually already solved for the chart).
-    // The running-count display keeps its offset boundaries, so it skips this solve.
-    let base =
-        (kind == CountKind::TrueCount).then(|| ShoeChoice::Decks(n).solve(up, rules, None).summary);
-    let set_basic = |ci: &mut CategoryIndex, cat| {
-        if let Some(base) = &base {
-            (ci.basic, ci.basic_fallback) = basic_moves(base, cat);
+    // The uncounted base column (system-independent, disk-cached — usually already solved for the
+    // chart) anchors two things: the no-count basic move per cell (the deviation baseline) and the
+    // cell's hand-frequency reach mass. Both feed the leverage score, and the basic move also drives
+    // the true-count display, which gives the *deviation* the inclusive side of its cutoff. Always
+    // solved now (the running-count report needs it for leverage too, not just true count).
+    let base = ShoeChoice::Decks(n).solve(up, rules, None).summary;
+    // The running-count display keeps its offset boundaries, so only the true-count report shows the
+    // basic move on the ladder; leverage is set for both families.
+    let want_basic = kind == CountKind::TrueCount;
+    let finish = |eval: &ColumnEval, ci: &mut CategoryIndex, cat| {
+        let (basic_head, basic_fb) = basic_moves(&base, cat);
+        if want_basic {
+            ci.basic = basic_head;
+            ci.basic_fallback = basic_fb;
+        }
+        let Some(cell) = base.get(&cat) else { return };
+        // Every round-frequency factor — up-card frequency P(up|c), hold mass P(hold|c), and the count
+        // prior P(c) — is folded into the leverage integral per count (see `leverage`), so the global
+        // marker cutoff compares columns on how often each deviation is actually faced, fully
+        // count-conditioned rather than via fresh-shoe constants. The base column is read only for the
+        // no-count headline that baselines the deviation gain. leverage (primary) =
+        // Σ_c P(up|c)·P(hold|c)·ΔEV(c)·P(c) over the headline ladder. fallback_leverage scores the H/S
+        // backup behind a start-only headline (16vT-style "stand if you can't surrender"), which the
+        // primary score misses; computed only where that backup exists.
+        ci.leverage = eval.leverage(cat, cell.headline, Ladder::Primary);
+        if !ci.fallback.is_empty()
+            && let Some(fb) = basic_fb
+        {
+            ci.fallback_leverage = eval.leverage(cat, fb, Ladder::HitStand);
         }
     };
     let (light, pairs) = index_categories();
@@ -652,7 +859,7 @@ pub(super) fn compute_index_report(
     };
     for cat in light {
         let mut ci = eval.category_index(cat);
-        set_basic(&mut ci, cat);
+        finish(&eval, &mut ci, cat);
         report.cats.insert(cat, ci);
     }
     if tx
@@ -667,7 +874,7 @@ pub(super) fn compute_index_report(
     }
     for cat in pairs {
         let mut ci = eval.category_index(cat);
-        set_basic(&mut ci, cat);
+        finish(&eval, &mut ci, cat);
         report.cats.insert(cat, ci);
     }
     report.complete = true;
@@ -964,6 +1171,80 @@ mod tests {
                  flip={}\n",
                 tot_frames.saturating_sub(tot_floor)
             );
+        }
+    }
+
+    /// PROTOTYPE MEASUREMENT (not an assertion): the count-index leverage of every cell, sorted
+    /// descending, for a couple of deck counts — the data that calibrates [`INDEX_LEVERAGE_CUTOFF`].
+    /// Leverage is `Σ_c P(up|c)·P(hold|c)·ΔEV(c)·P(c)`: the occurrence-weighted deviation-gain integral
+    /// with every round-frequency factor — up-card frequency and hold mass alike — folded in per count
+    /// (all read off the count-conditioned summaries), exactly as [`compute_index_report`] computes it,
+    /// and scored on the
+    /// **better** of the primary (headline) and fallback (Hit/Stand backup) ladders — so a surrender/
+    /// double cell is ranked by its H/S backup when that is the real deviation (16vT, 15vT). The
+    /// canonical KO deviations (16vT, 15vT, 12v3, the high pairs, hard 10/11 doubles vs a Ten) should
+    /// top the list while trivial 4th-decimal flips sink below the cutoff — pick the cutoff at that gap.
+    /// `f`/`p` after each value flags which ladder won. `#[ignore]` (a count-conditioned solve per
+    /// up-card column). Run:
+    /// `cargo test --release index_leverage_ranking -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn index_leverage_ranking() {
+        let rules = Ruleset::default();
+        for n in [1u8, 6] {
+            // (score, primary, fallback, up, cat) — score is the max of the two ladders (what the marker
+            // keys on); the individual ladders are printed so the dominant one is visible.
+            let mut scored: Vec<(f64, f64, f64, Card, HandCategory)> = Vec::new();
+            for &up in &crate::tui::UP_CARDS {
+                let Some(mut eval) = ColumnEval::new(CountKind::Running, n, up, &rules) else {
+                    continue;
+                };
+                let base = ShoeChoice::Decks(n).solve(up, &rules, None).summary;
+                let (light, pairs) = index_categories();
+                let cats: Vec<HandCategory> = light.into_iter().chain(pairs).collect();
+                // Populate every category's ladders/summaries first, so each leverage integral
+                // interpolates over the full shared sample set (seed grid ∪ all flip brackets).
+                let mut idx: Vec<(HandCategory, CategoryIndex)> =
+                    cats.iter().map(|&c| (c, eval.category_index(c))).collect();
+                for (cat, ci) in &mut idx {
+                    let Some(cell) = base.get(cat) else { continue };
+                    let prim = eval.leverage(*cat, cell.headline, Ladder::Primary);
+                    let fb = if !ci.fallback.is_empty() {
+                        match basic_moves(&base, *cat).1 {
+                            Some(m) => eval.leverage(*cat, m, Ladder::HitStand),
+                            None => 0.0,
+                        }
+                    } else {
+                        0.0
+                    };
+                    let score = prim.max(fb);
+                    if score > 0.0 {
+                        scored.push((score, prim, fb, up, *cat));
+                    }
+                }
+            }
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let marked = scored
+                .iter()
+                .filter(|(s, ..)| *s >= INDEX_LEVERAGE_CUTOFF)
+                .count();
+            println!(
+                "=== n={n}  count-index leverage (KO), cutoff={INDEX_LEVERAGE_CUTOFF:.1e} \
+                 ({marked}/{} marked) ===",
+                scored.len()
+            );
+            for (score, prim, fb, up, cat) in &scored {
+                let mark = if *score >= INDEX_LEVERAGE_CUTOFF {
+                    "\u{00b0}"
+                } else {
+                    " "
+                };
+                let who = if fb > prim { "f" } else { "p" };
+                println!(
+                    "  {mark} {score:+.6}{who}  (p {prim:+.6}  f {fb:+.6})  {cat:?} vs {up:?}"
+                );
+            }
+            println!();
         }
     }
 }

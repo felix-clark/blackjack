@@ -19,7 +19,8 @@ use crate::rules::Ruleset;
 use super::column::{Column, ColumnResult};
 use super::config::{CountSetting, ShoeChoice};
 use super::index::{
-    INDEX_FILL_CONCURRENCY, IndexKey, IndexReport, IndexResult, compute_index_report,
+    INDEX_FILL_CONCURRENCY, INDEX_LEVERAGE_CUTOFF, IndexKey, IndexReport, IndexResult,
+    compute_index_report,
 };
 use super::training::Training;
 use super::{PANES, Pane, SOLVE_ORDER, Tab, UP_CARDS};
@@ -272,10 +273,10 @@ impl App {
     }
 
     /// Whether `cat` vs `up` is a count-dependent cell whose report has already been computed and whose
-    /// flips fall within the report's notable `[mark_lo, mark_hi]` band — the cue for the chart's `°`
-    /// marker. The band is occurrence-mass derived (deck/penetration-aware), so for an unbalanced count
-    /// it tracks the common running-count range instead of a fixed window around zero. (Flips out in the
-    /// occurrence tails are suppressed here but still shown in the popup.)
+    /// deviation clears the [`INDEX_LEVERAGE_CUTOFF`] — the cue for the chart's `°` marker. The cell is
+    /// prioritized by *leverage* (the occurrence-weighted EV its deviation earns), not mere
+    /// count-dependence, so the markers fall on the handful of plays that actually matter at a glance.
+    /// (Lower-leverage deviations are unmarked on the chart but still shown in full in the popup.)
     pub(super) fn index_dependent(&self, cat: HandCategory, up: Card) -> bool {
         let Some(report) = self
             .index_key(up)
@@ -286,7 +287,7 @@ impl App {
         report
             .cats
             .get(&cat)
-            .is_some_and(|ci| ci.count_dependent_in_band(report.mark_lo, report.mark_hi))
+            .is_some_and(|ci| ci.is_leveraged(INDEX_LEVERAGE_CUTOFF))
     }
 
     /// Switch the active top-level view. Entering the training tab re-points its live shoe and counting
