@@ -390,14 +390,6 @@ impl App {
                         // the move held across the whole window — no count dependence to display).
                         let primary_has_index = ci.primary.len() >= 2;
                         let fallback_has_index = ci.fallback.len() >= 2;
-                        // The commonly-held count band line is intentionally omitted: with the band now
-                        // calibrated by occurrence mass it is the same `mark_lo..mark_hi` on every popup,
-                        // so repeating it per-cell adds clutter without telling the reader anything new.
-                        // Re-enable here if the band ever becomes cell-specific.
-                        // lines.push(Line::from(Span::styled(
-                        //     format!("  common {axis}: {}..{}", report.mark_lo, report.mark_hi),
-                        //     Style::default().fg(Color::DarkGray),
-                        // )));
                         if primary_has_index {
                             lines.push(lev_line(ci.leverage, 2));
                         }
