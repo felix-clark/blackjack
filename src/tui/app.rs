@@ -19,8 +19,8 @@ use crate::rules::Ruleset;
 use super::column::{Column, ColumnResult};
 use super::config::{CountSetting, ShoeChoice};
 use super::index::{
-    INDEX_FILL_CONCURRENCY, INDEX_LEVERAGE_CUTOFF, IndexKey, IndexReport, IndexResult,
-    compute_index_report,
+    EdgeKeyResult, INDEX_FILL_CONCURRENCY, INDEX_LEVERAGE_CUTOFF, IndexKey, IndexReport,
+    IndexResult, compute_edge_key_count, compute_index_report,
 };
 use super::training::Training;
 use super::{PANES, Pane, SOLVE_ORDER, Tab, UP_CARDS};
@@ -65,6 +65,11 @@ pub(super) struct App {
     /// the dealer shows an Ace. This is quick to compute but we don't need to re-run it every
     /// frame.
     pub(super) insurance_ev: f64,
+    /// The insurance "key count": the lowest count at which insurance turns positive-EV under the
+    /// selected system (running count for KO, integer true count for Hi-Lo). `None` on the infinite deck
+    /// or if no realistic count makes it pay. Cheap (a count-conditioned `draw_prob`, no solve), so it is
+    /// recomputed synchronously alongside [`insurance_ev`](Self::insurance_ev) on every recompute.
+    pub(super) insurance_key_count: Option<i16>,
     /// Finished chart batches, keyed by [`ChartKey`], so flipping back to a prior setting is instant
     /// instead of a re-solve. Populated once all ten columns of an epoch arrive.
     cache: HashMap<ChartKey, [Column; 10]>,
@@ -96,12 +101,23 @@ pub(super) struct App {
     index_epoch: u64,
     index_tx: Sender<IndexResult>,
     index_rx: Receiver<IndexResult>,
+    /// Solved edge key counts, keyed by the same `(shoe, rules, counting system)` basis the index reports
+    /// share ([`index_basis`](Self::index_basis)): the lowest count at which the overall edge turns
+    /// non-negative (`None` = no advantage in the reachable window). Survives count-value changes, dropped
+    /// when the basis changes. A present entry means the background search finished.
+    edge_key_cache: HashMap<(ShoeChoice, Ruleset, CountKind), Option<i16>>,
+    /// The basis whose edge key count is being searched in the background, so the scheduler doesn't
+    /// respawn it. Tagged with [`index_epoch`](Self::index_epoch) like the index workers.
+    edge_pending: HashSet<(ShoeChoice, Ruleset, CountKind)>,
+    edge_tx: Sender<EdgeKeyResult>,
+    edge_rx: Receiver<EdgeKeyResult>,
 }
 
 impl App {
     pub(super) fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         let (index_tx, index_rx) = mpsc::channel();
+        let (edge_tx, edge_rx) = mpsc::channel();
         let count = CountSetting {
             external: 0,
             cmp: CountCmp::Eq,
@@ -118,6 +134,7 @@ impl App {
             epoch: 0,
             epoch_key: (ShoeChoice::Infinite, Ruleset::default(), None),
             insurance_ev: f64::NAN,
+            insurance_key_count: None,
             cache: HashMap::new(),
             columns: array::from_fn(|_| None),
             cursor: Cursor {
@@ -138,6 +155,10 @@ impl App {
             index_epoch: 0,
             index_tx,
             index_rx,
+            edge_key_cache: HashMap::new(),
+            edge_pending: HashSet::new(),
+            edge_tx,
+            edge_rx,
         }
     }
 
@@ -166,8 +187,14 @@ impl App {
             self.index_epoch += 1;
             self.index_cache.clear();
             self.index_pending.clear();
+            // The edge key count shares the index basis and epoch, so it is dropped on the same change.
+            self.edge_key_cache.clear();
+            self.edge_pending.clear();
         }
         self.insurance_ev = self.shoe.insurance(self.effective_count());
+        // The insurance key count is a property of the shoe and system (not the count value), and cheap
+        // (no solve), so it is recomputed here synchronously rather than backgrounded like the edge one.
+        self.insurance_key_count = self.shoe.insurance_key_count(self.count.system);
         // Cache hit: restore all ten columns at once, no workers (so nothing arrives for this epoch).
         if let Some(cached) = self.cache.get(&self.epoch_key) {
             self.columns = array::from_fn(|i| Some(cached[i].clone()));
@@ -250,6 +277,55 @@ impl App {
             let epoch = self.index_epoch;
             thread::spawn(move || compute_index_report(n, key, &rules, epoch, &tx));
         }
+    }
+
+    /// Background-search the overall-edge key count for the current basis, once the base chart is up.
+    /// Spawned *before* [`schedule_index_fill`](Self::schedule_index_fill) in the loop so its per-up-card
+    /// frame solves (shared with the index sweep through the disk frame cache — see
+    /// [`compute_edge_key_count`]) get a head start and warm the index fill. One worker per basis;
+    /// skipped once the basis is solved or in flight. Finite shoe only (no count on an infinite deck).
+    fn schedule_edge_key_count(&mut self) {
+        let ShoeChoice::Decks(n) = self.shoe else {
+            return;
+        };
+        if !self.columns.iter().all(Option::is_some) {
+            return;
+        }
+        let basis = (self.shoe, self.rules, self.count.system.kind());
+        if self.edge_key_cache.contains_key(&basis) || self.edge_pending.contains(&basis) {
+            return;
+        }
+        self.edge_pending.insert(basis);
+        let tx = self.edge_tx.clone();
+        let (rules, kind, epoch) = (self.rules, basis.2, self.index_epoch);
+        thread::spawn(move || {
+            let key_count = compute_edge_key_count(n, kind, &rules);
+            let _ = tx.send(EdgeKeyResult {
+                epoch,
+                basis,
+                key_count,
+            });
+        });
+    }
+
+    /// Drain a finished edge key-count search into the cache, dropping any from a superseded basis.
+    fn drain_edge_results(&mut self) {
+        while let Ok(res) = self.edge_rx.try_recv() {
+            if res.epoch != self.index_epoch {
+                continue;
+            }
+            self.edge_pending.remove(&res.basis);
+            self.edge_key_cache.insert(res.basis, res.key_count);
+        }
+    }
+
+    /// The overall-edge key count for the current basis: `Some(kc)` once the background search has
+    /// finished (`kc = None` ⇒ no advantage in the reachable window), or `None` while it is still
+    /// computing or on the infinite deck. The inner value is in the system's display axis (running count
+    /// for KO, integer true count for Hi-Lo).
+    pub(super) fn edge_key_count(&self) -> Option<Option<i16>> {
+        let basis = (self.shoe, self.rules, self.count.system.kind());
+        self.edge_key_cache.get(&basis).copied()
     }
 
     /// Drain finished (or partial) count-index reports into the cache, dropping any from a superseded
@@ -353,12 +429,15 @@ impl App {
         loop {
             self.drain_results();
             self.drain_index_results();
+            self.drain_edge_results();
             // Fold in any background training-decision grades that have finished.
             self.training.drain_evals();
             // Advance the paced dealer turn (one card per tick when its timer is up; a no-op otherwise).
             let rules = self.rules;
             self.training.tick(&rules);
-            // Background-fill every cell's count index once the base chart is up (finite shoe only).
+            // Background-search the edge key count first (it warms the index frame cache), then
+            // background-fill every cell's count index — both once the base chart is up (finite shoe only).
+            self.schedule_edge_key_count();
             self.schedule_index_fill();
             terminal.draw(|f| self.render(f))?;
             // Poll with a timeout so the chart keeps filling in as workers finish, even with no input.

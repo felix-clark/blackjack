@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
 use crate::count::{
-    CountCmp, CountCondition, CountFrame, CountKind, CountSystem, HiLo, Ko, TC_HALF_UNITS,
+    CountCmp, CountCondition, CountFrame, CountKind, CountSystem, CountSystemId, HiLo, Ko,
+    TC_HALF_UNITS,
 };
 use crate::countshoe::CountShoe;
 use crate::diskcache;
@@ -19,13 +20,13 @@ use crate::hand::{HandCategory, Move};
 use crate::reach::{CellInfo, reach_weights, summarize_cells};
 use crate::rules::Ruleset;
 use crate::shoe::Shoe;
-use crate::simulation::build_evs;
+use crate::simulation::{build_evs, edge_term};
 
 use super::PANES;
 use super::column::{
     COUNT_GROUPS, ColumnSummary, ReachMap, Tree, merge_count_frames, solve_counted,
 };
-use super::config::{COUNT_PENETRATION, ShoeChoice};
+use super::config::{COUNT_PENETRATION, CountSetting, ShoeChoice};
 
 /// One solved frame: the `build_evs` EV tree and its game-time reach weights — the unit the count-index
 /// WoO merge reads off (one per band count). Persisted per [`FrameKey`] so a warm relaunch skips the
@@ -41,6 +42,27 @@ type FrameKey = (Card, u8, i16, Ruleset, CountKind);
 
 /// Disk namespace for persisted frames (distinct from the chart's `"column"` cache).
 const FRAME_KIND: &str = "frame";
+
+/// Load (or solve and persist) the band [`Frame`] for up-card `up` at exact external running count `c`
+/// on the already-built band `shoe` (the pre-round pool conditioned on running count `c`). Disk-first on
+/// the [`FrameKey`], so a warm relaunch skips the dominant re-solve; a miss does the full `build_evs`
+/// (splits and all) + reach pass the WoO merge reads and persists it. Factored out of
+/// [`ColumnEval::ensure_frame`] so the edge key-count finder ([`compute_edge_key_count`]) populates the
+/// *same* cache the count-index sweep reads — the two warm each other (an edge probe at count `c` is the
+/// identical solve the index sweep needs there). Keep the key and the solve here in lockstep with the
+/// index sweep, or a stale cross-served frame slips past the schema version.
+fn load_or_build_frame(up: Card, n: u8, c: i16, rules: &Ruleset, shoe: &CountShoe) -> Frame {
+    // The band sweep is solved on KO (running-count) shoes; tag the key so it can never alias a
+    // future true-count frame at the same numeric count.
+    let key: FrameKey = (up, n, c, *rules, Ko::KIND);
+    diskcache::load::<_, Frame>(FRAME_KIND, &key).unwrap_or_else(|| {
+        let tree = build_evs(shoe.clone(), up, rules);
+        let reach = reach_weights(shoe.clone(), up, rules, &tree, true);
+        let frame = (tree, reach);
+        diskcache::store(FRAME_KIND, &key, &frame);
+        frame
+    })
+}
 
 /// How much occurrence probability the count-index window may drop off **each** tail. The window is the
 /// central span of the running-count occurrence distribution
@@ -59,14 +81,14 @@ const FRAME_KIND: &str = "frame";
 /// *true-count* system (HiLo, once added) acts on running ÷ decks-remaining, so its occurrence axis is
 /// the true count (a function of pool size too); generalizing means giving the occurrence distribution
 /// that axis, after which this threshold and the trimming in [`occurrence_window`] apply unchanged.
-const INDEX_TAIL_MASS: f64 = 0.01;
+pub(super) const INDEX_TAIL_MASS: f64 = 0.01;
 
 /// The inclusive external-count window `[lo, hi]` covering the central mass of occurrence distribution
 /// `dist` (ascending `(count, P(count))` pairs), dropping at most `tail_each` probability off each end.
 /// The trim is purely on probability mass, so it is independent of the count scale or system — only the
 /// `dist` passed in is system-specific. A count is dropped from a tail only while the running total of
 /// dropped mass stays within budget; the first count that would exceed it becomes the edge (kept).
-fn occurrence_window(dist: &[(i16, f64)], tail_each: f64) -> (i16, i16) {
+pub(super) fn occurrence_window(dist: &[(i16, f64)], tail_each: f64) -> (i16, i16) {
     let mut lo = 0;
     let mut dropped = 0.0;
     while lo + 1 < dist.len() && dropped + dist[lo].1 <= tail_each {
@@ -575,19 +597,9 @@ impl ColumnEval {
     fn ensure_frame(&mut self, c: i16) -> i16 {
         let c = c.clamp(self.lo(), self.hi());
         if !self.frames.contains_key(&c) {
-            let (up, n, rules) = (self.up, self.n, self.rules);
-            // The band sweep is solved on KO (running-count) shoes; tag the key so it can never alias a
-            // future true-count frame at the same numeric count.
-            let key: FrameKey = (up, n, c, rules, Ko::KIND);
-            let frame = diskcache::load::<_, Frame>(FRAME_KIND, &key).unwrap_or_else(|| {
-                let idx = self.externals.iter().position(|&e| e == c).unwrap();
-                let shoe = self.shoes[idx].clone();
-                let tree = build_evs(shoe.clone(), up, &rules);
-                let reach = reach_weights(shoe, up, &rules, &tree, true);
-                let frame = (tree, reach);
-                diskcache::store(FRAME_KIND, &key, &frame);
-                frame
-            });
+            let idx = self.externals.iter().position(|&e| e == c).unwrap();
+            let shoe = self.shoes[idx].clone();
+            let frame = load_or_build_frame(self.up, self.n, c, &self.rules, &shoe);
             self.frames.insert(c, frame);
         }
         c
@@ -880,6 +892,157 @@ pub(super) fn compute_index_report(
     report.complete = true;
     diskcache::store("index", &key, &report);
     let _ = tx.send(IndexResult { epoch, key, report });
+}
+
+/// A finished edge key-count search, tagged with the index epoch it was computed under. The edge key
+/// count shares the index basis — `(shoe, rules, counting system)` — so it is invalidated and stamped
+/// exactly like an [`IndexResult`]. `key_count` is the lowest count at which the player's overall edge
+/// turns non-negative (running count for KO, integer true count for Hi-Lo), or `None` if no realistically
+/// reachable count reaches an advantage.
+pub(super) struct EdgeKeyResult {
+    pub(super) epoch: u64,
+    pub(super) basis: (ShoeChoice, Ruleset, CountKind),
+    pub(super) key_count: Option<i16>,
+}
+
+/// The lowest integer count at which the player's **overall edge** crosses to non-negative — the "key
+/// count" (running count for KO, integer true count for Hi-Lo). `None` if no count in the realistically
+/// reachable occurrence window ([`INDEX_TAIL_MASS`]) reaches an advantage.
+///
+/// The edge is monotone increasing in the count, so this is a monotone bisection ([`least_nonneg`]) over
+/// the window — `O(log width)` probes, each a full ten-up-card edge evaluation. For KO each probe reads
+/// the same exact-count band frames the count-index sweep uses (shared disk cache — see
+/// [`load_or_build_frame`]), so running the edge finder first warms the index fill; for Hi-Lo each probe
+/// is ten one-sided `TC ≥ c` conditioned [`ShoeChoice::solve`] columns (shared with the chart's column
+/// cache).
+pub(super) fn compute_edge_key_count(n: u8, kind: CountKind, rules: &Ruleset) -> Option<i16> {
+    match kind {
+        CountKind::Running => {
+            let dist = CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION);
+            let (lo, hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
+            least_nonneg(lo, hi, |c| edge_at_running(n, rules, c))
+        }
+        CountKind::TrueCount => {
+            // A true count is measure-zero, so there is no exact-count conditioning to read a *marginal*
+            // edge off directly (as KO's `Eq` bands give). Instead recover it by differencing the
+            // inequality-conditioned `TC ≥ c` edges against the occurrence masses (see [`banded_crossing`]):
+            // the per-band marginal edge is what the bet-ramp decision actually turns on, so its crossing
+            // is the count at which raising your bet first pays — not the `≥ c` tail crossing, which reads
+            // low because the time spent at `TC ≥ 0` is mostly spent nearer the real turnover above it.
+            let dist = CountShoe::true_count_distribution::<HiLo>(n, COUNT_PENETRATION);
+            if dist.is_empty() {
+                return None;
+            }
+            let (lo, hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
+            banded_crossing(lo, hi, &dist, |c| edge_at_true_ge(n, rules, c))
+        }
+    }
+}
+
+/// The least integer count `c` in `[lo, hi]` whose **per-band marginal** value crosses to non-negative,
+/// recovered from inequality-conditioned tail values `tail(c) = Q(· | count ≥ c)` and the occurrence
+/// distribution `dist` (ascending `(count, P(count))`). For a true count there is no exact-count
+/// conditioning, so the marginal at band `c` is reconstructed by the law of total expectation —
+/// differencing the cumulative tails against the suffix masses `S(c) = Σ_{t ≥ c} P(t)`:
+///
+/// ```text
+/// banded(c) = E[Q | c ≤ count < c+1] = [S(c)·tail(c) − S(c+1)·tail(c+1)] / [S(c) − S(c+1)]
+/// ```
+///
+/// This is exact whenever `tail(c)` is the same occurrence-weighted average over the tail that `dist`
+/// describes (the engine guarantees this: `true_count_distribution`'s suffix sum *is* `P(TC ≥ c)`). The
+/// banded value is monotone increasing in `c`, so a single ascending scan finds the first non-negative
+/// band — the genuine turnover count, free of the tail's upward bias. `tail` is evaluated once per
+/// integer in `lo..=hi` (each a heavy conditioned solve for the edge; cheap for insurance).
+pub(super) fn banded_crossing(
+    lo: i16,
+    hi: i16,
+    dist: &[(i16, f64)],
+    mut tail: impl FnMut(i16) -> f64,
+) -> Option<i16> {
+    if hi <= lo {
+        return None;
+    }
+    let mut cur = tail(lo);
+    for c in lo..hi {
+        let next = tail(c + 1);
+        let (sc, sc1) = (tail_mass(dist, c), tail_mass(dist, c + 1));
+        let w = sc - sc1; // occurrence mass of band `c` itself
+        if w > 1e-12 {
+            let banded = (sc * cur - sc1 * next) / w;
+            if banded >= 0.0 {
+                return Some(c);
+            }
+        }
+        cur = next;
+    }
+    None
+}
+
+/// The occurrence mass of the tail `count ≥ c`: the suffix sum of `dist` (ascending `(count, P)`). Small
+/// list, so the linear scan is fine.
+fn tail_mass(dist: &[(i16, f64)], c: i16) -> f64 {
+    dist.iter().filter(|&&(t, _)| t >= c).map(|&(_, p)| p).sum()
+}
+
+/// The player's overall edge conditioned on the exact KO running count `c`: the draw-probability-weighted
+/// two-card-root [`edge_term`] summed over the ten up-cards, each read off the shared band frame at `c`
+/// (the `k = −map(U)` pre-round frame the chart's footer edge uses, which collapses to the
+/// up-card-independent pre-round pool conditioned on running count `c`). Equal to the footer edge under
+/// `KO RC == c`, but assembled straight from the cached frames.
+fn edge_at_running(n: u8, rules: &Ruleset, c: i16) -> f64 {
+    let shoe = CountShoe::band_external::<Ko>(n, &[c], CountCmp::Eq, COUNT_PENETRATION)
+        .pop()
+        .expect("band_external returns one shoe per requested count");
+    Card::ALL
+        .iter()
+        .map(|&up| {
+            let frame = load_or_build_frame(up, n, c, rules, &shoe);
+            shoe.draw_prob(&up) * edge_term(&frame.0).value()
+        })
+        .sum()
+}
+
+/// The player's overall edge conditioned on the **tail** `TC ≥ c` (Hi-Lo): the up-card-weighted
+/// two-card-root edge summed over the ten conditioned columns — the footer edge the chart shows under
+/// `Hi-Lo TC ≥ c`, read off [`ShoeChoice::solve`]'s disk-cached columns. [`banded_crossing`] differences
+/// these tails into the per-band marginal edge.
+fn edge_at_true_ge(n: u8, rules: &Ruleset, c: i16) -> f64 {
+    let setting = CountSetting {
+        external: TC_HALF_UNITS * c,
+        cmp: CountCmp::Ge,
+        system: CountSystemId::HiLo,
+    };
+    Card::ALL
+        .iter()
+        .map(|&up| {
+            let col = ShoeChoice::Decks(n).solve(up, rules, Some(setting));
+            col.p_up * col.edge.value()
+        })
+        .sum()
+}
+
+/// The least integer in `[lo, hi]` at which monotone-increasing `f` is non-negative, or `None` if `f`
+/// stays negative through `hi`. Bisection: `O(log(hi − lo))` evaluations of `f` (each a heavy edge
+/// probe), relying on `f` crossing zero at most once.
+fn least_nonneg(lo: i16, hi: i16, mut f: impl FnMut(i16) -> f64) -> Option<i16> {
+    if hi < lo || f(hi) < 0.0 {
+        return None;
+    }
+    if f(lo) >= 0.0 {
+        return Some(lo);
+    }
+    // Invariant: f(lo) < 0 ≤ f(hi).
+    let (mut lo, mut hi) = (lo, hi);
+    while hi - lo > 1 {
+        let m = lo + (hi - lo) / 2;
+        if f(m) >= 0.0 {
+            hi = m;
+        } else {
+            lo = m;
+        }
+    }
+    Some(hi)
 }
 
 #[cfg(test)]

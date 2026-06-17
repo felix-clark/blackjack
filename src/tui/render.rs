@@ -230,15 +230,31 @@ impl App {
         );
 
         // Row 2: everything that moves with the count — the counting system and its current
-        // parameterization, the resulting edge, and the insurance EV. Count is only meaningful on a
-        // finite shoe; shown as e.g. "KO RC>=+4", "Hi-Lo TC>=+1.5", or "off".
+        // parameterization, the resulting edge, and the insurance EV. Shown as e.g. "KO RC>=+4" or
+        // "Hi-Lo TC>=+1.5" with a constraint; with no constraint the bare system name ("KO"/"Hi-Lo") —
+        // a system is always selected, since the edge/index/key-count calcs run off it even on the
+        // base chart — matching the count modal's System field. Count only applies to a finite shoe.
         let count = match self.effective_count() {
             Some(c) => c.label(),
-            None if self.count_on => "n/a(\u{221e})".to_string(),
-            None => "off".to_string(),
+            None => self.count.system_label().to_string(),
         };
         let insurance = format!("{:+.3}", self.insurance_ev);
-        let counted = format!("count {count} | edge {edge}{computing} | insurance {insurance}",);
+        // The "+EV from count" key thresholds, axis-aware (RC for KO, TC for Hi-Lo). The edge one is
+        // backgrounded, so it shows "…" until its search finishes; both omit on the infinite deck.
+        let (edge_key, ins_key) = match self.shoe {
+            ShoeChoice::Infinite => (String::new(), String::new()),
+            ShoeChoice::Decks(_) => {
+                let axis = self.count.axis_label();
+                let edge_key = match self.edge_key_count() {
+                    None => " (+@\u{2026})".to_string(),
+                    Some(kc) => key_count_suffix(axis, kc),
+                };
+                (edge_key, key_count_suffix(axis, self.insurance_key_count))
+            }
+        };
+        let counted = format!(
+            "count {count} | edge {edge}{edge_key}{computing} | insurance {insurance}{ins_key}",
+        );
 
         let keys = "hjkl move \u{00b7} Enter EVs \u{00b7} r rules \u{00b7} c count \u{00b7} q quit";
 
@@ -1280,6 +1296,16 @@ fn ev_color(ev: f64) -> Color {
 
 fn yn(b: bool) -> &'static str {
     if b { "\u{2713}" } else { "\u{2717}" }
+}
+
+/// The footer's "+EV from count" key-threshold suffix, axis-aware (`axis` is `RC` for KO, `TC` for
+/// Hi-Lo). `Some(c)` reads as "positive once the count reaches `c`" (`(+@RC≥+1)`); `None` means no
+/// realistically reachable count makes it pay (`(+@RC n/a)`).
+fn key_count_suffix(axis: &str, kc: Option<i16>) -> String {
+    match kc {
+        Some(c) => format!(" (+@{axis}\u{2265}{c:+})"),
+        None => format!(" (+@{axis} n/a)"),
+    }
 }
 
 /// A centered `width`x`height` rect within `area`, clamped to fit.
