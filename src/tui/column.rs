@@ -11,12 +11,12 @@ use crate::card::Card;
 use crate::count::{CountCmp, CountSystem, cond_for_frame};
 use crate::countshoe::CountShoe;
 use crate::hand::{HandCategory, Move};
-use crate::reach::{CellInfo, reach_weights, summarize_cells};
+use crate::reach::{CellInfo, bust_weights, reach_weights, summarize_cells};
 use crate::rules::Ruleset;
 use crate::shoe::{CardCol, Shoe};
 use crate::simulation::{
-    EdgeTerm, bs_edge_term, bs_value_tree, build_evs, build_evs_with_splits, edge_term,
-    pair_split_evs_for, splittable_pairs,
+    EdgeTerm, bs_edge_term, bs_value_tree, build_evs, build_evs_with_splits, dealer_bust_prob,
+    edge_term, pair_split_evs_for, splittable_pairs,
 };
 
 use super::config::COUNT_PENETRATION;
@@ -38,6 +38,10 @@ pub(super) struct Column {
     /// Two-card-root edge under **basic-strategy** play: each hand scored by the move its category's
     /// chart cell prescribes ([`summary`](Self::summary)'s headlines), not the per-hand optimum.
     pub(super) bs_edge: EdgeTerm,
+    /// P(dealer busts) given this up-card (peek-conditional), the F7 dealer-bust view. One value per
+    /// column — it conditions only on the up-card, so every cell in the column shows it (see
+    /// [`dealer_bust_prob`]).
+    pub(super) dealer_bust: f64,
 }
 
 /// A finished worker result: one solved column, tagged with the epoch it was computed for.
@@ -61,12 +65,16 @@ pub(super) fn solve_on<S: Shoe + Clone + Eq + Hash + Sync>(
 ) -> Column {
     let tree = build_evs(shoe.clone(), up_card, rules);
     let weights = reach_weights(shoe.clone(), up_card, rules, &tree, true);
-    let summary = summarize_cells(&tree, &weights);
+    let bust = bust_weights(shoe.clone(), up_card, rules, &tree);
+    let summary = summarize_cells(&tree, &weights, &bust);
     let bs_values = bs_value_tree(shoe.clone(), up_card, rules, &tree, &cell_table(&summary));
+    let mut after_up = shoe.clone();
+    after_up.draw(&up_card);
     Column {
         p_up: shoe.draw_prob(&up_card),
         edge: edge_term(&tree),
         bs_edge: bs_edge_term(&tree, &bs_values),
+        dealer_bust: dealer_bust_prob(up_card, &after_up, rules),
         summary,
     }
 }
@@ -195,11 +203,13 @@ pub(super) fn solve_counted<S: CountSystem>(
     // Per-frame DP (the cheap ~2%), each fed only the splits whose pair belongs to that frame.
     let mut trees: HashMap<i16, Tree> = HashMap::new();
     let mut reaches: HashMap<i16, ReachMap> = HashMap::new();
+    let mut busts: HashMap<i16, ReachMap> = HashMap::new();
     let mut edge = EdgeTerm {
         weighted_ev: 0.0,
         weight: 0.0,
     };
     let mut p_up = 0.0;
+    let mut dealer_bust = 0.0;
     for k in COUNT_GROUPS {
         let frame_splits: HashMap<CardCol, f64> = split_evs
             .iter()
@@ -209,18 +219,33 @@ pub(super) fn solve_counted<S: CountSystem>(
         let shoe = &shoes[&k];
         let tree = build_evs_with_splits(shoe.clone(), up_card, rules, &frame_splits);
         let reach = reach_weights(shoe.clone(), up_card, rules, &tree, true);
+        let bust = bust_weights(shoe.clone(), up_card, rules, &tree);
         // The pre-round frame (entered count taken as the count *before* the round) is `k = -map(U)`,
-        // which is always in range since `map(U) ∈ [-1, 1]`. The edge and up-card weight read from it.
+        // which is always in range since `map(U) ∈ [-1, 1]`. The edge, up-card weight, and (frame-anchored
+        // like the edge) dealer-bust probability read from it.
         if k == -mu {
             edge = edge_term(&tree);
             p_up = shoe.draw_prob(&up_card);
+            let mut after_up = shoe.clone();
+            after_up.draw(&up_card);
+            dealer_bust = dealer_bust_prob(up_card, &after_up, rules);
         }
         trees.insert(k, tree);
         reaches.insert(k, reach);
+        busts.insert(k, bust);
     }
 
     let (merged_tree, merged_reach) = merge_count_frames::<S>(|k| &trees[&k], |k| &reaches[&k]);
-    let summary = summarize_cells(&merged_tree, &merged_reach);
+    // Merge the per-frame bust maps the same way the tree/reach merge: each hand's bust comes from the
+    // frame matching its own count value (see [`merge_count_frames`]).
+    let merged_bust: ReachMap = merged_tree
+        .keys()
+        .filter_map(|h| {
+            let k = hand_count_value::<S>(h).clamp(lo, hi);
+            busts[&k].get(h).map(|&b| (*h, b))
+        })
+        .collect();
+    let summary = summarize_cells(&merged_tree, &merged_reach, &merged_bust);
     // The basic-strategy edge follows the displayed chart at every node, valued on the same pre-round
     // frame (`k = -map(U)`, shoe `shoes[&-mu]`) the optimal edge uses, so the two are comparable.
     let bs_values = bs_value_tree(
@@ -236,5 +261,6 @@ pub(super) fn solve_counted<S: CountSystem>(
         p_up,
         edge,
         bs_edge,
+        dealer_bust,
     }
 }

@@ -10,6 +10,7 @@ use crate::rules::{BjPayout, PeekRule, PeekSurrender, SplitAces};
 
 use super::app::{App, Mode};
 use super::config::{DECK_OPTIONS, SPLIT_OPTIONS};
+use super::ChartView;
 use super::training::Phase;
 use super::{PANES, Tab, UP_CARDS};
 
@@ -91,10 +92,17 @@ impl App {
             // F1: the count-description panel (selected system's tags/IRC/pivot/key counts/notes). The
             // first of an intended F-key family of chart info overlays.
             KeyCode::F(1) => self.mode = Mode::CountInfo,
-            // F2: swap the chart grid between the basic-strategy moves and the count index (the count at
-            // which each cell's play deviates). A persistent view toggle, not a modal — the cursor and
-            // popup keep working over the swapped grid. The second of the F-key chart-overlay family.
-            KeyCode::F(2) => self.view = self.view.toggled(),
+            // F2-F7: swap the chart grid to an alternate per-cell layer, or back to the basic-strategy
+            // moves on a second press (see [`App::set_view`]). Persistent view toggles, not modals — the
+            // cursor and popup keep working over the swapped grid. F2 = count index; F3/F4/F5 = the
+            // best/hit/stand EV views; F6/F7 = the player/dealer bust probabilities. The F-key
+            // chart-overlay family.
+            KeyCode::F(2) => self.set_view(ChartView::Index),
+            KeyCode::F(3) => self.set_view(ChartView::BestEv),
+            KeyCode::F(4) => self.set_view(ChartView::HitEv),
+            KeyCode::F(5) => self.set_view(ChartView::StandEv),
+            KeyCode::F(6) => self.set_view(ChartView::PlayerBust),
+            KeyCode::F(7) => self.set_view(ChartView::DealerBust),
             KeyCode::Enter | KeyCode::Char(' ') => self.mode = Mode::Popup,
             KeyCode::Char('r') => self.open_rules(),
             KeyCode::Char('c') => {

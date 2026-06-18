@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::card::*;
 use crate::hand::{HandCategory, Move};
-use crate::reach::{reach_weights, summarize_cells};
+use crate::reach::{bust_weights, reach_weights, summarize_cells};
 use crate::rules::Ruleset;
 use crate::shoe::*;
 use crate::simulation::build_evs;
@@ -37,7 +37,8 @@ pub(crate) fn strategy_for(up_card: Card) -> HashMap<HandCategory, Move> {
     let rules = ruleset_with(0);
     let tree = build_evs(shoe, up_card, &rules);
     let reach = reach_weights(shoe, up_card, &rules, &tree, true);
-    summarize_cells(&tree, &reach)
+    let bust = bust_weights(shoe, up_card, &rules, &tree);
+    summarize_cells(&tree, &reach, &bust)
         .into_iter()
         .map(|(cat, cell)| (cat, cell.headline))
         .collect()
@@ -50,7 +51,8 @@ pub(crate) fn cells_for(decks: u8, up_card: Card) -> HashMap<HandCategory, crate
     let rules = ruleset_with(0);
     let tree = build_evs(shoe, up_card, &rules);
     let reach = reach_weights(shoe, up_card, &rules, &tree, true);
-    summarize_cells(&tree, &reach)
+    let bust = bust_weights(shoe, up_card, &rules, &tree);
+    summarize_cells(&tree, &reach, &bust)
 }
 
 #[track_caller]

@@ -573,7 +573,10 @@ impl ColumnEval {
         let frame = |k: i16| &self.frames[&frame_key(k)];
         let (mt, mr) = dispatch_system!(self.sys,
             S => merge_count_frames::<S>(|k| &frame(k).0, |k| &frame(k).1));
-        summarize_cells(&mt, &mr)
+        // The index sweep reads only headlines/move EVs to locate the deviation count, never the
+        // player-bust field, so the bust map can be empty here (the displayed chart's bust comes from
+        // the `solve_on`/`solve_counted` columns, which compute it for real).
+        summarize_cells(&mt, &mr, &HashMap::new())
     }
 
     /// The one-sided conditioned chart summary on the side `ext` sits (TrueCount): the WoO-merged

@@ -108,6 +108,54 @@ pub(crate) fn reach_weights<S: Shoe + Clone>(
     reach
 }
 
+/// Per-hand probability that the player **busts** if, from this hand, they take at least one more card
+/// and then continue by the optimal policy (keep hitting while the hand's best move is `Hit`; stop
+/// otherwise). The "at least one" forces the first hit even at a hand the policy would stand — so a
+/// Stand cell still reports the bust risk it is declining, which is what makes the view informative.
+///
+/// Same shape as [`reach_weights`]: `shoe` is the full shoe with the up-card still present, `ev_tree`
+/// the matching `build_evs` output (read for each hand's optimal action and to identify bust children,
+/// which are simply absent from the tree). Returns `{hand → P(bust)}`.
+pub(crate) fn bust_weights<S: Shoe + Clone>(
+    mut shoe: S,
+    up_card: Card,
+    rules: &Ruleset,
+    ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
+) -> HashMap<CardCol, f64> {
+    shoe.draw(&up_card);
+    let shoe_minus_up = shoe;
+    let basis = Basis::new(up_card, rules);
+
+    // A hit grows the hand by one card, so the post-hit hand totals strictly more: processing in
+    // nonincreasing hard total visits every child before its parent, so the child's continuation bust
+    // probability `cont` is in hand when the parent reads it (the same backward dependency `build_evs`'s
+    // Hit DP rides). A bust child has no decision node — it is absent from the tree exactly as in
+    // `build_evs`'s Hit branch — so its continuation bust probability is 1.
+    let mut hands: Vec<&CardCol> = ev_tree.keys().collect();
+    hands.sort_by_key(|h| std::cmp::Reverse(h.hard_count()));
+
+    // `cont(H)` = P(bust | play on from H by the policy, standing where the policy stands); `forced(H)`
+    // = P(bust | take one card from H regardless, then continue by `cont`) — the displayed quantity.
+    let mut cont: HashMap<CardCol, f64> = HashMap::new();
+    let mut forced: HashMap<CardCol, f64> = HashMap::new();
+    for &hand in &hands {
+        let shoe_here = shoe_minus_up.remove_hand(hand);
+        let one_hit_bust: f64 = basis
+            .draw_probs(&shoe_here)
+            .into_iter()
+            .map(|(c, p_c)| {
+                let mut child = *hand;
+                child.insert(c);
+                p_c * cont.get(&child).copied().unwrap_or(1.0)
+            })
+            .sum();
+        forced.insert(*hand, one_hit_bust);
+        let hits = best_move(&ev_tree[hand].1) == Move::Hit;
+        cont.insert(*hand, if hits { one_hit_bust } else { 0.0 });
+    }
+    forced
+}
+
 /// Re-seed the decision nodes reached *inside* a split, folding split-arm play back into the reach
 /// lattice. Mirrors the [`SplitSolver`](crate::split) arm structure on the **independent-arms** model
 /// (each arm drawn from the shared post-split shoe, no cross-arm depletion — the `split_cards: 0`
@@ -302,6 +350,10 @@ pub(crate) struct CellInfo {
     pub(crate) move_evs: HashMap<Move, f64>,
     /// The chart's recommended move (argmax of `move_evs`).
     pub(crate) headline: Move,
+    /// Reach-weighted P(player busts) over the decision population, taking **at least one** hit and then
+    /// playing on optimally (see [`bust_weights`]) — the F6 view. Defined even for Stand cells (the bust
+    /// risk they are declining).
+    pub(crate) player_bust: f64,
     /// The cell's game-time decision-reaching mass: `P(player faces this decision)`, summed over the
     /// decision population (the two-card members, or all members for the multi-card-only categories).
     /// This is the same population `move_evs` is pooled over, so it doubles as the hand-frequency
@@ -322,6 +374,7 @@ pub(crate) struct CellInfo {
 pub(crate) fn summarize_cells(
     ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
     reach: &HashMap<CardCol, f64>,
+    bust: &HashMap<CardCol, f64>,
 ) -> HashMap<HandCategory, CellInfo> {
     let mut by_cat: HashMap<HandCategory, Vec<CardCol>> = HashMap::new();
     for hand in ev_tree.keys() {
@@ -329,7 +382,7 @@ pub(crate) fn summarize_cells(
     }
     by_cat
         .into_iter()
-        .map(|(cat, members)| (cat, cell_info(&members, ev_tree, reach)))
+        .map(|(cat, members)| (cat, cell_info(&members, ev_tree, reach, bust)))
         .collect()
 }
 
@@ -397,6 +450,7 @@ fn cell_info(
     members: &[CardCol],
     ev_tree: &HashMap<CardCol, (f64, HashMap<Move, f64>)>,
     reach: &HashMap<CardCol, f64>,
+    bust: &HashMap<CardCol, f64>,
 ) -> CellInfo {
     // Decision population: two-card members if any, else all members (Hard 20/21, Soft 21).
     let two_card: Vec<CardCol> = members.iter().copied().filter(|h| h.len() == 2).collect();
@@ -409,6 +463,7 @@ fn cell_info(
     let move_evs = pooled_move_evs(decision, ev_tree, reach);
     let headline = best_move(&move_evs);
     let reach_mass = decision.iter().map(|h| reach_of(h, reach)).sum();
+    let player_bust = pooled_scalar(decision, bust, reach);
     let composition_dependent = composition_dependent(members, ev_tree, reach);
 
     // Breakdown: every reachable composition under its own best legal move. Fall back to the
@@ -446,10 +501,31 @@ fn cell_info(
     CellInfo {
         move_evs,
         headline,
+        player_bust,
         reach_mass,
         composition_dependent,
         breakdown,
     }
+}
+
+/// Reach-weighted average of a per-hand scalar over `hands` — the [`pooled_move_evs`] weighting for a
+/// plain `{hand → value}` map (used for the per-hand bust probabilities). A population with no reach
+/// mass falls back to a simple mean, matching `pooled_move_evs`; a hand absent from `values` contributes
+/// `0` (it should not happen for the full bust map, but keeps the pool total well-defined).
+fn pooled_scalar(
+    hands: &[CardCol],
+    values: &HashMap<CardCol, f64>,
+    reach: &HashMap<CardCol, f64>,
+) -> f64 {
+    let degenerate = hands.iter().map(|h| reach_of(h, reach)).sum::<f64>() <= REACH_EPS;
+    let mut wsum = 0.0;
+    let mut vsum = 0.0;
+    for h in hands {
+        let w = if degenerate { 1.0 } else { reach_of(h, reach) };
+        wsum += w;
+        vsum += w * values.get(h).copied().unwrap_or(0.0);
+    }
+    if wsum > 0.0 { vsum / wsum } else { 0.0 }
 }
 
 /// Reach-weighted per-move EV average over `hands`. If the population carries no reach mass (a

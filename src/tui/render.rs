@@ -17,6 +17,7 @@ use crate::rules::Ruleset;
 use crate::shoe::CardCol;
 
 use super::app::{App, Mode};
+use super::column::Column;
 use super::config::ShoeChoice;
 use super::index::INDEX_LEVERAGE_CUTOFF;
 use super::training::{Phase, Training};
@@ -145,7 +146,7 @@ impl App {
                 let (text, mut style) = match &self.columns[i_c] {
                     None => ("\u{00b7}".to_string(), Style::default().fg(Color::DarkGray)),
                     Some(col) => match col.summary.get(&cat) {
-                        Some(cell) => self.cell_view(cat, upcard, cell),
+                        Some(cell) => self.cell_view(cat, upcard, col, cell),
                         None => (" ".to_string(), Style::default()),
                     },
                 };
@@ -174,7 +175,13 @@ impl App {
     /// colored by the basic-strategy move (so the grid keeps its familiar colors, the number says when to
     /// deviate). A cell with no in-window deviation — still computing, or count-independent — falls back
     /// to the plain basic-strategy letter in the same general-chart color, with no marker.
-    fn cell_view(&self, cat: HandCategory, up: Card, cell: &CellInfo) -> (String, Style) {
+    fn cell_view(
+        &self,
+        cat: HandCategory,
+        up: Card,
+        col: &Column,
+        cell: &CellInfo,
+    ) -> (String, Style) {
         match self.view {
             ChartView::Strategy => {
                 let mv = cell.headline;
@@ -200,6 +207,18 @@ impl App {
                     Style::default().fg(move_color(cell.headline)),
                 ),
             },
+            // Best / Hit / Stand EV, all in integer percent (matching the footer edge readout). `headline`
+            // is always present in `move_evs`; a category where Hit/Stand is unavailable shows the dot
+            // placeholder. Values past ±100% (a Double stakes twice, a natural pays 3:2) are rare and
+            // clamp to three digits rather than getting a finer scale that would clutter the common case.
+            ChartView::BestEv => compact_ev(cell.move_evs[&cell.headline], 100.0),
+            ChartView::HitEv => ev_or_dot(cell.move_evs.get(&Move::Hit), 100.0),
+            ChartView::StandEv => ev_or_dot(cell.move_evs.get(&Move::Stand), 100.0),
+            // Bust probabilities: integer percent in a neutral color (a probability has no favorable/
+            // unfavorable sign to carry in green/red). Player-bust is per-cell; dealer-bust is the
+            // column-constant value, so every row of a column shows the same number.
+            ChartView::PlayerBust => compact_prob(cell.player_bust),
+            ChartView::DealerBust => compact_prob(col.dealer_bust),
         }
     }
 
@@ -278,8 +297,17 @@ impl App {
         // so the swapped grid is legibly flagged — like the tab bar marking the active tab — while the
         // resting keys stay the same dull gray.
         let dull = Style::default().fg(Color::DarkGray);
-        let index_on = self.view == ChartView::Index;
         let keys = "hjkl move \u{00b7} Enter EVs \u{00b7} r rules \u{00b7} c count \u{00b7} q quit";
+        // The active alternate view is highlighted yellow so the swapped grid is legibly flagged.
+        let view_key = |label: &str, v: ChartView| {
+            let style = if self.view == v {
+                Style::default().fg(Color::Yellow)
+            } else {
+                dull
+            };
+            Span::styled(label.to_string(), style)
+        };
+        let sep = || Span::styled(" \u{00b7} ", dull);
 
         let lines = vec![
             // The current selection (hand vs up-card → move / EV) sits on its own line above all the
@@ -292,15 +320,18 @@ impl App {
             )]),
             Line::from(vec![
                 Span::styled("F1 system", dull),
-                Span::styled(" \u{00b7} ", dull),
-                Span::styled(
-                    "F2 index",
-                    if index_on {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        dull
-                    },
-                ),
+                sep(),
+                view_key("F2 index", ChartView::Index),
+                sep(),
+                view_key("F3 best", ChartView::BestEv),
+                sep(),
+                view_key("F4 hit", ChartView::HitEv),
+                sep(),
+                view_key("F5 stand", ChartView::StandEv),
+                sep(),
+                view_key("F6 pbust", ChartView::PlayerBust),
+                sep(),
+                view_key("F7 dbust", ChartView::DealerBust),
             ]),
             Line::from(vec![Span::styled(keys, dull)]),
         ];
@@ -1453,7 +1484,7 @@ fn move_color(mv: Move) -> Color {
 
 /// Sign-coded color for an EV value in the popup: green when favorable, red when not. Kept distinct
 /// from the (Light*) move colors by using the plain variants so the two columns don't blur together.
-fn ev_color(ev: f64) -> Color {
+pub(super) fn ev_color(ev: f64) -> Color {
     if ev > 1e-9 {
         Color::Green
     } else if ev < -1e-9 {
@@ -1461,6 +1492,33 @@ fn ev_color(ev: f64) -> Color {
     } else {
         Color::DarkGray
     }
+}
+
+/// A signed EV rendered into the 3-column chart cell with the sign carried by color, not a glyph (see
+/// [`ev_color`]) — freeing all three columns for digits. `scale` is applied before rounding: `1000`
+/// renders the EV in thousandths (0.1% resolution, `0.457 -> "457"`), `100` in integer percent
+/// (`0.46 -> "46"`, `1.85 -> "185"`). The magnitude is clamped to three digits so an out-of-range value
+/// can never overflow the cell; near-zero reads as a dim "0".
+pub(super) fn compact_ev(ev: f64, scale: f64) -> (String, Style) {
+    let mag = (ev.abs() * scale).round().min(999.0) as u32;
+    (mag.to_string(), Style::default().fg(ev_color(ev)))
+}
+
+/// [`compact_ev`] for an optional EV (a move absent from this cell's category — e.g. a hand that cannot
+/// Hit), falling back to the dim dot placeholder the empty/pending cells use.
+fn ev_or_dot(ev: Option<&f64>, scale: f64) -> (String, Style) {
+    match ev {
+        Some(&ev) => compact_ev(ev, scale),
+        None => ("\u{00b7}".to_string(), Style::default().fg(Color::DarkGray)),
+    }
+}
+
+/// A `[0, 1]` probability rendered into the 3-column cell as integer percent (`0.42 -> "42"`). Unlike
+/// [`compact_ev`] there is no sign to color-code, so it uses a neutral gray; `100` is the only value
+/// that fills all three columns and never overflows.
+fn compact_prob(p: f64) -> (String, Style) {
+    let pct = (p * 100.0).round().clamp(0.0, 100.0) as u32;
+    (pct.to_string(), Style::default().fg(Color::Gray))
 }
 
 fn yn(b: bool) -> &'static str {

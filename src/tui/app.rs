@@ -456,6 +456,17 @@ impl App {
         (cat, UP_CARDS[self.cursor.col])
     }
 
+    /// Switch the chart to `view`, or back to [`ChartView::Strategy`] if it is already showing — so each
+    /// F-key acts as an on/off toggle for its own overlay (F2 index, F3/F4/F5 the EV views) and the chart
+    /// always returns to the strategy grid on a second press.
+    pub(super) fn set_view(&mut self, view: ChartView) {
+        self.view = if self.view == view {
+            ChartView::Strategy
+        } else {
+            view
+        };
+    }
+
     /// The consolidated cell for the current selection, if its column has finished computing.
     pub(super) fn selected_cell(&self) -> Option<&CellInfo> {
         let (cat, _) = self.selection();

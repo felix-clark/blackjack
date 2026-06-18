@@ -85,9 +85,14 @@ pub(super) enum Tab {
 
 /// An alternative information layer drawn onto the strategy chart's three-pane grid. The default
 /// [`Strategy`](ChartView::Strategy) fills each cell with the recommended move; further views reuse the
-/// exact same layout but swap in different per-cell information. The first of an intended F-key view
-/// family (F2 = the count index), so this is the seam any later chart overlay slots into. Toggled, not
-/// modal — it persists until switched back, so the cursor/popup keep working over the swapped grid.
+/// exact same layout but swap in different per-cell information. One of an F-key view family (F2 = the
+/// count index, F3/F4/F5 = the EV views), the seam any later chart overlay slots into. Each is toggled
+/// on by its F-key and back off to [`Strategy`](ChartView::Strategy) (see [`App::set_view`]), not modal
+/// — it persists until switched, so the cursor/popup keep working over the swapped grid.
+///
+/// The three EV views (F3/F4/F5) face a 3-column-per-cell budget. Rather than spend a glyph on the
+/// sign, they carry it in the cell color ([`ev_color`](render::ev_color): green favorable, red not) and
+/// use all three glyphs for digits — see [`compact_ev`](render::compact_ev) for the scale convention.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum ChartView {
     /// The basic-strategy move per cell (the chart proper).
@@ -95,16 +100,21 @@ pub(super) enum ChartView {
     /// The count-index pivot per cell: the count at which the play deviates from basic strategy, where
     /// the cell has an in-window deviation; cells with none fall back to the plain basic-strategy move.
     Index,
-}
-
-impl ChartView {
-    /// Cycle to the next view (currently a two-state toggle; extends to a ring as views are added).
-    pub(super) fn toggled(self) -> Self {
-        match self {
-            ChartView::Strategy => ChartView::Index,
-            ChartView::Index => ChartView::Strategy,
-        }
-    }
+    /// The optimal (headline-move) EV per cell, in integer percent. Unlike Hit/Stand this is unbounded
+    /// past ±100% (a Double pays on a doubled stake, a natural pays 3:2), so it uses the coarser percent
+    /// scale that matches the footer edge readout.
+    BestEv,
+    /// The Hit EV per cell, in integer percent. Bounded to [-1, +1].
+    HitEv,
+    /// The Stand EV per cell, in integer percent. Bounded to [-1, +1].
+    StandEv,
+    /// P(player busts) per cell, in integer percent: take at least one hit then play on optimally (see
+    /// [`bust_weights`](crate::reach::bust_weights)). A probability, not an EV, so it is rendered in a
+    /// neutral color rather than the green/red sign coding.
+    PlayerBust,
+    /// P(dealer busts) per cell, in integer percent. Conditions only on the up-card, so it is constant
+    /// down each column (see [`dealer_bust_prob`](crate::simulation::dealer_bust_prob)).
+    DealerBust,
 }
 
 /// The three chart panes.

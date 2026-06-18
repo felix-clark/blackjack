@@ -194,6 +194,20 @@ impl Basis {
     }
 }
 
+/// Probability the dealer busts, given only the up-card (and the cards left in `shoe`, the up-card
+/// already removed). On a peek basis the dealer-natural mass is conditioned away, so for a Ten/Ace up
+/// this is `P(dealer busts | no dealer natural)` — the "you're still in the round" figure that matches
+/// the EVs the chart shows. It conditions on nothing the player holds, so it is one number per up-card
+/// (the same in every cell of the column); the player-hand-specific depletion is a fourth-decimal
+/// effect deliberately not modeled here. Feeds the F7 dealer-bust view.
+pub(crate) fn dealer_bust_prob<S: Shoe>(up_card: Card, shoe: &S, rules: &Ruleset) -> f64 {
+    Basis::new(up_card, rules)
+        .dealer_dist(shoe)
+        .iter()
+        .filter_map(|(o, p)| matches!(o, DealerOutcome::Bust).then_some(*p))
+        .sum()
+}
+
 /// Returns a map from a given player hand to a probability weight and an expectation value for each
 /// move made with that hand, assuming optimal H/S strategy afterwards.
 ///
@@ -816,13 +830,14 @@ mod tests {
     /// move's EV) and that the resulting two-card-root edge never beats optimal play.
     #[test]
     fn bs_value_follows_table_at_every_node() {
-        use crate::reach::{reach_weights, summarize_cells};
+        use crate::reach::{bust_weights, reach_weights, summarize_cells};
         let up = Card::Ace;
         let shoe = CardCol::from_decks(2);
         let rules = ruleset_with(0);
         let tree = build_evs(shoe, up, &rules);
         let reach = reach_weights(shoe, up, &rules, &tree, true);
-        let summary = summarize_cells(&tree, &reach);
+        let bust = bust_weights(shoe, up, &rules, &tree);
+        let summary = summarize_cells(&tree, &reach, &bust);
         let table: HashMap<HandCategory, HashMap<Move, f64>> = summary
             .iter()
             .map(|(c, cell)| (*c, cell.move_evs.clone()))
