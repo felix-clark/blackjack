@@ -73,8 +73,11 @@ impl CountSystemId {
     /// Every system in canonical menu order — the single source of truth for "which systems exist" and
     /// the order the count modal cycles through. Adding a system means appending it here (plus its
     /// [`dispatch_system!`] arm); the menu wiring is pure index math over this array and needs no edit.
-    pub(crate) const ALL: [CountSystemId; 3] =
-        [CountSystemId::Ko, CountSystemId::HiLo, CountSystemId::AceFive];
+    pub(crate) const ALL: [CountSystemId; 3] = [
+        CountSystemId::Ko,
+        CountSystemId::HiLo,
+        CountSystemId::AceFive,
+    ];
 
     /// The system `delta` steps along [`ALL`](Self::ALL) from this one, wrapping around: `+1` is the
     /// next system, `−1` the previous. Lets the menu handle both directions as index arithmetic rather
@@ -105,12 +108,55 @@ impl CountSystemId {
         dispatch_system!(self, S => S::starting_count(n_decks))
     }
 
+    /// The total count value of a full `n`-deck shoe ([`CountSystem::full_shoe_count`]); `0` iff the
+    /// system is balanced. Surfaced for the F1 count-description panel.
+    pub(crate) fn full_shoe_count(self, n_decks: u8) -> i16 {
+        dispatch_system!(self, S => S::full_shoe_count(n_decks))
+    }
+
+    /// The system's pivot constant ([`CountSystem::pivot`]) — `external = pivot − internal`. `+4` for
+    /// KO, `0` for any balanced system. Surfaced for the F1 count-description panel.
+    pub(crate) fn pivot(self, n_decks: u8) -> i16 {
+        dispatch_system!(self, S => S::pivot(n_decks))
+    }
+
+    /// Whether the system is balanced (every `+v` rank matched by a `−v` rank, so a full shoe counts to
+    /// `0`). Balanced systems have pivot `0` and need a true-count division to act on; KO does not.
+    pub(crate) fn balanced(self, n_decks: u8) -> bool {
+        self.full_shoe_count(n_decks) == 0
+    }
+
     /// Short display name: `KO`, `Hi-Lo`, or `Ace-Five`.
     pub(crate) fn label(self) -> &'static str {
         match self {
             CountSystemId::Ko => "KO",
             CountSystemId::HiLo => "Hi-Lo",
             CountSystemId::AceFive => "Ace-Five",
+        }
+    }
+
+    /// Free-text usage notes and caveats for the F1 count-description panel, one entry per rendered
+    /// line. Kept here beside the system definitions so a new system's caveats land in one place. The
+    /// Ace-Five 8-deck warning mirrors the quantitative finding recorded in `CLAUDE.md` and the
+    /// `ace_five_edge_by_penetration` measurement in `src/tui/index.rs`.
+    pub(crate) fn notes(self) -> &'static [&'static str] {
+        match self {
+            CountSystemId::Ko => &[
+                "Unbalanced: the IRC offsets by deck count so the pivot is a fixed +4.",
+                "Act on the running count directly — no true-count division.",
+            ],
+            CountSystemId::HiLo => &[
+                "Balanced: divide the running count by decks remaining for the",
+                "true count, and act on that. Indices are quoted in true count.",
+            ],
+            CountSystemId::AceFive => &[
+                "Minimal training-wheels count: tag only Aces (-1) and 5s (+1).",
+                "Balanced, but played as a raw running count (no true-count division).",
+                "6-deck: safe — edge is ~break-even at the key count even early.",
+                "8-deck FOOTGUN: a fixed RC overrates the edge early in the shoe. At",
+                "the key count the first ~third is still ~-0.14% EV. Be conservative",
+                "early — only raise your bet past about half the shoe.",
+            ],
         }
     }
 }
@@ -220,6 +266,15 @@ impl CountSystem for HiLo {
 }
 
 /// The extremely simple Ace-Five count. This is balanced, but not a true count.
+///
+/// **8-deck footgun (training-wheels caveat).** Because it is read as a *raw running count* (no
+/// true-count division), a fixed running count reads a *higher* true count the deeper the shoe is
+/// dealt, so the edge at a fixed RC climbs with penetration and the penetration-marginal key count
+/// overstates the early-shoe edge. On 6 decks this is harmless (the edge at the key count is
+/// ~break-even even at the start of the shoe); on **8 decks it backfires** — at the key count the
+/// first ~third of the shoe is still ~−0.14% EV. See the quantitative table in `CLAUDE.md` and the
+/// `ace_five_edge_by_penetration` measurement in [`crate::tui`]. Mitigation that keeps it
+/// division-free: only ramp the bet past ~half the shoe (surfaced in the F1 count-description notes).
 pub(crate) struct AceFive {}
 
 impl CountSystem for AceFive {

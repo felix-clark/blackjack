@@ -45,6 +45,15 @@ The card-counting dimension is split into **vocabulary** and **engine**:
 - `src/count.rs` — what a count *is*: the `CountSystem` trait and its `Ko`/`HiLo` impls, `CountKind` (running vs. true-count family), the runtime `CountSystemId` + `dispatch_system!` seam, and the `CountCondition`/`CountFrame`/`Penetration`/`CountCmp` types plus the `cond_from_*`/`cond_for_frame` constructors that turn a player's entered count into a constraint over the unseen pool. Pure definitions; the rest of the codebase imports from here.
 - `src/countshoe.rs` — the count-conditioned **solver**: `CountShoe`, a `Shoe` whose draws are conditioned on a `CountCondition` (each draw both depletes the pool and shifts the carried condition), backed by `CountW`, a normalized-probability dynamic program over count classes memoized through a shared `DistCache`. Main tree and dealer are exact; splits use a mean-field tilt. This file also holds the independent enumeration **oracle** (`CountState`/`CountDp`) the DP is cross-checked against in tests.
 
+**Ace-Five running-count caveat (8-deck footgun).** The displayed "key count" (the lowest count whose edge crosses non-negative) is the player edge *marginalized over penetration* (`COUNT_PENETRATION = FlatPastPercent(25)`, a flat prior over 0–75% dealt). For a **balanced count read as a raw running count** — i.e. Ace-Five, where there is no true-count division — a fixed running count corresponds to a *higher* true count the deeper the shoe is dealt, so the edge at a fixed RC climbs with penetration and the marginal overstates the early-shoe edge. Quantified by the `ace_five_edge_by_penetration` measurement in `src/tui/index.rs` (`Penetration::CardsRemaining` pins the pool size; computes via `build_evs`/`edge_term` directly, **not** `load_or_build_frame`, whose disk key omits penetration). Per-round flat-bet edge (%) at fixed RC, early→deep penetration:
+
+| decks | RC | 15% dealt | 50% dealt | 75% dealt | marginal (key count) |
+|---|---|---|---|---|---|
+| 6 | +4 | +0.033 | +0.392 | +1.298 | +0.383 (key ≈ RC +3) |
+| 8 | +4 | **−0.139** | +0.138 | +0.825 | +0.121 (key ≈ RC +3/+4) |
+
+So **6-deck is safe** (edge is ~break-even at the key count even at the start of the shoe), but **8-deck backfires**: at the marginal key count the first ~third of the shoe is still ~−0.14% EV, and you need ~RC +6 to be positive across all penetrations. Mitigation that keeps the count division-free: only ramp the bet past ~half the shoe (or add ~+2 to the trigger on 8 decks). This is intrinsic to running-count usage of a balanced count, not a solver bug — don't "fix" it in the math. The caveat is surfaced to users in the F1 count-description panel's notes (`CountSystemId::notes`).
+
 ### TUI (`src/tui/`)
 
 The only place `ratatui` is used. Organised into top-level `Tab`s — **strategy** (the chart) and **training** (the drill) — with a documented module map at the top of `src/tui/mod.rs`:
@@ -54,8 +63,8 @@ The only place `ratatui` is used. Organised into top-level `Tab`s — **strategy
 - `index` — the count-index subsystem (the running counts at which a cell's play flips), and the footer "+EV from count" key counts (the lowest count at which the player edge / insurance turn positive, found by per-band marginal differencing — `banded_crossing`).
 - `training` — the training-tab model and game-simulation loop.
 - `app` — the `App` state, the async solve lifecycle (one worker thread per up-card, results streamed over an `mpsc` channel and tagged with a monotonic `epoch` so a rules/deck/count change discards stale results), and the event loop.
-- `input` — keyboard input and the modal field editors.
-- `render` — all drawing.
+- `input` — keyboard input and the modal field editors. **F1** opens the read-only *count-description* overlay (`Mode::CountInfo`) — a summary of the selected counting system (card tags, IRC/pivot/balance, the +EV and insurance key counts, and `CountSystemId::notes` usage caveats). It is the first of an intended F-key family of chart info overlays; currently a toggle (a true "hold to peek" would need terminal keyboard-enhancement release events).
+- `render` — all drawing (incl. `render_count_info`, the F1 panel).
 
 ### Persistence (`src/diskcache.rs`)
 

@@ -11,9 +11,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::card::Card;
 use crate::count::{
-    CountCmp, CountCondition, CountFrame, CountKind, CountSystem, CountSystemId, HiLo, Ko,
-    TC_HALF_UNITS,
+    CountCmp, CountCondition, CountFrame, CountKind, CountSystemId, TC_HALF_UNITS, dispatch_system,
 };
+// `CountSystem` (for the cfg(test) `new_windowed` `S::pivot`) and the concrete `Ko`/`HiLo` types are
+// referenced only by the regression/measurement tests below; production reaches every system through
+// `dispatch_system!` over generic functions, never a bare system type.
+#[cfg(test)]
+use crate::count::{AceFive, CountSystem, HiLo, Ko, Penetration};
 use crate::countshoe::CountShoe;
 use crate::diskcache;
 use crate::hand::{HandCategory, Move};
@@ -35,10 +39,11 @@ use super::config::{COUNT_PENETRATION, CountSetting, ShoeChoice};
 type Frame = (Tree, ReachMap);
 
 /// What a persisted frame is keyed under: up-card, deck count, exact external count, ruleset, and the
-/// counting-system family ([`CountKind`], so a running-count frame and a true-count frame at the same
-/// numeric count never alias). The band's comparison is always `Eq` and its penetration prior a fixed
-/// constant ([`COUNT_PENETRATION`]), so neither is in the key.
-type FrameKey = (Card, u8, i16, Ruleset, CountKind);
+/// concrete counting [`CountSystemId`] (so two systems — even two of the same [`CountKind`], like KO and
+/// Ace-Five — never alias each other's frames, and a running-count frame and a true-count frame at the
+/// same numeric count never alias either). The band's comparison is always `Eq` and its penetration
+/// prior a fixed constant ([`COUNT_PENETRATION`]), so neither is in the key.
+type FrameKey = (Card, u8, i16, Ruleset, CountSystemId);
 
 /// Disk namespace for persisted frames (distinct from the chart's `"column"` cache).
 const FRAME_KIND: &str = "frame";
@@ -49,12 +54,19 @@ const FRAME_KIND: &str = "frame";
 /// (splits and all) + reach pass the WoO merge reads and persists it. Factored out of
 /// [`ColumnEval::ensure_frame`] so the edge key-count finder ([`compute_edge_key_count`]) populates the
 /// *same* cache the count-index sweep reads — the two warm each other (an edge probe at count `c` is the
-/// identical solve the index sweep needs there). Keep the key and the solve here in lockstep with the
-/// index sweep, or a stale cross-served frame slips past the schema version.
-fn load_or_build_frame(up: Card, n: u8, c: i16, rules: &Ruleset, shoe: &CountShoe) -> Frame {
-    // The band sweep is solved on KO (running-count) shoes; tag the key so it can never alias a
-    // future true-count frame at the same numeric count.
-    let key: FrameKey = (up, n, c, *rules, Ko::KIND);
+/// identical solve the index sweep needs there). `sys` is the concrete counting system the band `shoe`
+/// was conditioned under; it tags the key so one system's frames can never be served for another. Keep
+/// the key and the solve here in lockstep with the index sweep, or a stale cross-served frame slips past
+/// the schema version.
+fn load_or_build_frame(
+    up: Card,
+    n: u8,
+    c: i16,
+    rules: &Ruleset,
+    sys: CountSystemId,
+    shoe: &CountShoe,
+) -> Frame {
+    let key: FrameKey = (up, n, c, *rules, sys);
     diskcache::load::<_, Frame>(FRAME_KIND, &key).unwrap_or_else(|| {
         let tree = build_evs(shoe.clone(), up, rules);
         let reach = reach_weights(shoe.clone(), up, rules, &tree, true);
@@ -223,8 +235,9 @@ pub(super) struct IndexReport {
 
 /// What an [`IndexReport`] is cached/keyed under. Deliberately *without* the player's count (the report
 /// is count-independent) and without the chart's count comparison (the index is always exact-count
-/// based).
-pub(super) type IndexKey = (Card, ShoeChoice, Ruleset, CountKind);
+/// based). Keyed on the concrete [`CountSystemId`] (not merely its [`CountKind`]) so two running-count
+/// systems — KO and Ace-Five — never share a cached report.
+pub(super) type IndexKey = (Card, ShoeChoice, Ruleset, CountSystemId);
 
 /// A finished (or partial) count-index report, tagged with the index epoch it was computed under so a
 /// stale one (the shoe or ruleset changed) is dropped on arrival.
@@ -330,18 +343,23 @@ enum Ladder {
 /// memoized in `frames` (disk-backed — see [`ensure_frame`]) and shared across index-counts. The move at
 /// `ext` is the best move conditioned on the count being *exactly* `ext`.
 ///
-/// **TrueCount (Hi-Lo):** an exact true count is measure-zero, so there is no exact-count conditioning.
-/// Instead the move at integer true count `ext` is read straight off the **one-sided conditioned solve on
-/// the side `ext` sits**: `TC ≥ ext` for `ext ≥ 0`, `TC ≤ ext` for `ext < 0` (see
+/// **TrueCount (e.g. Hi-Lo):** an exact true count is measure-zero, so there is no exact-count
+/// conditioning. Instead the move at integer true count `ext` is read straight off the **one-sided
+/// conditioned solve on the side `ext` sits**: `TC ≥ ext` for `ext ≥ 0`, `TC ≤ ext` for `ext < 0` (see
 /// [`true_summary`](Self::true_summary)). This is exactly the column the chart shows when the player
 /// imposes that same `TC` constraint, so the reported index threshold and the conditioned chart agree by
 /// construction — a deviation is declared at the count where `TC ≥ c` first recommends it, not one count
 /// later (the earlier slice-differencing was conservative by a count). Each solve is the WoO-merged
-/// [`solve_counted`]`::<HiLo>` conditioned column, memoized in `summaries`. No band/`frames` are used here.
+/// [`solve_counted`]`::<S>` conditioned column for the active true-count system `S` ([`Self::sys`]),
+/// memoized in `summaries`. No band/`frames` are used here.
 ///
 /// `summaries` memoizes the per-`ext` summary so all categories and both ladders reuse it.
 struct ColumnEval {
-    kind: CountKind,
+    /// The concrete counting system this column is evaluated under. Its [`CountKind`](CountSystemId::kind)
+    /// selects the algorithm branch (Running bands vs. one-sided true-count solves); its card→value
+    /// [`map`](CountSystemId::map) drives the conditioning. Two systems of the same kind (KO, Ace-Five)
+    /// therefore take the same code path but never share a frame or a report.
+    sys: CountSystemId,
     n: u8,
     up: Card,
     rules: Ruleset,
@@ -379,17 +397,17 @@ impl ColumnEval {
     /// tails back in via flat extrapolation off the window ends). Which counts within that window earn a
     /// chart marker is decided later by occurrence-weighted leverage ([`CategoryIndex::is_leveraged`]),
     /// not by the window. `None` if nothing is reachable.
-    fn new(kind: CountKind, n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
-        match kind {
-            CountKind::Running => Self::new_running(n, up, rules),
-            CountKind::TrueCount => Self::new_true(n, up, rules),
+    fn new(sys: CountSystemId, n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
+        match sys.kind() {
+            CountKind::Running => Self::new_running(sys, n, up, rules),
+            CountKind::TrueCount => Self::new_true(sys, n, up, rules),
         }
     }
 
-    fn new_running(n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
-        let dist = CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION);
+    fn new_running(sys: CountSystemId, n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
+        let dist = dispatch_system!(sys, S => CountShoe::external_count_distribution::<S>(n, COUNT_PENETRATION));
         let (lo, hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
-        Self::build_running(n, up, rules, lo, hi)
+        Self::build_running(sys, n, up, rules, lo, hi)
     }
 
     /// Build the true-count evaluator over the occurrence-bounded integer-TC window: the
@@ -397,8 +415,8 @@ impl ColumnEval {
     /// [`INDEX_TAIL_MASS`] tail bound as the running-count sweep — the true count's spread is far narrower,
     /// so this is naturally a handful of integers around 0). No band shoes: each `TC ≥ ext` solve is an
     /// on-demand [`solve_counted`] in [`summary`](Self::summary).
-    fn new_true(n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
-        let dist = CountShoe::true_count_distribution::<HiLo>(n, COUNT_PENETRATION);
+    fn new_true(sys: CountSystemId, n: u8, up: Card, rules: &Ruleset) -> Option<Self> {
+        let dist = dispatch_system!(sys, S => CountShoe::true_count_distribution::<S>(n, COUNT_PENETRATION));
         if dist.is_empty() {
             return None;
         }
@@ -418,12 +436,13 @@ impl ColumnEval {
                 CountFrame::pre_round(cond)
             })
             .collect();
+        let band = dispatch_system!(sys, S => CountShoe::band::<S>(n, &frames, COUNT_PENETRATION));
         let up_cond = (lo..=hi)
-            .zip(CountShoe::band::<HiLo>(n, &frames, COUNT_PENETRATION))
+            .zip(band)
             .map(|(ext, shoe)| (ext, shoe.draw_prob(&up)))
             .collect();
         Some(Self {
-            kind: CountKind::TrueCount,
+            sys,
             n,
             up,
             rules: *rules,
@@ -439,12 +458,20 @@ impl ColumnEval {
     /// Build a **running-count** evaluator over an explicit inclusive external-count window `[lo, hi]`,
     /// dropping the counts whose exact condition has no mass (unreachable under the penetration prior — a
     /// zero draw distribution would make the solve meaningless). The reachable set is contiguous. `None`
-    /// if nothing is reachable. KO-specific by construction (KO band shoes, exact-count slicing), so the
-    /// `kind` it stamps is always [`CountKind::Running`]; the true-count path shares none of this and
-    /// builds its struct inline in [`new_true`](Self::new_true).
-    fn build_running(n: u8, up: Card, rules: &Ruleset, lo: i16, hi: i16) -> Option<Self> {
+    /// if nothing is reachable. Specific to a *running-count* system (exact-count band shoes, exact-count
+    /// slicing) — `sys` must be a [`CountKind::Running`] system; the true-count path shares none of this
+    /// and builds its struct inline in [`new_true`](Self::new_true).
+    fn build_running(
+        sys: CountSystemId,
+        n: u8,
+        up: Card,
+        rules: &Ruleset,
+        lo: i16,
+        hi: i16,
+    ) -> Option<Self> {
         let window: Vec<i16> = (lo..=hi).collect();
-        let shoes = CountShoe::band_external::<Ko>(n, &window, CountCmp::Eq, COUNT_PENETRATION);
+        let shoes = dispatch_system!(sys,
+            S => CountShoe::band_external::<S>(n, &window, CountCmp::Eq, COUNT_PENETRATION));
         let mut externals = Vec::new();
         let mut usable = Vec::new();
         for (&e, shoe) in window.iter().zip(shoes) {
@@ -465,8 +492,9 @@ impl ColumnEval {
             .zip(&usable)
             .map(|(&e, shoe)| (e, shoe.draw_prob(&up)))
             .collect();
+        let occ = dispatch_system!(sys, S => CountShoe::external_count_distribution::<S>(n, COUNT_PENETRATION));
         Some(Self {
-            kind: CountKind::Running,
+            sys,
             n,
             up,
             rules: *rules,
@@ -474,7 +502,7 @@ impl ColumnEval {
             shoes: usable,
             frames: HashMap::new(),
             summaries: HashMap::new(),
-            occ: CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION),
+            occ,
             up_cond,
         })
     }
@@ -482,9 +510,15 @@ impl ColumnEval {
     /// As [`new`](Self::new) but over a fixed pivot-centered half-width window, so a measurement can
     /// sweep the window size independent of the occurrence bound. Test-only.
     #[cfg(test)]
-    fn new_windowed(n: u8, up: Card, rules: &Ruleset, half_width: i16) -> Option<Self> {
-        let pivot = Ko::pivot(n);
-        Self::build_running(n, up, rules, pivot - half_width, pivot + half_width)
+    fn new_windowed(
+        sys: CountSystemId,
+        n: u8,
+        up: Card,
+        rules: &Ruleset,
+        half_width: i16,
+    ) -> Option<Self> {
+        let pivot = dispatch_system!(sys, S => S::pivot(n));
+        Self::build_running(sys, n, up, rules, pivot - half_width, pivot + half_width)
     }
 
     fn lo(&self) -> i16 {
@@ -505,7 +539,7 @@ impl ColumnEval {
         if !self.frames.contains_key(&c) {
             let idx = self.externals.iter().position(|&e| e == c).unwrap();
             let shoe = self.shoes[idx].clone();
-            let frame = load_or_build_frame(self.up, self.n, c, &self.rules, &shoe);
+            let frame = load_or_build_frame(self.up, self.n, c, &self.rules, self.sys, &shoe);
             self.frames.insert(c, frame);
         }
         c
@@ -515,7 +549,7 @@ impl ColumnEval {
     /// `TC ≥/≤ ext` conditioned column for TrueCount.
     fn summary(&mut self, ext: i16) -> &ColumnSummary {
         if !self.summaries.contains_key(&ext) {
-            let summary = match self.kind {
+            let summary = match self.sys.kind() {
                 CountKind::Running => self.running_summary(ext),
                 CountKind::TrueCount => self.true_summary(ext),
             };
@@ -527,7 +561,7 @@ impl ColumnEval {
     /// The WoO-merged exact-count summary at running count `ext` (Running): each hand read from the band
     /// frame at `ext - map(U) - map(hand)`, so the running count `ext` includes the hand and the up-card.
     fn running_summary(&mut self, ext: i16) -> ColumnSummary {
-        let mu = Ko::map(&self.up);
+        let mu = self.sys.map(&self.up);
         let (lo, hi) = (self.lo(), self.hi());
         // Solve every frame the merge will read first (mutably), so it can then borrow them all
         // immutably. `frame_key` reads only locals, so it does not borrow `self`.
@@ -537,18 +571,21 @@ impl ColumnEval {
         let frame_key = |k: i16| (ext - mu - k).clamp(lo, hi);
         // `ensure_frame` above guarantees each band frame is present.
         let frame = |k: i16| &self.frames[&frame_key(k)];
-        let (mt, mr) = merge_count_frames::<Ko>(|k| &frame(k).0, |k| &frame(k).1);
+        let (mt, mr) = dispatch_system!(self.sys,
+            S => merge_count_frames::<S>(|k| &frame(k).0, |k| &frame(k).1));
         summarize_cells(&mt, &mr)
     }
 
     /// The one-sided conditioned chart summary on the side `ext` sits (TrueCount): the WoO-merged
-    /// [`solve_counted`]`::<HiLo>` column at the integer true-count cutoff `ext` (passed in half-units),
-    /// compared `TC ≥ ext` for `ext ≥ 0` and `TC ≤ ext` for `ext < 0`. This is the very column the chart
+    /// [`solve_counted`]`::<S>` column (for the active true-count system `S = self.sys`) at the integer
+    /// true-count cutoff `ext` (passed in half-units), compared `TC ≥ ext` for `ext ≥ 0` and `TC ≤ ext`
+    /// for `ext < 0`. This is the very column the chart
     /// shows under that `TC` constraint, so its headline is read directly as the index move — the reported
     /// threshold and the conditioned chart agree by construction.
     fn true_summary(&self, ext: i16) -> ColumnSummary {
         let cmp = if ext >= 0 { CountCmp::Ge } else { CountCmp::Le };
-        solve_counted::<HiLo>(self.n, TC_HALF_UNITS * ext, cmp, self.up, &self.rules).summary
+        dispatch_system!(self.sys,
+            S => solve_counted::<S>(self.n, TC_HALF_UNITS * ext, cmp, self.up, &self.rules).summary)
     }
 
     /// The move `ladder` recommends for `cat` at index-count `ext`, or `None` if the category is absent.
@@ -729,10 +766,11 @@ pub(super) fn compute_index_report(
         return;
     }
     let up = key.0;
-    // The index family comes from the key (the chart's selected counting system), so the markers match
-    // the active system and never alias a cached report from the other.
-    let kind = key.3;
-    let Some(mut eval) = ColumnEval::new(kind, n, up, rules) else {
+    // The counting system comes from the key (the chart's selected system), so the markers match the
+    // active system and never alias a cached report from another — including a sibling of the same
+    // `CountKind` (KO vs Ace-Five).
+    let sys = key.3;
+    let Some(mut eval) = ColumnEval::new(sys, n, up, rules) else {
         return;
     };
     // The uncounted base column (system-independent, disk-cached — usually already solved for the
@@ -743,7 +781,7 @@ pub(super) fn compute_index_report(
     let base = ShoeChoice::Decks(n).solve(up, rules, None).summary;
     // The running-count display keeps its offset boundaries, so only the true-count report shows the
     // basic move on the ladder; leverage is set for both families.
-    let want_basic = kind == CountKind::TrueCount;
+    let want_basic = sys.kind() == CountKind::TrueCount;
     let finish = |eval: &ColumnEval, ci: &mut CategoryIndex, cat| {
         let (basic_head, basic_fb) = basic_moves(&base, cat);
         if want_basic {
@@ -805,7 +843,7 @@ pub(super) fn compute_index_report(
 /// reachable count reaches an advantage.
 pub(super) struct EdgeKeyResult {
     pub(super) epoch: u64,
-    pub(super) basis: (ShoeChoice, Ruleset, CountKind),
+    pub(super) basis: (ShoeChoice, Ruleset, CountSystemId),
     pub(super) key_count: Option<i16>,
 }
 
@@ -814,17 +852,19 @@ pub(super) struct EdgeKeyResult {
 /// reachable occurrence window ([`INDEX_TAIL_MASS`]) reaches an advantage.
 ///
 /// The edge is monotone increasing in the count, so this is a monotone bisection ([`least_nonneg`]) over
-/// the window — `O(log width)` probes, each a full ten-up-card edge evaluation. For KO each probe reads
-/// the same exact-count band frames the count-index sweep uses (shared disk cache — see
-/// [`load_or_build_frame`]), so running the edge finder first warms the index fill; for Hi-Lo each probe
-/// is ten one-sided `TC ≥ c` conditioned [`ShoeChoice::solve`] columns (shared with the chart's column
-/// cache).
-pub(super) fn compute_edge_key_count(n: u8, kind: CountKind, rules: &Ruleset) -> Option<i16> {
-    match kind {
+/// the window — `O(log width)` probes, each a full ten-up-card edge evaluation. For a running-count
+/// system each probe reads the same exact-count band frames the count-index sweep uses (shared disk cache
+/// — see [`load_or_build_frame`]), so running the edge finder first warms the index fill; for a
+/// true-count system each probe is ten one-sided `TC ≥ c` conditioned [`ShoeChoice::solve`] columns
+/// (shared with the chart's column cache). Generic over the concrete `sys` — a balanced running-count
+/// system like Ace-Five sweeps its own (much narrower) window, not KO's.
+pub(super) fn compute_edge_key_count(n: u8, sys: CountSystemId, rules: &Ruleset) -> Option<i16> {
+    match sys.kind() {
         CountKind::Running => {
-            let dist = CountShoe::external_count_distribution::<Ko>(n, COUNT_PENETRATION);
+            let dist = dispatch_system!(sys,
+                S => CountShoe::external_count_distribution::<S>(n, COUNT_PENETRATION));
             let (lo, hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
-            least_nonneg(lo, hi, |c| edge_at_running(n, rules, c))
+            least_nonneg(lo, hi, |c| edge_at_running(n, sys, rules, c))
         }
         CountKind::TrueCount => {
             // A true count is measure-zero, so there is no exact-count conditioning to read a *marginal*
@@ -833,12 +873,13 @@ pub(super) fn compute_edge_key_count(n: u8, kind: CountKind, rules: &Ruleset) ->
             // the per-band marginal edge is what the bet-ramp decision actually turns on, so its crossing
             // is the count at which raising your bet first pays — not the `≥ c` tail crossing, which reads
             // low because the time spent at `TC ≥ 0` is mostly spent nearer the real turnover above it.
-            let dist = CountShoe::true_count_distribution::<HiLo>(n, COUNT_PENETRATION);
+            let dist = dispatch_system!(sys,
+                S => CountShoe::true_count_distribution::<S>(n, COUNT_PENETRATION));
             if dist.is_empty() {
                 return None;
             }
             let (lo, hi) = occurrence_window(&dist, INDEX_TAIL_MASS);
-            banded_crossing(lo, hi, &dist, |c| edge_at_true_ge(n, rules, c))
+            banded_crossing(lo, hi, &dist, |c| edge_at_true_ge(n, sys, rules, c))
         }
     }
 }
@@ -920,33 +961,35 @@ fn tail_mass(dist: &[(i16, f64)], c: i16) -> f64 {
     dist.iter().filter(|&&(t, _)| t >= c).map(|&(_, p)| p).sum()
 }
 
-/// The player's overall edge conditioned on the exact KO running count `c`: the draw-probability-weighted
-/// two-card-root [`edge_term`] summed over the ten up-cards, each read off the shared band frame at `c`
-/// (the `k = −map(U)` pre-round frame the chart's footer edge uses, which collapses to the
-/// up-card-independent pre-round pool conditioned on running count `c`). Equal to the footer edge under
-/// `KO RC == c`, but assembled straight from the cached frames.
-fn edge_at_running(n: u8, rules: &Ruleset, c: i16) -> f64 {
-    let shoe = CountShoe::band_external::<Ko>(n, &[c], CountCmp::Eq, COUNT_PENETRATION)
-        .pop()
-        .expect("band_external returns one shoe per requested count");
+/// The player's overall edge conditioned on the exact running count `c` under system `sys`: the
+/// draw-probability-weighted two-card-root [`edge_term`] summed over the ten up-cards, each read off the
+/// shared band frame at `c` (the `k = −map(U)` pre-round frame the chart's footer edge uses, which
+/// collapses to the up-card-independent pre-round pool conditioned on running count `c`). Equal to the
+/// footer edge under `sys RC == c`, but assembled straight from the cached frames. `sys` must be a
+/// [`CountKind::Running`] system.
+fn edge_at_running(n: u8, sys: CountSystemId, rules: &Ruleset, c: i16) -> f64 {
+    let shoe = dispatch_system!(sys,
+        S => CountShoe::band_external::<S>(n, &[c], CountCmp::Eq, COUNT_PENETRATION))
+    .pop()
+    .expect("band_external returns one shoe per requested count");
     Card::ALL
         .iter()
         .map(|&up| {
-            let frame = load_or_build_frame(up, n, c, rules, &shoe);
+            let frame = load_or_build_frame(up, n, c, rules, sys, &shoe);
             shoe.draw_prob(&up) * edge_term(&frame.0).value()
         })
         .sum()
 }
 
-/// The player's overall edge conditioned on the **tail** `TC ≥ c` (Hi-Lo): the up-card-weighted
-/// two-card-root edge summed over the ten conditioned columns — the footer edge the chart shows under
-/// `Hi-Lo TC ≥ c`, read off [`ShoeChoice::solve`]'s disk-cached columns. [`banded_crossing`] differences
-/// these tails into the per-band marginal edge.
-fn edge_at_true_ge(n: u8, rules: &Ruleset, c: i16) -> f64 {
+/// The player's overall edge conditioned on the **tail** `TC ≥ c` under true-count system `sys`: the
+/// up-card-weighted two-card-root edge summed over the ten conditioned columns — the footer edge the
+/// chart shows under `sys TC ≥ c`, read off [`ShoeChoice::solve`]'s disk-cached columns.
+/// [`banded_crossing`] differences these tails into the per-band marginal edge.
+fn edge_at_true_ge(n: u8, sys: CountSystemId, rules: &Ruleset, c: i16) -> f64 {
     let setting = CountSetting {
         external: TC_HALF_UNITS * c,
         cmp: CountCmp::Ge,
-        system: CountSystemId::HiLo,
+        system: sys,
     };
     Card::ALL
         .iter()
@@ -1033,7 +1076,7 @@ mod tests {
     #[test]
     #[ignore]
     fn count_index_16_vs_ten_flips_with_count() {
-        let mut eval = ColumnEval::new(CountKind::Running, 1, Card::Ten, &Ruleset::default())
+        let mut eval = ColumnEval::new(CountSystemId::Ko, 1, Card::Ten, &Ruleset::default())
             .expect("usable window");
         let ci = eval.category_index(HandCategory::Hard(16));
         assert!(
@@ -1068,7 +1111,7 @@ mod tests {
     #[test]
     #[ignore]
     fn true_count_index_16_vs_ten_flips_near_zero() {
-        let mut eval = ColumnEval::new(CountKind::TrueCount, 1, Card::Ten, &Ruleset::default())
+        let mut eval = ColumnEval::new(CountSystemId::HiLo, 1, Card::Ten, &Ruleset::default())
             .expect("usable window");
         let ci = eval.category_index(HandCategory::Hard(16));
         assert!(
@@ -1100,7 +1143,7 @@ mod tests {
     #[test]
     #[ignore]
     fn count_index_12_vs_3_flips_near_neg3() {
-        let mut eval = ColumnEval::new(CountKind::Running, 4, Card::Pip(3), &Ruleset::default())
+        let mut eval = ColumnEval::new(CountSystemId::Ko, 4, Card::Pip(3), &Ruleset::default())
             .expect("usable window");
         let ci = eval.category_index(HandCategory::Hard(12));
         assert!(
@@ -1134,13 +1177,18 @@ mod tests {
         let rules = Ruleset::default();
         let up = Card::Pip(3);
         let cat = HandCategory::Soft(16);
-        let mut eval = ColumnEval::new(CountKind::Running, 1, up, &rules).expect("usable window");
+        let mut eval = ColumnEval::new(CountSystemId::Ko, 1, up, &rules).expect("usable window");
         let ci = eval.category_index(cat);
         let double = ci
             .primary
             .iter()
             .find(|&&(m, _, _)| m == Move::Double)
-            .unwrap_or_else(|| panic!("expected a Hit→Double deviation, got primary={:?}", ci.primary));
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a Hit→Double deviation, got primary={:?}",
+                    ci.primary
+                )
+            });
         assert!(
             (3..=9).contains(&double.1),
             "Hit→Double flip should sit at a high positive count (~RC +5), got run {double:?} in primary={:?}",
@@ -1208,7 +1256,8 @@ mod tests {
 
     /// Fill one up-card column (all categories) at `half_width` and report its [`ColumnBreakdown`].
     fn column_breakdown(n: u8, up: Card, rules: &Ruleset, half_width: i16) -> ColumnBreakdown {
-        let mut eval = ColumnEval::new_windowed(n, up, rules, half_width).expect("usable window");
+        let mut eval = ColumnEval::new_windowed(CountSystemId::Ko, n, up, rules, half_width)
+            .expect("usable window");
         let (light, pairs) = index_categories();
         for cat in light.into_iter().chain(pairs) {
             let _ = eval.category_index(cat);
@@ -1289,7 +1338,7 @@ mod tests {
             // keys on); the individual ladders are printed so the dominant one is visible.
             let mut scored: Vec<(f64, f64, f64, Card, HandCategory)> = Vec::new();
             for &up in &crate::tui::UP_CARDS {
-                let Some(mut eval) = ColumnEval::new(CountKind::Running, n, up, &rules) else {
+                let Some(mut eval) = ColumnEval::new(CountSystemId::Ko, n, up, &rules) else {
                     continue;
                 };
                 let base = ShoeChoice::Decks(n).solve(up, &rules, None).summary;
@@ -1338,6 +1387,91 @@ mod tests {
                 );
             }
             println!();
+        }
+    }
+
+    /// PROTOTYPE MEASUREMENT (not an assertion): the Ace-Five **running-count** edge resolved by deck
+    /// penetration, to see whether reading a *balanced* count as a raw running count (no true-count
+    /// division) overrates the edge early in the shoe. The footer key count is the edge marginalized over
+    /// [`COUNT_PENETRATION`] (a flat prior across 0–75% dealt); a fixed running count `c` means a *higher*
+    /// true count the deeper the shoe is dealt, so edge(`c`) should climb monotonically as cards deplete,
+    /// and the marginal can report a positive key-count edge that is actually negative early. This pins the
+    /// pool size with [`Penetration::CardsRemaining`] to expose that spread.
+    ///
+    /// For each deck count it prints, per fixed external running count (rows), the player edge at several
+    /// fixed penetrations (columns, labelled by decks remaining) plus the [`COUNT_PENETRATION`] marginal —
+    /// the latter equal by construction to the footer "+EV from count" edge at that running count. A `—`
+    /// means that exact `(count, pool size)` carries no occurrence mass (unreachable). Heavy: a full
+    /// `build_evs` (splits and all) per up-card per cell, cache-free. Run alone:
+    /// `cargo test --release ace_five_edge_by_penetration -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn ace_five_edge_by_penetration() {
+        let rules = Ruleset::default();
+        // Fixed external running counts to probe (Ace-Five is balanced, pivot 0).
+        let counts = [0i16, 2, 4, 6];
+        // Penetration points as fraction of the shoe still *remaining* (1 − fraction dealt). The
+        // production deal stops at 25% remaining (FlatPastPercent(25)), so these span the live range.
+        let fracs = [0.85f64, 0.65, 0.50, 0.35, 0.25];
+
+        // The Ace-Five running-count edge at exact external count `c` and pool prior `pen`: the
+        // up-card-weighted two-card-root edge, assembled exactly as `edge_at_running` but cache-free and
+        // at an arbitrary penetration (so it never touches the penetration-blind frame disk cache).
+        // `None` when count `c` is unreachable at this pool size (its conditioned draw mass is ~0).
+        let edge_at = |n: u8, c: i16, pen: Penetration| -> Option<f64> {
+            let shoe = CountShoe::band_external::<AceFive>(n, &[c], CountCmp::Eq, pen)
+                .pop()
+                .expect("one shoe per requested count");
+            let mass: f64 = shoe.all_draw_probs().map(|(_, p)| p).sum();
+            if mass < 0.5 {
+                return None;
+            }
+            let edge: f64 = Card::ALL
+                .iter()
+                .map(|&up| {
+                    shoe.draw_prob(&up) * edge_term(&build_evs(shoe.clone(), up, &rules)).value()
+                })
+                .sum();
+            Some(edge)
+        };
+
+        for n in [6u8, 8] {
+            let big_n = 52u16 * n as u16;
+            let rems: Vec<u16> = fracs
+                .iter()
+                .map(|f| (big_n as f64 * f).round() as u16)
+                .collect();
+            println!(
+                "\n=== Ace-Five running-count edge by penetration, n={n} decks ({big_n} cards) ===\
+                 \nrunning count held as a raw RC (no true-count division); edge in % (×100)\n"
+            );
+            print!("  RC  ");
+            for (frac, rem) in fracs.iter().zip(&rems) {
+                print!(
+                    "  {:>4.0}%d/{:>4.1}d ",
+                    (1.0 - frac) * 100.0,
+                    *rem as f64 / 52.0
+                );
+            }
+            println!("   marginal");
+            for &c in &counts {
+                print!("  {c:>+3} ");
+                for &rem in &rems {
+                    match edge_at(n, c, Penetration::CardsRemaining(rem)) {
+                        Some(e) => print!("   {:>+7.3}   ", e * 100.0),
+                        None => print!("     —      "),
+                    }
+                }
+                match edge_at(n, c, COUNT_PENETRATION) {
+                    Some(e) => println!("   {:>+7.3}", e * 100.0),
+                    None => println!("     —"),
+                }
+            }
+            println!(
+                "\n  (column header: % of shoe dealt / decks remaining; marginal = FlatPastPercent(25),\n\
+                 \x20  the footer key-count edge. Edge climbing left→right at fixed RC = the running count\n\
+                 \x20  reading a higher true count deeper in the shoe.)"
+            );
         }
     }
 }

@@ -55,9 +55,24 @@ impl App {
             Mode::Normal => return self.handle_normal(code),
             Mode::Popup => self.handle_popup(code),
             Mode::Count => self.handle_count(code),
+            Mode::CountInfo => self.handle_count_info(code),
             Mode::Rules => {} // handled above, before tab routing
         }
         false
+    }
+
+    /// The F1 count-description panel is read-only: F1 (toggle off), Esc, or `q` dismiss it; everything
+    /// else is swallowed so a stray key doesn't move the hidden cursor. Drafted as a toggle for
+    /// cross-terminal robustness — true "hold F1 to peek" would require enabling the terminal's keyboard
+    /// enhancement protocol and handling key-release events (most legacy terminals send only presses),
+    /// which the event loop does not do today.
+    fn handle_count_info(&mut self, code: KeyCode) {
+        if matches!(
+            code,
+            KeyCode::F(1) | KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')
+        ) {
+            self.mode = Mode::Normal;
+        }
     }
 
     /// Open the shared rules-editing modal, snapshotting the current `(rules, shoe)` so a change can be
@@ -73,6 +88,9 @@ impl App {
         match code {
             KeyCode::Char('q') => return true,
             KeyCode::Char('2') => self.set_tab(Tab::Training),
+            // F1: the count-description panel (selected system's tags/IRC/pivot/key counts/notes). The
+            // first of an intended F-key family of chart info overlays.
+            KeyCode::F(1) => self.mode = Mode::CountInfo,
             KeyCode::Enter | KeyCode::Char(' ') => self.mode = Mode::Popup,
             KeyCode::Char('r') => self.open_rules(),
             KeyCode::Char('c') => {

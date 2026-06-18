@@ -1300,9 +1300,10 @@ impl Training {
             return (None, false);
         }
         // Tag the key with the *current* system so the trainer shares the exact persisted report the
-        // strategy tab keys its index under (a HiLo report can never be served for a KO basis, or vice
-        // versa). A cold up-card (report not yet filled) is unavailable until the background solve lands.
-        let key: IndexKey = (up, ShoeChoice::Decks(*n_decks), *rules, self.system.kind());
+        // strategy tab keys its index under (a Hi-Lo report can never be served for a KO basis, nor a KO
+        // report for an Ace-Five one). A cold up-card (report not yet filled) is unavailable until the
+        // background solve lands.
+        let key: IndexKey = (up, ShoeChoice::Decks(*n_decks), *rules, self.system);
         let Some(report) = diskcache::load::<_, IndexReport>("index", &key) else {
             return (None, false);
         };

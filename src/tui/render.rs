@@ -65,7 +65,7 @@ impl App {
     fn render_strategy(&self, f: &mut Frame, body: Rect) {
         let outer = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .constraints([Constraint::Min(0), Constraint::Length(5)])
             .split(body);
 
         // Lay the panes side by side when there's room for all three (each needs PANE_WIDTH); fall
@@ -102,6 +102,7 @@ impl App {
             Mode::Popup => self.render_popup(f),
             Mode::Rules => self.render_rules(f),
             Mode::Count => self.render_count(f),
+            Mode::CountInfo => self.render_count_info(f),
             Mode::Normal => {}
         }
     }
@@ -256,18 +257,25 @@ impl App {
             "count {count} | edge {edge}{edge_key}{computing} | insurance {insurance}{ins_key}",
         );
 
+        // F-key info overlays get their own row above the normal key map (an intended F-key family);
+        // the rest of the keys sit on the bottom row.
+        let fkeys = "F1 system";
         let keys = "hjkl move \u{00b7} Enter EVs \u{00b7} r rules \u{00b7} c count \u{00b7} q quit";
 
         let lines = vec![
+            // The current selection (hand vs up-card → move / EV) sits on its own line above all the
+            // rule/count status, so it reads as the headline rather than sharing the key-map row.
+            Line::from(vec![Span::styled(sel, Style::default().fg(Color::Gray))]),
             Line::from(vec![Span::styled(rules, Style::default().fg(Color::Cyan))]),
             Line::from(vec![Span::styled(
                 counted,
                 Style::default().fg(Color::Cyan),
             )]),
-            Line::from(vec![
-                Span::styled(format!("{sel}    "), Style::default().fg(Color::White)),
-                Span::styled(keys, Style::default().fg(Color::DarkGray)),
-            ]),
+            Line::from(vec![Span::styled(fkeys, Style::default().fg(Color::DarkGray))]),
+            Line::from(vec![Span::styled(
+                keys,
+                Style::default().fg(Color::DarkGray),
+            )]),
         ];
         f.render_widget(Paragraph::new(lines), area);
     }
@@ -544,6 +552,160 @@ impl App {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
             .title(" Card counting ");
+        f.render_widget(Clear, area);
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    /// The F1 count-description panel: a read-only summary of the selected counting system — its card
+    /// tags, IRC/pivot/balance, the current shoe's +EV and insurance key counts, and free-text usage
+    /// notes (incl. the Ace-Five 8-deck caveat). Shoe-specific numbers (IRC, key counts) are shown for a
+    /// finite shoe and dashed on the infinite deck (which has no count). The first of an intended F-key
+    /// family of chart info overlays.
+    fn render_count_info(&self, f: &mut Frame) {
+        let sys = self.count.system;
+        let axis = self.count.axis_label();
+        // IRC/pivot/balance are deck-count dependent; use the finite shoe's count, else note n/a.
+        let n = match self.shoe {
+            ShoeChoice::Decks(n) => Some(n),
+            ShoeChoice::Infinite => None,
+        };
+        let kind_word = if axis == "TC" {
+            "true count"
+        } else {
+            "running count"
+        };
+        let balance_word = match n {
+            Some(n) if !sys.balanced(n) => "unbalanced",
+            _ => "balanced",
+        };
+
+        let label_style = Style::default().fg(Color::Gray);
+        let val_style = Style::default().fg(Color::White);
+        let kv = |label: &str, val: String| {
+            Line::from(vec![
+                Span::styled(format!("  {label:<14}"), label_style),
+                Span::styled(val, val_style),
+            ])
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("  {} — {balance_word} {kind_word}", sys.label()),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+
+        // Card→value tag table: the ten ranks over their count values, aligned in 3-wide cells so the
+        // value sits under its rank. Uses chart column order (2..9, T, A) so the Ace sits at the far
+        // right past the Ten, matching the strategy grid rather than dense rank_index order.
+        let rank_hdr: Vec<Span> = std::iter::once(Span::styled("  rank   ", label_style))
+            .chain(UP_CARDS.iter().map(|c| {
+                Span::styled(
+                    format!("{:^3}", c.to_string()),
+                    Style::default().fg(Color::Gray),
+                )
+            }))
+            .collect();
+        let tag_row: Vec<Span> = std::iter::once(Span::styled("  tag    ", label_style))
+            .chain(UP_CARDS.iter().map(|c| {
+                let v = sys.map(c);
+                let txt = if v == 0 {
+                    "0".to_string()
+                } else {
+                    format!("{v:+}")
+                };
+                let color = match v.signum() {
+                    1 => Color::Green,
+                    -1 => Color::Red,
+                    _ => Color::DarkGray,
+                };
+                Span::styled(format!("{txt:^3}"), Style::default().fg(color))
+            }))
+            .collect();
+        lines.push(Line::from(rank_hdr));
+        lines.push(Line::from(tag_row));
+        lines.push(Line::from(""));
+
+        // IRC / pivot / balance. The IRC and pivot depend on deck count, so they need a finite shoe.
+        match n {
+            Some(n) => {
+                lines.push(kv(
+                    "IRC",
+                    format!("{:+} ({n} decks)", sys.starting_count(n)),
+                ));
+                lines.push(kv("Pivot", format!("{:+}", sys.pivot(n))));
+                lines.push(kv(
+                    "Full shoe",
+                    format!(
+                        "{:+}  ({})",
+                        sys.full_shoe_count(n),
+                        if sys.balanced(n) {
+                            "balanced"
+                        } else {
+                            "unbalanced"
+                        }
+                    ),
+                ));
+            }
+            None => {
+                lines.push(kv("IRC / pivot", "— (finite shoe only)".to_string()));
+            }
+        }
+        lines.push(Line::from(""));
+
+        // The +EV key counts for the current shoe (axis-aware). The edge one is backgrounded.
+        let edge_kc = match self.shoe {
+            ShoeChoice::Infinite => "— (finite shoe only)".to_string(),
+            ShoeChoice::Decks(_) => match self.edge_key_count() {
+                None => "computing\u{2026}".to_string(),
+                Some(None) => "no advantage in window".to_string(),
+                Some(Some(c)) => format!("{axis} \u{2265} {c:+}"),
+            },
+        };
+        let ins_kc = match self.insurance_key_count {
+            Some(c) => format!("{axis} \u{2265} {c:+}"),
+            None => match self.shoe {
+                ShoeChoice::Infinite => "— (finite shoe only)".to_string(),
+                ShoeChoice::Decks(_) => "never pays in window".to_string(),
+            },
+        };
+        lines.push(kv("+EV from", edge_kc));
+        lines.push(kv("Insurance", ins_kc));
+        lines.push(Line::from(""));
+
+        // Free-text usage notes / caveats. Word-wrapped so a note longer than the panel folds onto
+        // continuation lines (hanging-indented under the bullet text) rather than being clipped.
+        const WIDTH: u16 = 70;
+        let text_width = (WIDTH - 2) as usize; // minus the two border columns
+        lines.push(Line::from(Span::styled("  Notes", label_style)));
+        let note_style = Style::default().fg(Color::Cyan);
+        for note in sys.notes() {
+            for (i, chunk) in wrap_text(note, text_width - 5).into_iter().enumerate() {
+                // First fragment carries the bullet; the rest indent to line up under its text.
+                let prefix = if i == 0 { "   \u{2022} " } else { "     " };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{chunk}"),
+                    note_style,
+                )));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  F1/Esc close",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        // Wide enough for the kv/table rows; notes wrap to this width above.
+        let width = WIDTH;
+        let height = lines.len() as u16 + 2;
+        let area = centered_rect(width, height, f.area());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Count system (F1) ");
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(lines).block(block), area);
     }
@@ -1288,6 +1450,27 @@ fn ev_color(ev: f64) -> Color {
 
 fn yn(b: bool) -> &'static str {
     if b { "\u{2713}" } else { "\u{2717}" }
+}
+
+/// Greedy word-wrap of `s` to at most `width` columns per line, breaking on spaces. A single word
+/// longer than `width` is left intact on its own line (overflow beats mid-word truncation). Returns at
+/// least one (possibly empty) fragment, so callers can rely on a first element for the bullet.
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.len() + 1 + word.len() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+    }
+    out.push(cur);
+    out
 }
 
 /// The footer's "+EV from count" key-threshold suffix, axis-aware (`axis` is `RC` for KO, `TC` for

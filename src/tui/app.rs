@@ -11,7 +11,7 @@ use std::{array, io, thread};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 use crate::card::Card;
-use crate::count::{CountCmp, CountKind, CountSystemId};
+use crate::count::{CountCmp, CountSystemId};
 use crate::hand::HandCategory;
 use crate::reach::CellInfo;
 use crate::rules::Ruleset;
@@ -32,6 +32,12 @@ pub(super) enum Mode {
     Popup,
     Rules,
     Count,
+    /// The F1 count-description panel: a read-only summary of the selected counting system (card tags,
+    /// IRC/pivot/balance, the +EV and insurance key counts, and usage notes). The first of an intended
+    /// F-key family of chart info overlays. Currently a toggle (F1 opens, F1/Esc closes); the eventual
+    /// "hold to peek" semantics would need terminal keyboard-enhancement (release events) — see
+    /// [`App::handle_count_info`](super::input).
+    CountInfo,
 }
 
 /// The highlighted cell: which pane, which row within it, which up-card column.
@@ -94,9 +100,10 @@ pub(super) struct App {
     /// column already in flight. Cleared per key when its *complete* report lands.
     index_pending: HashSet<IndexKey>,
     /// The `(shoe, rules, counting system)` the cached index reports are for; a change invalidates them.
-    /// The count *value* is not part of it (the index is value-independent), but the *system* is (KO and
-    /// Hi-Lo give different indices).
-    index_basis: Option<(ShoeChoice, Ruleset, CountKind)>,
+    /// The count *value* is not part of it (the index is value-independent), but the concrete *system* is
+    /// — and not merely its [`CountKind`]: KO and Ace-Five are both running counts yet give different
+    /// indices, so the [`CountSystemId`] itself must key the basis.
+    index_basis: Option<(ShoeChoice, Ruleset, CountSystemId)>,
     /// Bumped when `index_basis` changes, stamped on background reports so stale ones are dropped.
     index_epoch: u64,
     index_tx: Sender<IndexResult>,
@@ -105,10 +112,10 @@ pub(super) struct App {
     /// share ([`index_basis`](Self::index_basis)): the lowest count at which the overall edge turns
     /// non-negative (`None` = no advantage in the reachable window). Survives count-value changes, dropped
     /// when the basis changes. A present entry means the background search finished.
-    edge_key_cache: HashMap<(ShoeChoice, Ruleset, CountKind), Option<i16>>,
+    edge_key_cache: HashMap<(ShoeChoice, Ruleset, CountSystemId), Option<i16>>,
     /// The basis whose edge key count is being searched in the background, so the scheduler doesn't
     /// respawn it. Tagged with [`index_epoch`](Self::index_epoch) like the index workers.
-    edge_pending: HashSet<(ShoeChoice, Ruleset, CountKind)>,
+    edge_pending: HashSet<(ShoeChoice, Ruleset, CountSystemId)>,
     edge_tx: Sender<EdgeKeyResult>,
     edge_rx: Receiver<EdgeKeyResult>,
 }
@@ -181,7 +188,7 @@ impl App {
         // *system* (KO vs Hi-Lo give different indices), so the basis is `(shoe, rules, system)`: a count
         // value tweak keeps them, a system switch refills them. Bumping `index_epoch` drops any in-flight
         // worker for the old basis.
-        let basis = (self.shoe, self.rules, self.count.system.kind());
+        let basis = (self.shoe, self.rules, self.count.system);
         if self.index_basis != Some(basis) {
             self.index_basis = Some(basis);
             self.index_epoch += 1;
@@ -243,17 +250,23 @@ impl App {
     pub(super) fn index_key(&self, up: Card) -> Option<IndexKey> {
         match self.shoe {
             // The index thresholds are a property of the counting system (its card→value map), so the
-            // system tags the key — a HiLo index can never be served for a KO basis. Count-*independent*
-            // still (the player's count value isn't in the key), so it survives a count tweak.
-            ShoeChoice::Decks(_) => Some((up, self.shoe, self.rules, self.count.system.kind())),
+            // concrete system tags the key — a Hi-Lo index can never be served for a KO basis, nor a KO
+            // index for an Ace-Five one. Count-*independent* still (the player's count value isn't in the
+            // key), so it survives a count tweak.
+            ShoeChoice::Decks(_) => Some((up, self.shoe, self.rules, self.count.system)),
             ShoeChoice::Infinite => None,
         }
     }
 
     /// Background-fill the count-index reports for every up-card, up to [`INDEX_FILL_CONCURRENCY`] at a
     /// time. Deferred until the base chart finishes so the markers fill in *after* the chart is up
-    /// rather than competing with it. Skips columns already complete or in flight; a worker streams its
-    /// Hard/Soft markers first, then completes with Pairs (see [`compute_index_report`]).
+    /// rather than competing with it — and, beyond that, gated on the overall-edge key count having
+    /// *finished* (see [`schedule_edge_key_count`](Self::schedule_edge_key_count)). The edge key count is
+    /// the more crucial number, and its per-up-card frame solves warm the very disk cache this sweep
+    /// reads, so letting it run to completion first surfaces it ASAP and makes the subsequent index fill
+    /// run largely off warm frames instead of contending for cores with it. Skips columns already
+    /// complete or in flight; a worker streams its Hard/Soft markers first, then completes with Pairs
+    /// (see [`compute_index_report`]).
     fn schedule_index_fill(&mut self) {
         let ShoeChoice::Decks(n) = self.shoe else {
             return;
@@ -261,12 +274,18 @@ impl App {
         if !self.columns.iter().all(Option::is_some) {
             return;
         }
+        // Hold off until the edge key count for this basis has landed; its frame solves warm the cache
+        // the sweep below reuses, and it is the more important number to show first.
+        let basis = (self.shoe, self.rules, self.count.system);
+        if !self.edge_key_cache.contains_key(&basis) {
+            return;
+        }
         for &col in &SOLVE_ORDER {
             if self.index_pending.len() >= INDEX_FILL_CONCURRENCY {
                 break;
             }
             let up = UP_CARDS[col];
-            let key = (up, self.shoe, self.rules, self.count.system.kind());
+            let key = (up, self.shoe, self.rules, self.count.system);
             let done = self.index_cache.get(&key).is_some_and(|r| r.complete);
             if done || self.index_pending.contains(&key) {
                 continue;
@@ -280,10 +299,11 @@ impl App {
     }
 
     /// Background-search the overall-edge key count for the current basis, once the base chart is up.
-    /// Spawned *before* [`schedule_index_fill`](Self::schedule_index_fill) in the loop so its per-up-card
-    /// frame solves (shared with the index sweep through the disk frame cache — see
-    /// [`compute_edge_key_count`]) get a head start and warm the index fill. One worker per basis;
-    /// skipped once the basis is solved or in flight. Finite shoe only (no count on an infinite deck).
+    /// Spawned *before* [`schedule_index_fill`](Self::schedule_index_fill) in the loop — and the index
+    /// fill is now gated to wait for this to *finish* — so its per-up-card frame solves (shared with the
+    /// index sweep through the disk frame cache — see [`compute_edge_key_count`]) run uncontended and warm
+    /// the index fill, surfacing the more-crucial edge key count first. One worker per basis; skipped once
+    /// the basis is solved or in flight. Finite shoe only (no count on an infinite deck).
     fn schedule_edge_key_count(&mut self) {
         let ShoeChoice::Decks(n) = self.shoe else {
             return;
@@ -291,15 +311,15 @@ impl App {
         if !self.columns.iter().all(Option::is_some) {
             return;
         }
-        let basis = (self.shoe, self.rules, self.count.system.kind());
+        let basis = (self.shoe, self.rules, self.count.system);
         if self.edge_key_cache.contains_key(&basis) || self.edge_pending.contains(&basis) {
             return;
         }
         self.edge_pending.insert(basis);
         let tx = self.edge_tx.clone();
-        let (rules, kind, epoch) = (self.rules, basis.2, self.index_epoch);
+        let (rules, sys, epoch) = (self.rules, basis.2, self.index_epoch);
         thread::spawn(move || {
-            let key_count = compute_edge_key_count(n, kind, &rules);
+            let key_count = compute_edge_key_count(n, sys, &rules);
             let _ = tx.send(EdgeKeyResult {
                 epoch,
                 basis,
@@ -324,7 +344,7 @@ impl App {
     /// computing or on the infinite deck. The inner value is in the system's display axis (running count
     /// for KO, integer true count for Hi-Lo).
     pub(super) fn edge_key_count(&self) -> Option<Option<i16>> {
-        let basis = (self.shoe, self.rules, self.count.system.kind());
+        let basis = (self.shoe, self.rules, self.count.system);
         self.edge_key_cache.get(&basis).copied()
     }
 
