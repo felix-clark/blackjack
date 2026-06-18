@@ -12,7 +12,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 use crate::card::Card;
 use crate::count::{CountCmp, CountSystemId};
-use crate::hand::HandCategory;
+use crate::hand::{HandCategory, Move};
 use crate::reach::CellInfo;
 use crate::rules::Ruleset;
 
@@ -23,7 +23,7 @@ use super::index::{
     IndexResult, compute_edge_key_count, compute_index_report,
 };
 use super::training::Training;
-use super::{PANES, Pane, SOLVE_ORDER, Tab, UP_CARDS};
+use super::{ChartView, PANES, Pane, SOLVE_ORDER, Tab, UP_CARDS};
 
 /// Which overlay (if any) is currently up.
 #[derive(PartialEq)]
@@ -82,6 +82,9 @@ pub(super) struct App {
     /// Per up-card column, `None` until that worker finishes (or filled at once from the cache).
     pub(super) columns: [Option<Column>; 10],
     pub(super) cursor: Cursor,
+    /// Which information layer the chart grid is drawing (Strategy moves vs. the count index). Toggled
+    /// with F2; orthogonal to [`mode`](Self::mode) (an overlay can still open over either view).
+    pub(super) view: ChartView,
     pub(super) mode: Mode,
     /// Selected field in the rules modal.
     pub(super) rules_sel: usize,
@@ -149,6 +152,7 @@ impl App {
                 row: 0,
                 col: 0,
             },
+            view: ChartView::Strategy,
             mode: Mode::Normal,
             rules_sel: 0,
             rules_snapshot: (Ruleset::default(), ShoeChoice::Infinite),
@@ -384,6 +388,51 @@ impl App {
             .cats
             .get(&cat)
             .is_some_and(|ci| ci.is_leveraged(INDEX_LEVERAGE_CUTOFF))
+    }
+
+    /// The F2 index view's pivot for `cat` vs `up`: the count at which the play deviates from basic
+    /// strategy, paired with the basic-strategy headline move that colors the cell. Picks the
+    /// higher-leverage of the two ladders — the headline deviation, or the Hit/Stand backup behind a
+    /// start-only headline (the 16-v-T case, where the Surrender headline never flips but its H/S backup
+    /// does, so the cell keeps its Surrender color yet shows the backup's pivot). The pivot is the first
+    /// flip's upper-run low edge: the count at and above which the upper move applies, matching the
+    /// popup's run ranges and the published "stand at ≥ N" convention. `None` when the cell's deviation is
+    /// below the marker's leverage bar ([`INDEX_LEVERAGE_CUTOFF`]) — still computing, count-independent, or
+    /// a barely-moving fractional flip — so the caller falls back to the plain basic-strategy letter.
+    pub(super) fn index_pivot(
+        &self,
+        cat: HandCategory,
+        up: Card,
+        cell: &CellInfo,
+    ) -> Option<(i16, Move)> {
+        let report = self.index_key(up).and_then(|k| self.index_cache.get(&k))?;
+        let ci = report.cats.get(&cat)?;
+        // Gate on the same leverage bar as the chart `°` marker ([`INDEX_LEVERAGE_CUTOFF`]), so the view
+        // shows pivots for exactly the deviations the marker flags rather than every count-dependent cell.
+        // A cell below the bar falls back to its plain basic-strategy letter. (One constant to loosen here
+        // later if someone wants to study the deeper cuts.)
+        if !ci.is_leveraged(INDEX_LEVERAGE_CUTOFF) {
+            return None;
+        }
+        // Only a ladder that actually flips inside the window (≥ 2 runs) is a candidate; between the two,
+        // the one whose deviation earns more EV wins (so a high-leverage H/S backup beats a barely-moving
+        // headline flip).
+        let primary = (ci.primary.len() >= 2).then_some((ci.leverage, ci.primary.as_slice()));
+        let fallback =
+            (ci.fallback.len() >= 2).then_some((ci.fallback_leverage, ci.fallback.as_slice()));
+        let runs = match (primary, fallback) {
+            (Some(p), Some(f)) => {
+                if p.0 >= f.0 {
+                    p.1
+                } else {
+                    f.1
+                }
+            }
+            (Some(p), None) => p.1,
+            (None, Some(f)) => f.1,
+            (None, None) => return None,
+        };
+        Some((runs.get(1)?.1, cell.headline))
     }
 
     /// Switch the active top-level view. Entering the training tab re-points its live shoe and counting

@@ -83,6 +83,30 @@ pub(super) enum Tab {
     Training,
 }
 
+/// An alternative information layer drawn onto the strategy chart's three-pane grid. The default
+/// [`Strategy`](ChartView::Strategy) fills each cell with the recommended move; further views reuse the
+/// exact same layout but swap in different per-cell information. The first of an intended F-key view
+/// family (F2 = the count index), so this is the seam any later chart overlay slots into. Toggled, not
+/// modal — it persists until switched back, so the cursor/popup keep working over the swapped grid.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum ChartView {
+    /// The basic-strategy move per cell (the chart proper).
+    Strategy,
+    /// The count-index pivot per cell: the count at which the play deviates from basic strategy, where
+    /// the cell has an in-window deviation; cells with none fall back to the plain basic-strategy move.
+    Index,
+}
+
+impl ChartView {
+    /// Cycle to the next view (currently a two-state toggle; extends to a ring as views are added).
+    pub(super) fn toggled(self) -> Self {
+        match self {
+            ChartView::Strategy => ChartView::Index,
+            ChartView::Index => ChartView::Strategy,
+        }
+    }
+}
+
 /// The three chart panes.
 #[derive(Clone, Copy)]
 enum Pane {

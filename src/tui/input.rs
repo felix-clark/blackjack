@@ -91,6 +91,10 @@ impl App {
             // F1: the count-description panel (selected system's tags/IRC/pivot/key counts/notes). The
             // first of an intended F-key family of chart info overlays.
             KeyCode::F(1) => self.mode = Mode::CountInfo,
+            // F2: swap the chart grid between the basic-strategy moves and the count index (the count at
+            // which each cell's play deviates). A persistent view toggle, not a modal — the cursor and
+            // popup keep working over the swapped grid. The second of the F-key chart-overlay family.
+            KeyCode::F(2) => self.view = self.view.toggled(),
             KeyCode::Enter | KeyCode::Char(' ') => self.mode = Mode::Popup,
             KeyCode::Char('r') => self.open_rules(),
             KeyCode::Char('c') => {

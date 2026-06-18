@@ -11,7 +11,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::card::Card;
-use crate::hand::{HandState, Move};
+use crate::hand::{HandCategory, HandState, Move};
+use crate::reach::CellInfo;
 use crate::rules::Ruleset;
 use crate::shoe::CardCol;
 
@@ -19,7 +20,7 @@ use super::app::{App, Mode};
 use super::config::ShoeChoice;
 use super::index::INDEX_LEVERAGE_CUTOFF;
 use super::training::{Phase, Training};
-use super::{MOVE_ORDER, PANES, Pane, Tab, UP_CARDS};
+use super::{ChartView, MOVE_ORDER, PANES, Pane, Tab, UP_CARDS};
 
 /// Width one pane needs to render untruncated: 2 border + 4 row-label + 10 up-cards × 3. Below
 /// `3 × PANE_WIDTH` the chart stacks the panes vertically instead of side by side.
@@ -144,35 +145,7 @@ impl App {
                 let (text, mut style) = match &self.columns[i_c] {
                     None => ("\u{00b7}".to_string(), Style::default().fg(Color::DarkGray)),
                     Some(col) => match col.summary.get(&cat) {
-                        Some(cell) => {
-                            // The headline move (one letter, or a two-letter fallback label like
-                            // "DS"/"RP", see `move_label`) plus a one-char suffix in the 3-wide cell:
-                            // `*` when the play varies by composition at this count (takes priority —
-                            // a composition-dependent cell has two near-tied EVs, so it is essentially
-                            // always count-dependent too, and `*` is the stronger signal), else `°`
-                            // when the play flips with the running count in the notable window. The
-                            // popup carries both. A lone letter gets a leading space so it (and its
-                            // suffix) stays centered (" H " / " H*"); a two-letter label is left-shifted
-                            // by one so the suffix still fits the 3-wide column ("DS" / "DS*").
-                            let mv = cell.headline;
-                            let core = move_label(mv, &cell.move_evs);
-                            let suffix = if cell.composition_dependent {
-                                "*"
-                            } else if self.index_dependent(cat, upcard) {
-                                "\u{00b0}"
-                            } else {
-                                ""
-                            };
-                            let text = if core.len() == 2 {
-                                format!("{core}{suffix}")
-                            } else {
-                                format!(
-                                    "{}{core}{suffix}",
-                                    if suffix.is_empty() { "" } else { " " }
-                                )
-                            };
-                            (text, Style::default().fg(move_color(mv)))
-                        }
+                        Some(cell) => self.cell_view(cat, upcard, cell),
                         None => (" ".to_string(), Style::default()),
                     },
                 };
@@ -185,6 +158,49 @@ impl App {
         }
 
         f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// One chart cell's `(text, style)` under the active [`ChartView`].
+    ///
+    /// **Strategy** (the default): the headline move (one letter, or a two-letter fallback label like
+    /// "DS"/"RP", see [`move_label`]) plus a one-char suffix in the 3-wide cell — `*` when the play
+    /// varies by composition at this count (takes priority: a composition-dependent cell has two
+    /// near-tied EVs, so it is essentially always count-dependent too, and `*` is the stronger signal),
+    /// else `°` when the play flips with the count in the notable window. The popup carries both. A lone
+    /// letter gets a leading space so it (and its suffix) stays centered (" H " / " H*"); a two-letter
+    /// label is left-shifted by one so the suffix still fits the column ("DS" / "DS*").
+    ///
+    /// **Index** (F2): the count at which the play deviates ([`App::index_pivot`](super::app)), signed,
+    /// colored by the basic-strategy move (so the grid keeps its familiar colors, the number says when to
+    /// deviate). A cell with no in-window deviation — still computing, or count-independent — falls back
+    /// to the plain basic-strategy letter in the same general-chart color, with no marker.
+    fn cell_view(&self, cat: HandCategory, up: Card, cell: &CellInfo) -> (String, Style) {
+        match self.view {
+            ChartView::Strategy => {
+                let mv = cell.headline;
+                let core = move_label(mv, &cell.move_evs);
+                let suffix = if cell.composition_dependent {
+                    "*"
+                } else if self.index_dependent(cat, up) {
+                    "\u{00b0}"
+                } else {
+                    ""
+                };
+                let text = if core.len() == 2 {
+                    format!("{core}{suffix}")
+                } else {
+                    format!("{}{core}{suffix}", if suffix.is_empty() { "" } else { " " })
+                };
+                (text, Style::default().fg(move_color(mv)))
+            }
+            ChartView::Index => match self.index_pivot(cat, up, cell) {
+                Some((pivot, mv)) => (format!("{pivot:+}"), Style::default().fg(move_color(mv))),
+                None => (
+                    move_label(cell.headline, &cell.move_evs),
+                    Style::default().fg(move_color(cell.headline)),
+                ),
+            },
+        }
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
@@ -257,9 +273,12 @@ impl App {
             "count {count} | edge {edge}{edge_key}{computing} | insurance {insurance}{ins_key}",
         );
 
-        // F-key info overlays get their own row above the normal key map (an intended F-key family);
-        // the rest of the keys sit on the bottom row.
-        let fkeys = "F1 system";
+        // F-key info/view overlays get their own row above the normal key map (an intended F-key family);
+        // the rest of the keys sit on the bottom row. The active alternate view (F2 index) is highlighted
+        // so the swapped grid is legibly flagged — like the tab bar marking the active tab — while the
+        // resting keys stay the same dull gray.
+        let dull = Style::default().fg(Color::DarkGray);
+        let index_on = self.view == ChartView::Index;
         let keys = "hjkl move \u{00b7} Enter EVs \u{00b7} r rules \u{00b7} c count \u{00b7} q quit";
 
         let lines = vec![
@@ -271,11 +290,19 @@ impl App {
                 counted,
                 Style::default().fg(Color::Cyan),
             )]),
-            Line::from(vec![Span::styled(fkeys, Style::default().fg(Color::DarkGray))]),
-            Line::from(vec![Span::styled(
-                keys,
-                Style::default().fg(Color::DarkGray),
-            )]),
+            Line::from(vec![
+                Span::styled("F1 system", dull),
+                Span::styled(" \u{00b7} ", dull),
+                Span::styled(
+                    "F2 index",
+                    if index_on {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        dull
+                    },
+                ),
+            ]),
+            Line::from(vec![Span::styled(keys, dull)]),
         ];
         f.render_widget(Paragraph::new(lines), area);
     }
@@ -636,18 +663,6 @@ impl App {
                     format!("{:+} ({n} decks)", sys.starting_count(n)),
                 ));
                 lines.push(kv("Pivot", format!("{:+}", sys.pivot(n))));
-                lines.push(kv(
-                    "Full shoe",
-                    format!(
-                        "{:+}  ({})",
-                        sys.full_shoe_count(n),
-                        if sys.balanced(n) {
-                            "balanced"
-                        } else {
-                            "unbalanced"
-                        }
-                    ),
-                ));
             }
             None => {
                 lines.push(kv("IRC / pivot", "— (finite shoe only)".to_string()));
