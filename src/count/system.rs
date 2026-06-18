@@ -146,23 +146,21 @@ impl CountSystemId {
                 "Act on the running count directly — no true-count division.",
             ],
             CountSystemId::HiLo => &[
-                "Balanced: divide the running count by decks remaining for the",
-                "true count, and act on that. Indices are quoted in true count.",
+                "Balanced: divide the running count by decks remaining for the true count, and act
+on that. Indices are quoted in true count.",
             ],
             CountSystemId::AceFive => &[
-                "Minimal training-wheels count: tag only Aces (-1) and 5s (+1).",
+                "Minimal training-wheels count - only Aces (-1) and 5s (+1).",
                 "Balanced, but played as a raw running count (no true-count division).",
-                "6-deck: safe — edge is ~break-even at the key count even early.",
-                "8-deck FOOTGUN: a fixed RC overrates the edge early in the shoe. At",
-                "the key count the first ~third is still ~-0.14% EV. Be conservative",
-                "early — only raise your bet past about half the shoe.",
+                "6-deck: edge is ~break-even at the key count even early",
+                "8-deck warning: a fixed RC overrates the edge early in the shoe. At the key count
+the first ~third of the shoe is still ~-0.14% EV. Be conservative early — only raise your bet past
+about half the shoe.",
             ],
         }
     }
 }
 
-// NOTE: If this ends up not needing to be anything more than a mapping, we can ditch the trait
-// formalism and just pass in an arbitrary function Card -> i8 to CountState.
 pub(crate) trait CountSystem {
     /// Which count family this system belongs to. [`Running`](CountKind::Running) systems (KO) are
     /// actioned on the raw running count; [`TrueCount`](CountKind::TrueCount) systems (Hi-Lo) on the
@@ -178,8 +176,6 @@ pub(crate) trait CountSystem {
     /// The mapping from card to count.
     /// NOTE: i16 is used because the space is necessary for total counts, and it's easier to
     /// maintain the per-card counts as well.
-    /// NOTE: We could also implement this as an array of i8s, of length 10, corresponding to the
-    /// internal CardCol array. This would probably optimize.
     fn map(card: &Card) -> i16;
 
     /// Total count value of a full `n`-deck shoe, `F = Σ_r v_r · f_r`. Zero for balanced systems
@@ -191,7 +187,7 @@ pub(crate) trait CountSystem {
             .sum()
     }
 
-    /// The system's **pivot constant** `P = starting_count(n) + full_shoe_count(n)`. This is the
+    /// The system's pivot constant `P = starting_count(n) + full_shoe_count(n)`. This is the
     /// one number the internal⇄external conversion turns on: `external = P − internal`. (KO: `4`;
     /// any balanced system: `0`.)
     fn pivot(n_decks: u8) -> i16 {
