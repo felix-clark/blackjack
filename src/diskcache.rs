@@ -5,7 +5,7 @@
 //!
 //! This is the one place the project leaves its (otherwise) std-only-plus-`ratatui` discipline: caching
 //! needs serialization, so the cached types `derive({Serialize, Deserialize})` and we encode with
-//! `bincode`. The cache is best-effort and side-channel — every operation degrades to a miss (recompute)
+//! `postcard`. The cache is best-effort and side-channel — every operation degrades to a miss (recompute)
 //! on any I/O or decode error, so a missing/corrupt/older cache never breaks correctness, only speed.
 //!
 //! Layout: `$XDG_CACHE_HOME/blackjack/v{SCHEMA_VERSION}/{kind}-{hash}.bin`. The schema version lives in
@@ -25,7 +25,7 @@ use serde::de::DeserializeOwned;
 
 /// Bump on any change to the on-disk layout or semantics of a cached type. Old files (under the prior
 /// version's subdirectory) are then simply never read again.
-const SCHEMA_VERSION: u32 = 18;
+const SCHEMA_VERSION: u32 = 19;
 
 /// Process-unique suffix source for temp files, so concurrent writers (the chart workers and the
 /// index-fill workers all cache in parallel) never collide on the same scratch path.
@@ -59,10 +59,10 @@ pub(crate) fn load<K: Serialize, V: DeserializeOwned>(kind: &str, key: &K) -> Op
     if !enabled() {
         return None;
     }
-    let key_bytes = bincode::serialize(key).ok()?;
+    let key_bytes = postcard::to_allocvec(key).ok()?;
     let path = path_for(kind, &key_bytes)?;
     let raw = fs::read(&path).ok()?;
-    let (stored_key, val): (Vec<u8>, V) = bincode::deserialize(&raw).ok()?;
+    let (stored_key, val): (Vec<u8>, V) = postcard::from_bytes(&raw).ok()?;
     // The filename is only a hash; confirm the full key before trusting the payload.
     (stored_key == key_bytes).then_some(val)
 }
@@ -74,7 +74,7 @@ pub(crate) fn store<K: Serialize, V: Serialize>(kind: &str, key: &K, val: &V) {
     if !enabled() {
         return;
     }
-    let Ok(key_bytes) = bincode::serialize(key) else {
+    let Ok(key_bytes) = postcard::to_allocvec(key) else {
         return;
     };
     let Some(path) = path_for(kind, &key_bytes) else {
@@ -86,7 +86,7 @@ pub(crate) fn store<K: Serialize, V: Serialize>(kind: &str, key: &K, val: &V) {
     if fs::create_dir_all(dir).is_err() {
         return;
     }
-    let Ok(payload) = bincode::serialize(&(key_bytes, val)) else {
+    let Ok(payload) = postcard::to_allocvec(&(key_bytes, val)) else {
         return;
     };
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
